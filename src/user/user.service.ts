@@ -29,7 +29,8 @@ export class UserService {
       email: dto.email,
       phone: dto.phone,
       password: hashedPassword,
-      role: UserRole.INVESTOR, // default
+      // role: UserRole.INVESTOR, // default
+      role: UserRole.PARTNER,
     });
 
     return this.userRepo.save(user);

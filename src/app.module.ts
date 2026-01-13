@@ -5,6 +5,7 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { UserModule } from './user/user.module';
 import { AuthModule } from './auth/auth.module';
+import { PartnerModule } from './partner/partner.module';
 
 @Module({
   imports: [
@@ -13,7 +14,7 @@ import { AuthModule } from './auth/auth.module';
     }),
 
     TypeOrmModule.forRootAsync({
-      imports: [ConfigModule, UserModule, AuthModule],
+      imports: [ConfigModule, UserModule, AuthModule, PartnerModule],
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
         type: 'postgres',
