@@ -6,6 +6,11 @@ import { AppService } from './app.service';
 import { UserModule } from './user/user.module';
 import { AuthModule } from './auth/auth.module';
 import { PartnerModule } from './partner/partner.module';
+import { AssetModule } from './asset/asset.module';
+import { InvestmentModule } from './investment/investment.module';
+import { KycModule } from './kyc/kyc.module';
+import { KycGuard } from './auth/guards/kyc.guard';
+import { PartnerApprovedGuard } from './auth/guards/partner-approved.guard';
 
 @Module({
   imports: [
@@ -14,7 +19,15 @@ import { PartnerModule } from './partner/partner.module';
     }),
 
     TypeOrmModule.forRootAsync({
-      imports: [ConfigModule, UserModule, AuthModule, PartnerModule],
+      imports: [
+        ConfigModule,
+        UserModule,
+        AuthModule,
+        PartnerModule,
+        AssetModule,
+        InvestmentModule,
+        KycModule,
+      ],
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
         type: 'postgres',
@@ -29,6 +42,10 @@ import { PartnerModule } from './partner/partner.module';
     }),
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [
+    AppService,
+    // KycGuard,
+    // PartnerApprovedGuard]
+  ],
 })
 export class AppModule {}
