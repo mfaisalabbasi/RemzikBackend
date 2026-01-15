@@ -1,4 +1,8 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  BadRequestException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import * as bcrypt from 'bcrypt';
@@ -27,10 +31,10 @@ export class UserService {
 
     const user = this.userRepo.create({
       email: dto.email,
+      name: dto.name,
       phone: dto.phone,
       password: hashedPassword,
-      // role: UserRole.INVESTOR, // default
-      role: UserRole.PARTNER,
+      role: dto.role,
     });
 
     return this.userRepo.save(user);
@@ -38,10 +42,14 @@ export class UserService {
 
   async validateUser(email: string, password: string): Promise<User | null> {
     const user = await this.userRepo.findOne({ where: { email } });
-    if (!user) return null;
+    if (!user) {
+      throw new UnauthorizedException('Invalid credentials');
+    }
 
     const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return null;
+    if (!isMatch) {
+      throw new UnauthorizedException('Invalid credentials');
+    }
 
     return user;
   }

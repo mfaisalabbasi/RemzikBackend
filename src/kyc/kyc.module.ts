@@ -8,6 +8,6 @@ import { KycController } from './kyc.controller';
   imports: [TypeOrmModule.forFeature([KycProfile])],
   providers: [KycService],
   controllers: [KycController],
-  exports: [KycService],
+  exports: [KycService, TypeOrmModule],
 })
 export class KycModule {}

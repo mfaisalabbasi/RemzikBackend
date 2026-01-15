@@ -14,7 +14,8 @@ export class User {
 
   @Column({ unique: true })
   email: string;
-
+  @Column()
+  name: string; // MANDATORY (business rule)
   @Column()
   phone: string; // MANDATORY (business rule)
 

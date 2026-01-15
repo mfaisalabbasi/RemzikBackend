@@ -5,9 +5,13 @@ import { InvestmentService } from './investment.service';
 import { InvestmentController } from './investment.controller';
 import { InvestorProfile } from '../investor/investor.entity';
 import { Asset } from '../asset/asset.entity';
+import { KycModule } from 'src/kyc/kyc.module';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([Investment, InvestorProfile, Asset])],
+  imports: [
+    KycModule,
+    TypeOrmModule.forFeature([Investment, InvestorProfile, Asset]),
+  ],
   providers: [InvestmentService],
   controllers: [InvestmentController],
 })
