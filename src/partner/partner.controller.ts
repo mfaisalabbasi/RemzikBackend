@@ -14,7 +14,8 @@ import { RolesGuard } from 'src/auth/guards/roles.guard';
 import { Roles } from 'src/auth/decorators/roles.decorator';
 import { UserRole } from '../user/enums/user-role.enum';
 import { CreatePartnerProfileDto } from './dto/create-partner-profile.dto';
-import { UpdatePartnerProfileDto } from './dto/update-partner-profile.dto';
+import { UpdatePartnerCompanyDto } from './dto/update-partner-only.dto';
+import { UpdatePartnerStatusDto } from './dto/update-admin-only.dto';
 
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('partners')
@@ -28,7 +29,7 @@ export class PartnerController {
   @Post('me')
   @Roles(UserRole.PARTNER)
   createMyProfile(@Req() req, @Body() dto: CreatePartnerProfileDto) {
-    return this.partnerService.createProfile(req.user, dto);
+    return this.partnerService.createProfile(req.user.userId, dto);
   }
 
   /**
@@ -40,12 +41,15 @@ export class PartnerController {
     return this.partnerService.getMyProfile(req.user.userId);
   }
 
-  /**
-   * ADMIN updates / approves partner
-   */
-  @Patch(':id')
+  @Patch('me')
+  @Roles(UserRole.PARTNER)
+  updateMyProfile(@Req() req, @Body() dto: UpdatePartnerCompanyDto) {
+    return this.partnerService.updateCompany(req.user.userId, dto);
+  }
+
+  @Patch(':id/status')
   @Roles(UserRole.ADMIN)
-  updatePartner(@Param('id') id: string, @Body() dto: UpdatePartnerProfileDto) {
-    return this.partnerService.updateProfile(id, dto);
+  updateStatus(@Param('id') id: string, @Body() dto: UpdatePartnerStatusDto) {
+    return this.partnerService.updateStatus(id, dto.status);
   }
 }

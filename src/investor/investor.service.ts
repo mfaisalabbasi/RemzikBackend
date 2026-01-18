@@ -18,9 +18,9 @@ export class InvestorService {
   /**
    * Create investor profile
    */
-  async createProfile(user: User): Promise<InvestorProfile> {
+  async createProfile(userId: string): Promise<InvestorProfile> {
     const existing = await this.investorRepo.findOne({
-      where: { user: { id: user.id } },
+      where: { user: { id: userId } },
       relations: ['user'],
     });
 
@@ -28,7 +28,7 @@ export class InvestorService {
       throw new BadRequestException('Investor profile already exists');
     }
 
-    const profile = this.investorRepo.create({ user });
+    const profile = this.investorRepo.create({ user: { id: userId } as User });
     return this.investorRepo.save(profile);
   }
 

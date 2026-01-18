@@ -11,6 +11,7 @@ import { InvestmentModule } from './investment/investment.module';
 import { KycModule } from './kyc/kyc.module';
 import { KycGuard } from './auth/guards/kyc.guard';
 import { PartnerApprovedGuard } from './auth/guards/partner-approved.guard';
+import { InvestorModule } from './investor/investor.module';
 
 @Module({
   imports: [
@@ -27,6 +28,7 @@ import { PartnerApprovedGuard } from './auth/guards/partner-approved.guard';
         AssetModule,
         InvestmentModule,
         KycModule,
+        InvestorModule,
       ],
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({

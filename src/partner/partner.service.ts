@@ -7,7 +7,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { PartnerProfile } from './partner.entity';
 import { CreatePartnerProfileDto } from './dto/create-partner-profile.dto';
-import { UpdatePartnerProfileDto } from './dto/update-partner-profile.dto';
+import { UpdatePartnerCompanyDto } from './dto/update-partner-only.dto';
 import { User } from '../user/user.entity';
 import { PartnerStatus } from './enums/partner-status.enum';
 
@@ -22,11 +22,11 @@ export class PartnerService {
    * Create partner profile for logged-in PARTNER user
    */
   async createProfile(
-    user: User,
+    userId: string,
     dto: CreatePartnerProfileDto,
   ): Promise<PartnerProfile> {
     const existing = await this.partnerRepo.findOne({
-      where: { user: { id: user.id } },
+      where: { user: { id: userId } },
       relations: ['user'],
     });
     if (existing) {
@@ -34,9 +34,9 @@ export class PartnerService {
     }
 
     const profile = this.partnerRepo.create({
-      user,
       companyName: dto.companyName,
       status: PartnerStatus.PENDING,
+      user: { id: userId },
     });
 
     return this.partnerRepo.save(profile);
@@ -61,19 +61,40 @@ export class PartnerService {
   /**
    * Admin-only update (approve / reject / edit)
    */
-  async updateProfile(
-    profileId: string,
-    dto: UpdatePartnerProfileDto,
+
+  async updateCompany(
+    userId: string,
+    dto: UpdatePartnerCompanyDto,
   ): Promise<PartnerProfile> {
     const profile = await this.partnerRepo.findOne({
-      where: { id: profileId },
+      where: { user: { id: userId } },
+      relations: ['user'],
     });
 
     if (!profile) {
       throw new NotFoundException('Partner profile not found');
     }
 
-    Object.assign(profile, dto);
+    // Optional business rule
+    if (profile.status !== PartnerStatus.PENDING) {
+      throw new BadRequestException('Cannot update company after approval');
+    }
+
+    profile.companyName = dto.companyName;
+
     return this.partnerRepo.save(profile);
+  }
+
+  async updateStatus(id: string, status: PartnerStatus) {
+    const partner = await this.partnerRepo.findOneBy({ id });
+
+    if (!partner) throw new NotFoundException();
+
+    if (partner.status !== PartnerStatus.PENDING) {
+      throw new BadRequestException('Status already decided');
+    }
+
+    partner.status = status;
+    return this.partnerRepo.save(partner);
   }
 }

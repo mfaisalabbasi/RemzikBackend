@@ -16,7 +16,7 @@ export class InvestorController {
   @Post('me')
   @Roles(UserRole.INVESTOR)
   createMyProfile(@Req() req) {
-    return this.investorService.createProfile(req.user);
+    return this.investorService.createProfile(req.user.userId);
   }
 
   /**
