@@ -29,10 +29,10 @@ export class DocumentController {
   @Roles(UserRole.PARTNER)
   @UseInterceptors(FileInterceptor('file'))
   upload(
-    // @UploadedFile() file: Express.Multer.File,
+    @UploadedFile() file: Express.Multer.File,
     @Body() dto: UploadDocumentDto,
   ) {
-    // return this.documentService.uploadDocument(file.path, dto);
+    return this.documentService.uploadDocument(file.path, dto);
   }
 
   /**

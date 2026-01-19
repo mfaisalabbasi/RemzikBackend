@@ -27,7 +27,7 @@ export class KycController {
   @Post('submit')
   @Roles(UserRole.INVESTOR, UserRole.PARTNER)
   submit(@Req() req, @Body() dto: SubmitKycDto) {
-    return this.kycService.submitKyc(req.user, dto);
+    return this.kycService.submitKyc(req.user.userId, dto);
   }
 
   /**
