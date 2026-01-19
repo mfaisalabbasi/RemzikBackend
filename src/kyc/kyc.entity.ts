@@ -15,32 +15,20 @@ export class KycProfile {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  /**
-   * One KYC per user
-   */
   @OneToOne(() => User, { nullable: false })
-  @JoinColumn()
+  @JoinColumn({ name: 'userId' }) // 🔴 REQUIRED
   user: User;
 
-  /**
-   * National ID / Iqama / Passport
-   */
-  @Column()
+  @Column({ unique: true })
   documentNumber: string;
 
-  /**
-   * Country of issuance
-   */
   @Column()
   country: string;
 
-  /**
-   * Compliance state
-   */
   @Column({
     type: 'enum',
     enum: KycStatus,
-    default: KycStatus.NOT_SUBMITTED,
+    default: KycStatus.PENDING,
   })
   status: KycStatus;
 
