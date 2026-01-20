@@ -1,12 +1,12 @@
 export enum AuditAction {
-  KYC_APPROVED = 'kyc_approved',
-  KYC_REJECTED = 'kyc_rejected',
+  KYC_APPROVED = 'KYC_APPROVED',
+  KYC_REJECTED = 'KYC_REJECTED',
 
-  PARTNER_APPROVED = 'partner_approved',
-  PARTNER_REJECTED = 'partner_rejected',
+  PARTNER_APPROVED = 'PARTNER_APPROVED',
+  PARTNER_REJECTED = 'PARTNER_REJECTED',
 
-  ASSET_APPROVED = 'asset_approved',
-  ASSET_REJECTED = 'asset_rejected',
+  ASSET_APPROVED = 'ASSET_APPROVED',
+  ASSET_REJECTED = 'ASSET_REJECTED',
 
-  USER_SUSPENDED = 'user_suspended',
+  USER_SUSPENDED = 'USER_SUSPENDED',
 }

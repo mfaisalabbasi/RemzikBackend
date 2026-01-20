@@ -3,4 +3,5 @@ export enum AssetStatus {
   SUBMITTED = 'SUBMITTED',
   APPROVED = 'APPROVED',
   REJECTED = 'REJECTED',
+  FREEZ = 'FREEZ',
 }

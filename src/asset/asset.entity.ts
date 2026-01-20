@@ -58,6 +58,9 @@ export class Asset {
   })
   status: AssetStatus;
 
+  @Column({ type: 'text', nullable: true })
+  rejectionReason?: string;
+
   @CreateDateColumn()
   createdAt: Date;
 

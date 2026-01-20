@@ -1,5 +1,5 @@
 export enum AdminAction {
-  APPROVE = 'approve',
-  REJECT = 'reject',
-  SUSPEND = 'suspend',
+  APPROVE = 'APPROVE',
+  REJECT = 'REJECT',
+  FREEZE = 'FREEZE',
 }

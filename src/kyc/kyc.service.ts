@@ -62,4 +62,28 @@ export class KycService {
     kyc.status = dto.status;
     return this.kycRepo.save(kyc);
   }
+
+  async approve(kycId: string) {
+    const kyc = await this.kycRepo.findOneBy({ id: kycId });
+
+    if (!kyc) {
+      throw new NotFoundException('KYC record not found');
+    }
+
+    kyc.status = KycStatus.APPROVED;
+    await this.kycRepo.save(kyc);
+  }
+
+  async reject(kycId: string, reason?: string) {
+    const kyc = await this.kycRepo.findOneBy({ id: kycId });
+
+    if (!kyc) {
+      throw new NotFoundException('KYC record not found');
+    }
+
+    kyc.status = KycStatus.REJECTED;
+    // kyc.rejectionReason = reason;
+
+    await this.kycRepo.save(kyc);
+  }
 }

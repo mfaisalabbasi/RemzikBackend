@@ -1,11 +1,11 @@
+// src/audit/audit.entity.ts
 import {
   Entity,
   PrimaryGeneratedColumn,
   Column,
   CreateDateColumn,
 } from 'typeorm';
-import { AuditAction } from './enums/audit-action.enum';
-
+import { AdminAction } from 'src/admin/enums/admin-action.enum';
 @Entity('audit_logs')
 export class AuditLog {
   @PrimaryGeneratedColumn('uuid')
@@ -15,13 +15,10 @@ export class AuditLog {
   adminId: string;
 
   @Column()
-  targetType: string; // kyc | partner | asset | user
-
-  @Column()
   targetId: string;
 
-  @Column({ type: 'enum', enum: AuditAction })
-  action: AuditAction;
+  @Column({ type: 'enum', enum: AdminAction })
+  action: AdminAction;
 
   @Column({ nullable: true })
   reason?: string;

@@ -97,4 +97,28 @@ export class PartnerService {
     partner.status = status;
     return this.partnerRepo.save(partner);
   }
+
+  async approve(partnerId: string) {
+    const partner = await this.partnerRepo.findOneBy({ id: partnerId });
+
+    if (!partner) {
+      throw new NotFoundException('Partner not found');
+    }
+
+    partner.status = PartnerStatus.APPROVED;
+    await this.partnerRepo.save(partner);
+  }
+
+  async reject(partnerId: string, reason?: string) {
+    const partner = await this.partnerRepo.findOneBy({ id: partnerId });
+
+    if (!partner) {
+      throw new NotFoundException('Partner not found');
+    }
+
+    partner.status = PartnerStatus.REJECTED;
+    // partner.rejectionReason = reason;
+
+    await this.partnerRepo.save(partner);
+  }
 }

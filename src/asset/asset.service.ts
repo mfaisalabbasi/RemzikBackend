@@ -69,4 +69,38 @@ export class AssetService {
       relations: ['partner'],
     });
   }
+
+  async approve(assetId: string) {
+    const asset = await this.assetRepo.findOneBy({ id: assetId });
+
+    if (!asset) {
+      throw new NotFoundException('Asset not found');
+    }
+
+    asset.status = AssetStatus.APPROVED;
+    await this.assetRepo.save(asset);
+  }
+
+  async reject(assetId: string, reason?: string) {
+    const asset = await this.assetRepo.findOneBy({ id: assetId });
+
+    if (!asset) {
+      throw new NotFoundException('Asset not found');
+    }
+
+    asset.status = AssetStatus.REJECTED;
+    asset.rejectionReason = reason;
+
+    await this.assetRepo.save(asset);
+  }
+  async freeze(assetId: string) {
+    const asset = await this.assetRepo.findOneBy({ id: assetId });
+
+    if (!asset) {
+      throw new NotFoundException('Asset not found');
+    }
+
+    asset.status = AssetStatus.FREEZ;
+    await this.assetRepo.save(asset);
+  }
 }
