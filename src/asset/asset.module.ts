@@ -10,5 +10,6 @@ import { KycModule } from 'src/kyc/kyc.module';
   imports: [TypeOrmModule.forFeature([Asset, PartnerProfile]), KycModule],
   providers: [AssetService],
   controllers: [AssetController],
+  exports: [AssetService],
 })
 export class AssetModule {}

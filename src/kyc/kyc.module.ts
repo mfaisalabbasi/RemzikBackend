@@ -9,6 +9,6 @@ import { User } from '../user/user.entity';
   imports: [TypeOrmModule.forFeature([KycProfile, User])],
   controllers: [KycController],
   providers: [KycService],
-  exports: [TypeOrmModule],
+  exports: [TypeOrmModule, KycService],
 })
 export class KycModule {}
