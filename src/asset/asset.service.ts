@@ -103,4 +103,18 @@ export class AssetService {
     asset.status = AssetStatus.FREEZ;
     await this.assetRepo.save(asset);
   }
+
+  // Analytics Reoprts.....
+
+  // Get assets submitted by a partner
+  async getByPartner(partnerId: string): Promise<Asset[]> {
+    return this.assetRepo.find({
+      where: { partner: { id: partnerId } },
+    });
+  }
+
+  // Get total number of assets
+  async countAssets(): Promise<number> {
+    return this.assetRepo.count();
+  }
 }

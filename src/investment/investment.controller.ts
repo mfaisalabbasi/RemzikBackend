@@ -33,11 +33,11 @@ export class InvestmentController {
   /**
    * ADMIN confirms payment
    */
-  @Patch(':id/confirm')
-  @Roles(UserRole.ADMIN)
-  confirm(@Param('id') id: string) {
-    return this.investmentService.confirmInvestment(id);
-  }
+  // @Patch(':id/confirm')
+  // @Roles(UserRole.ADMIN)
+  // confirm(@Param('id') id: string) {
+  //   return this.investmentService.confirmInvestment(id);
+  // }
 
   /**
    * INVESTOR portfolio

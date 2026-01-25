@@ -9,20 +9,17 @@ import { Investment } from './investment.entity';
 import { CreateInvestmentDto } from './dto/create-investment.dto';
 import { InvestorProfile } from 'src/investor/investor.entity';
 import { Asset } from '../asset/asset.entity';
-import { AssetStatus } from '../asset/enums/asset-status.enum';
 import { InvestmentStatus } from './enums/investment-status.enum';
-
+import { AssetToken } from 'src/tokenization/entities/asset-token.entity';
+import { OwnershipService } from 'src/ownership/ownership.service';
 @Injectable()
 export class InvestmentService {
   constructor(
     @InjectRepository(Investment)
     private readonly investmentRepo: Repository<Investment>,
-
-    @InjectRepository(InvestorProfile)
-    private readonly investorRepo: Repository<InvestorProfile>,
-
-    @InjectRepository(Asset)
-    private readonly assetRepo: Repository<Asset>,
+    @InjectRepository(AssetToken)
+    private readonly assettokenRepo: Repository<AssetToken>,
+    private readonly ownershipService: OwnershipService,
   ) {}
 
   /**
@@ -32,54 +29,58 @@ export class InvestmentService {
     userId: string,
     dto: CreateInvestmentDto,
   ): Promise<Investment> {
-    const investor = await this.investorRepo.findOne({
-      where: { user: { id: userId } },
-      relations: ['user'],
+    return await this.investmentRepo.manager.transaction(async (manager) => {
+      // 1️⃣ Load investor
+      const investor = await manager.findOne(InvestorProfile, {
+        where: { user: { id: userId } },
+        relations: ['user'],
+      });
+
+      if (!investor) {
+        throw new BadRequestException('Investor profile required');
+      }
+
+      // 2️⃣ Lock token row (IMPORTANT)
+      const token = await manager
+        .getRepository(AssetToken)
+        .createQueryBuilder('token')
+        .setLock('pessimistic_write')
+        .where('token.assetId = :assetId', {
+          assetId: dto.assetId,
+        })
+        .getOne();
+
+      if (!token) {
+        throw new BadRequestException('Asset not tokenized');
+      }
+
+      // 3️⃣ Calculate shares
+      const sharesToBuy = dto.amount / Number(token.sharePrice);
+
+      if (sharesToBuy > token.availableShares) {
+        throw new BadRequestException('Not enough shares available');
+      }
+
+      // 4️⃣ Deduct shares
+      token.availableShares -= sharesToBuy;
+      await manager.save(token);
+
+      // 5️⃣ Create investment
+      const investment = manager.create(Investment, {
+        investor,
+        asset: token.asset,
+        amount: dto.amount,
+        status: InvestmentStatus.PENDING,
+      });
+
+      return manager.save(investment);
     });
-
-    if (!investor) {
-      throw new BadRequestException('Investor profile required');
-    }
-
-    const asset = await this.assetRepo.findOne({
-      where: { id: dto.assetId },
-    });
-
-    if (!asset || asset.status !== AssetStatus.APPROVED) {
-      throw new BadRequestException('Asset not available for investment');
-    }
-
-    const investedSoFar = await this.investmentRepo
-      .createQueryBuilder('investment')
-      .select('SUM(investment.amount)', 'total')
-      .where('investment.assetId = :assetId', { assetId: asset.id })
-      .andWhere('investment.status = :status', {
-        status: InvestmentStatus.CONFIRMED,
-      })
-      .getRawOne();
-
-    const totalInvested = Number(investedSoFar.total || 0);
-
-    if (totalInvested + dto.amount > Number(asset.totalValue)) {
-      throw new BadRequestException('Investment exceeds asset value');
-    }
-
-    const investment = this.investmentRepo.create({
-      investor,
-      asset,
-      amount: dto.amount,
-      status: InvestmentStatus.PENDING,
-    });
-
-    return this.investmentRepo.save(investment);
   }
 
-  /**
-   * Simulate payment confirmation (ADMIN / GATEWAY)
-   */
   async confirmInvestment(id: string): Promise<Investment> {
     const investment = await this.investmentRepo.findOne({
       where: { id },
+      relations: ['investor', 'asset'],
     });
 
     if (!investment) {
@@ -87,6 +88,19 @@ export class InvestmentService {
     }
 
     investment.status = InvestmentStatus.CONFIRMED;
+
+    const token = await this.assettokenRepo.findOne({
+      where: { asset: { id: investment.asset.id } },
+    });
+
+    const shares = investment.amount / Number(token?.sharePrice);
+
+    await this.ownershipService.addShares(
+      investment.investor,
+      investment.asset,
+      shares,
+    );
+
     return this.investmentRepo.save(investment);
   }
 
@@ -98,5 +112,36 @@ export class InvestmentService {
       where: { investor: { user: { id: userId } } },
       relations: ['asset'],
     });
+  }
+
+  // Analytics part .......................
+
+  // Get all investments by a user
+  async getByUser(userId: string): Promise<Investment[]> {
+    return this.investmentRepo.find({
+      where: { investor: { id: userId } },
+      relations: ['investor', 'asset'],
+    });
+  }
+
+  // Get total raised for a specific asset
+  async getTotalByAsset(assetId: string): Promise<number> {
+    const result = await this.investmentRepo
+      .createQueryBuilder('investment')
+      .select('SUM(investment.amount)', 'total')
+      .where('investment.assetId = :assetId', { assetId })
+      .getRawOne();
+
+    return Number(result.total) || 0;
+  }
+
+  // Get total invested by all users
+  async getTotalInvested(): Promise<number> {
+    const result = await this.investmentRepo
+      .createQueryBuilder('investment')
+      .select('SUM(investment.amount)', 'total')
+      .getRawOne();
+
+    return Number(result.total) || 0;
   }
 }

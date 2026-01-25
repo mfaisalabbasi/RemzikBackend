@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { forwardRef, Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { AppController } from './app.controller';
@@ -14,6 +14,14 @@ import { PartnerApprovedGuard } from './auth/guards/partner-approved.guard';
 import { InvestorModule } from './investor/investor.module';
 import { DocumentModule } from './document/document.module';
 import { AdminModule } from './admin/admin.module';
+import { TokenizationModule } from './tokenization/tokenization.module';
+import { OwnershipModule } from './ownership/ownership.module';
+import { ScheduleModule } from '@nestjs/schedule';
+import { CronService } from './cron/cron.service';
+import { PayoutService } from './payout/payout.service';
+import { WalletModule } from './wallet/wallet.module';
+import { LedgerModule } from './ledger/ledger.module';
+import { PayoutModule } from './payout/payout.module';
 
 @Module({
   imports: [
@@ -23,6 +31,7 @@ import { AdminModule } from './admin/admin.module';
 
     TypeOrmModule.forRootAsync({
       imports: [
+        ScheduleModule.forRoot(),
         ConfigModule,
         UserModule,
         AuthModule,
@@ -33,6 +42,11 @@ import { AdminModule } from './admin/admin.module';
         InvestorModule,
         DocumentModule,
         AdminModule,
+        TokenizationModule,
+        OwnershipModule,
+        WalletModule,
+        LedgerModule,
+        forwardRef(() => PayoutModule),
       ],
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
@@ -50,6 +64,7 @@ import { AdminModule } from './admin/admin.module';
   controllers: [AppController],
   providers: [
     AppService,
+
     // KycGuard,
     // PartnerApprovedGuard]
   ],

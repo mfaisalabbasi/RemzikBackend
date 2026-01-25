@@ -1,85 +1,46 @@
-import {
-  BadRequestException,
-  Injectable,
-  NotFoundException,
-} from '@nestjs/common';
-import { ShareStatus } from './enums/share-status.enum';
-import { Repository } from 'typeorm';
-import { Asset } from 'src/asset/asset.entity';
+import { Injectable, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Ownership } from './entities/ownershipt.entity';
-import { AssetShare } from './entities/asset-share.entity';
+import { Repository } from 'typeorm';
+import { AssetToken } from './entities/asset-token.entity';
+import { Asset } from '../asset/asset.entity';
+import { CreateTokenizationDto } from './dto/create-tokenization.dto';
+import { AssetStatus } from '../asset/enums/asset-status.enum';
 
 @Injectable()
 export class TokenizationService {
   constructor(
-    @InjectRepository(AssetShare)
-    private shareRepo: Repository<AssetShare>,
-
-    @InjectRepository(Ownership)
-    private ownershipRepo: Repository<Ownership>,
+    @InjectRepository(AssetToken)
+    private readonly tokenRepo: Repository<AssetToken>,
 
     @InjectRepository(Asset)
-    private assetRepo: Repository<Asset>,
+    private readonly assetRepo: Repository<Asset>,
   ) {}
 
-  //Initialize Asset Shares (ONCE)
-
-  async initializeShares(
-    assetId: string,
-    totalShares: number,
-    pricePerShare: number,
-  ) {
+  /**
+   * ADMIN tokenizes an asset
+   */
+  async tokenizeAsset(assetId: string, dto: CreateTokenizationDto) {
     const asset = await this.assetRepo.findOne({ where: { id: assetId } });
 
-    if (!asset) throw new NotFoundException('Asset not found');
+    if (!asset || asset.status !== AssetStatus.APPROVED) {
+      throw new BadRequestException('Asset not approved');
+    }
 
-    const existing = await this.shareRepo.findOne({ where: { asset } });
-    if (existing) throw new BadRequestException('Shares already initialized');
-
-    return this.shareRepo.save({
-      asset,
-      totalShares,
-      pricePerShare,
-      status: ShareStatus.ACTIVE,
-    });
-  }
-
-  // Mint Shares (INVESTMENT → OWNERSHIP)
-
-  async mintShares(investorId: string, assetId: string, shares: number) {
-    const shareConfig = await this.shareRepo.findOne({
+    const existing = await this.tokenRepo.findOne({
       where: { asset: { id: assetId } },
     });
 
-    if (!shareConfig || shareConfig.status !== ShareStatus.ACTIVE) {
-      throw new BadRequestException('Asset not tokenized');
+    if (existing) {
+      throw new BadRequestException('Asset already tokenized');
     }
 
-    const minted = await this.ownershipRepo
-      .createQueryBuilder('o')
-      .select('SUM(o.sharesOwned)', 'sum')
-      .where('o.assetId = :assetId', { assetId })
-      .getRawOne();
-
-    const mintedShares = Number(minted.sum || 0);
-
-    if (mintedShares + shares > shareConfig.totalShares) {
-      throw new BadRequestException('Not enough shares available');
-    }
-
-    return this.ownershipRepo.save({
-      investor: { id: investorId },
-      asset: { id: assetId },
-      sharesOwned: shares,
+    const token = this.tokenRepo.create({
+      asset,
+      totalShares: dto.totalShares,
+      sharePrice: dto.sharePrice,
+      availableShares: dto.totalShares,
     });
+
+    return this.tokenRepo.save(token);
   }
 }
-
-//LINK WITH INVESTMENT MODULE
-
-// await this.tokenizationService.mintShares(
-//   investorId,
-//   assetId,
-//   calculatedShares,
-// );

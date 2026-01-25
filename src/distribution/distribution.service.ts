@@ -1,69 +1,66 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
-import { RevenueStatus } from './enums/distribution-status.enum';
-import { PayoutStatus } from './enums/payout-status.enum';
-import { TokenizationService } from 'src/tokenization/tokenization.service';
-import { Repository } from 'typeorm';
-import { Payout } from './entities/payout.entity';
+import { Injectable, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Revenue } from './entities/distribution.entity';
+import { Repository } from 'typeorm';
+import { Distribution } from './distribution.entity';
+import { Ownership } from '../ownership/ownership.entity';
+import { Asset } from '../asset/asset.entity';
+import { AssetToken } from 'src/tokenization/entities/asset-token.entity';
 
 @Injectable()
-export class RevenueService {
+export class DistributionService {
   constructor(
-    @InjectRepository(Revenue)
-    private revenueRepo: Repository<Revenue>,
+    @InjectRepository(Distribution)
+    private readonly distributionRepo: Repository<Distribution>,
 
-    @InjectRepository(Payout)
-    private payoutRepo: Repository<Payout>,
+    @InjectRepository(Ownership)
+    private readonly ownershipRepo: Repository<Ownership>,
 
-    private tokenizationService: TokenizationService,
+    @InjectRepository(AssetToken)
+    private readonly assetTokenRepo: Repository<AssetToken>,
   ) {}
 
-  // Create Revenue Entry
-
-  async recordRevenue(assetId: string, totalAmount: number) {
-    const platformFee = totalAmount * 0.05; // 5%
-    const distributable = totalAmount - platformFee;
-
-    return this.revenueRepo.save({
-      asset: { id: assetId },
-      totalAmount,
-      platformFee,
-      distributableAmount: distributable,
-      status: RevenueStatus.PENDING,
+  /**
+   * Distribute income for an asset
+   */
+  async distributeIncome(
+    asset: Asset,
+    totalIncome: number,
+    period: string,
+  ): Promise<void> {
+    // 1️⃣ Get all ownerships for this asset
+    const ownerships = await this.ownershipRepo.find({
+      where: { asset: { id: asset.id } },
+      relations: ['investor', 'asset'],
     });
+
+    if (!ownerships || ownerships.length === 0) {
+      throw new BadRequestException('No ownerships found for this asset');
+    }
+
+    // 2️⃣ Get the token record for this asset
+    const token = await this.assetTokenRepo.findOne({
+      where: { asset: { id: asset.id } },
+    });
+
+    if (!token) {
+      throw new BadRequestException('Asset not tokenized yet');
+    }
+
+    // 3️⃣ Loop over each ownership and calculate payout
+    for (const ownership of ownerships) {
+      const shareRatio = Number(ownership.shares) / Number(token.totalShares);
+      const payout = totalIncome * shareRatio;
+
+      // 4️⃣ Create distribution record
+      const record = this.distributionRepo.create({
+        asset,
+        investor: ownership.investor,
+        amount: payout,
+        period,
+        paid: false,
+      });
+
+      await this.distributionRepo.save(record);
+    }
   }
-
-  // DISTRIBUTE REVENUE (CRITICAL FUNCTION)
-
-  // async distributeRevenue(revenueId: string) {
-  //   const revenue = await this.revenueRepo.findOne({
-  //     where: { id: revenueId },
-  //   });
-
-  //   if (!revenue || revenue.status === RevenueStatus.DISTRIBUTED) {
-  //     throw new BadRequestException('Invalid revenue state');
-  //   }
-
-  //   const ownerships =
-  //     await this.tokenizationService.getOwnershipSnapshot(
-  //       revenue.asset.id,
-  //     );
-
-  //   for (const o of ownerships) {
-  //     const payoutAmount =
-  //       (revenue.distributableAmount * o.percentage) / 100;
-
-  //     await this.payoutRepo.save({
-  //       revenue,
-  //       user: { id: o.userId },
-  //       ownershipPercentage: o.percentage,
-  //       amount: payoutAmount,
-  //       status: PayoutStatus.PENDING,
-  //     });
-  //   }
-
-  //   revenue.status = RevenueStatus.DISTRIBUTED;
-  //   await this.revenueRepo.save(revenue);
-  // }
 }
