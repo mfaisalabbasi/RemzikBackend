@@ -1,0 +1,14 @@
+export enum DisputeStatus {
+  OPEN = 'OPEN',
+  UNDER_REVIEW = 'UNDER_REVIEW',
+  RESOLVED = 'RESOLVED',
+  REJECTED = 'REJECTED',
+}
+
+export enum DisputeType {
+  INVESTMENT = 'INVESTMENT',
+  PAYOUT = 'PAYOUT',
+  TRADE = 'TRADE',
+  WITHDRAWAL = 'WITHDRAWAL',
+  SECONDARY_TRADE = 'SECONDARY_TRADE',
+}

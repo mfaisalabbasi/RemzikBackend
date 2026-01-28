@@ -34,6 +34,9 @@ export class Ownership {
   @Column('decimal', { precision: 15, scale: 4 })
   shares: number;
 
+  @Column({ type: 'int', default: 0 }) // ✅ add this if missing
+  units: number;
+
   @CreateDateColumn()
   createdAt: Date;
 

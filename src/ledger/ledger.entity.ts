@@ -19,6 +19,11 @@ export class LedgerEntry {
   @Column('decimal', { precision: 15, scale: 2 })
   amount: number;
 
+  @Column({ nullable: true })
+  reference?: string;
+  @Column({ nullable: true })
+  description?: string;
+
   @Column({
     type: 'enum',
     enum: LedgerType,

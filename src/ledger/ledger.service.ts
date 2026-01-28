@@ -64,4 +64,29 @@ export class LedgerService {
 
     return query.orderBy('ledger.createdAt', 'ASC').getMany();
   }
+
+  async recordDisputeAdjustment(
+    userId: string,
+    amount: number,
+    referenceId: string,
+  ) {
+    return this.ledgerRepo.save({
+      userId,
+      type: LedgerType.DISPUTE_ADJUSTMENT,
+      amount,
+      referenceId,
+    });
+  }
+
+  async record(data: {
+    userId: string;
+    amount: number;
+    type: LedgerType;
+    source: LedgerSource;
+    reference?: string;
+    description?: string;
+  }) {
+    const entry = this.ledgerRepo.create(data);
+    return this.ledgerRepo.save(entry);
+  }
 }

@@ -40,4 +40,13 @@ export class OwnershipService {
 
     await this.ownershipRepo.save(ownership);
   }
+
+  // ✅ Add this method
+  async getUserUnitsForAsset(userId: string, assetId: string): Promise<number> {
+    const record = await this.ownershipRepo.findOne({
+      where: { user: { id: userId }, assetId } as any,
+    });
+
+    return record?.units ?? 0;
+  }
 }

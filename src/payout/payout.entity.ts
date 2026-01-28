@@ -25,6 +25,12 @@ export class Payout {
 
   @Column({ type: 'text', nullable: true })
   note?: string;
+  //secondary marekt updates
+  @Column()
+  userId: string; // seller
+
+  @Column()
+  referenceId: string; // tradeId
 
   @CreateDateColumn()
   createdAt: Date;

@@ -155,4 +155,53 @@ export class PayoutService {
       return false;
     }
   }
+
+  //secondary market updates
+
+  async settleSeller({
+    sellerId,
+    amount,
+    tradeId,
+  }: {
+    sellerId: string;
+    amount: number;
+    tradeId: string;
+  }) {
+    // 1️⃣ Create payout record
+    const payout = this.payoutRepo.create({
+      userId: sellerId,
+      referenceId: tradeId,
+      amount,
+      status: PayoutStatus.PENDING,
+    });
+
+    await this.payoutRepo.save(payout);
+
+    try {
+      // 2️⃣ Credit seller wallet
+      await this.walletService.credit(
+        sellerId,
+        amount,
+        LedgerSource.SECONDARY_MARKET_SELL,
+      );
+
+      // 3️⃣ Ledger entry
+      await this.ledgerService.record({
+        userId: sellerId,
+        amount,
+        type: LedgerType.CREDIT,
+        source: LedgerSource.SECONDARY_MARKET_SELL,
+        reference: tradeId,
+        description: 'Secondary market sale settlement',
+      });
+
+      // 4️⃣ Mark payout completed
+      payout.status = PayoutStatus.COMPLETED;
+      return this.payoutRepo.save(payout);
+    } catch (error) {
+      payout.status = PayoutStatus.FAILED;
+      await this.payoutRepo.save(payout);
+      throw error;
+    }
+  }
 }

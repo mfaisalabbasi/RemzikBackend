@@ -3,4 +3,5 @@ export enum PayoutStatus {
   PROCESSING = 'PROCESSING',
   COMPLETED = 'COMPLETED',
   FAILED = 'FAILED',
+  PENDING = 'PENDING',
 }

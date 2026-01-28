@@ -3,4 +3,5 @@ export class WalletResponseDto {
   lockedBalance: number;
   pendingPayout: number;
   totalEarned: number;
+  balance: number;
 }
