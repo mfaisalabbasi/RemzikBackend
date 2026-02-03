@@ -16,7 +16,11 @@ import { UserRole } from '../user/enums/user-role.enum';
 import { CreateInvestmentDto } from './dto/create-investment.dto';
 import { KycGuard } from 'src/auth/guards/kyc.guard';
 
-@UseGuards(JwtAuthGuard, RolesGuard, KycGuard)
+@UseGuards(
+  JwtAuthGuard,
+  RolesGuard,
+  // KycGuard
+)
 @Controller('investments')
 export class InvestmentController {
   constructor(private readonly investmentService: InvestmentService) {}
@@ -33,11 +37,11 @@ export class InvestmentController {
   /**
    * ADMIN confirms payment
    */
-  // @Patch(':id/confirm')
-  // @Roles(UserRole.ADMIN)
-  // confirm(@Param('id') id: string) {
-  //   return this.investmentService.confirmInvestment(id);
-  // }
+  @Patch(':id/confirm')
+  @Roles(UserRole.ADMIN)
+  confirm(@Param('id') id: string) {
+    return this.investmentService.confirmInvestment(id);
+  }
 
   /**
    * INVESTOR portfolio

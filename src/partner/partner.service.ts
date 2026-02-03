@@ -117,7 +117,7 @@ export class PartnerService {
     }
 
     partner.status = PartnerStatus.REJECTED;
-    // partner.rejectionReason = reason;
+    //partner.rejectionReason = reason;
 
     await this.partnerRepo.save(partner);
   }
