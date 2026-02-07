@@ -11,25 +11,32 @@ export class ListingService {
   constructor(
     @InjectRepository(SecondaryMarketListing)
     private readonly listingRepo: Repository<SecondaryMarketListing>,
-
     private readonly ownershipService: OwnershipService,
   ) {}
 
+  /**
+   * Create a secondary market listing
+   */
   async createListing(
-    sellerId: string,
+    sellerId: string, // ✅ MUST be UUID string
     dto: CreateListingDto,
   ): Promise<SecondaryMarketListing> {
-    // 1️⃣ Check seller ownership
+    if (!sellerId) {
+      throw new BadRequestException('Invalid seller id');
+    }
+
+    // 1️⃣ Check ownership
     const ownedUnits = await this.ownershipService.getUserUnitsForAsset(
       sellerId,
       dto.assetId,
     );
-
     if (ownedUnits < dto.unitsForSale) {
-      throw new BadRequestException('Insufficient units to create listing');
+      throw new BadRequestException(
+        `Insufficient units. You own ${ownedUnits} units.`,
+      );
     }
 
-    // 2️⃣ Create listing entity
+    // 2️⃣ Create listing
     const listing = this.listingRepo.create({
       sellerId,
       assetId: dto.assetId,
@@ -39,10 +46,13 @@ export class ListingService {
       status: ListingStatus.ACTIVE,
     });
 
-    // 3️⃣ Save to DB
+    // 3️⃣ Save
     return this.listingRepo.save(listing);
   }
 
+  /**
+   * Get active listings by asset
+   */
   async getActiveListingsByAsset(assetId: string) {
     return this.listingRepo.find({
       where: {
@@ -53,6 +63,9 @@ export class ListingService {
     });
   }
 
+  /**
+   * Cancel listing
+   */
   async cancelListing(listingId: string, sellerId: string) {
     const listing = await this.listingRepo.findOne({
       where: { id: listingId },

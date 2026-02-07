@@ -51,7 +51,6 @@ export class AssetService {
     const asset = await this.assetRepo.findOne({
       where: { id: assetId },
     });
-
     if (!asset) {
       throw new NotFoundException('Asset not found');
     }

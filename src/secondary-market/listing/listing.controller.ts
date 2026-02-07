@@ -1,13 +1,24 @@
-import { Controller, Post, Body, Get, Param, Delete } from '@nestjs/common';
+import {
+  Controller,
+  Post,
+  Body,
+  Get,
+  Param,
+  Delete,
+  UseGuards,
+} from '@nestjs/common';
 import { ListingService } from './listing.service';
 import { CreateListingDto } from './dto/create-listing.dto';
 import { CurrentUser } from 'src/auth/decorators/current-user.decorator';
+import { JwtAuthGuard } from 'src/auth/guards/jwt.gaurd';
+
+@UseGuards(JwtAuthGuard)
 @Controller('secondary-market/listings')
 export class ListingController {
   constructor(private readonly listingService: ListingService) {}
 
   @Post()
-  create(@CurrentUser('id') userId: string, @Body() dto: CreateListingDto) {
+  create(@CurrentUser('userId') userId: string, @Body() dto: CreateListingDto) {
     return this.listingService.createListing(userId, dto);
   }
 

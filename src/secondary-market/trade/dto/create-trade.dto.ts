@@ -1,12 +1,14 @@
-import { IsUUID, IsNumber } from 'class-validator';
+import { IsString, IsNumber, IsPositive } from 'class-validator';
 
 export class CreateTradeDto {
-  @IsUUID()
-  investmentId: string;
+  @IsString()
+  assetId: string;
 
   @IsNumber()
-  price: number;
+  @IsPositive()
+  units: number;
 
-  @IsUUID()
-  sellerId: string;
+  @IsNumber()
+  @IsPositive()
+  pricePerUnit: number;
 }

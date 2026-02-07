@@ -18,7 +18,12 @@ import { UpdateAssetStatusDto } from './dto/update-asset.dto';
 import { KycGuard } from 'src/auth/guards/kyc.guard';
 import { PartnerApprovedGuard } from 'src/auth/guards/partner-approved.guard';
 
-@UseGuards(JwtAuthGuard, RolesGuard, KycGuard, PartnerApprovedGuard)
+@UseGuards(
+  JwtAuthGuard,
+  RolesGuard,
+  // KycGuard,
+  // PartnerApprovedGuard
+)
 @Controller('assets')
 export class AssetController {
   constructor(private readonly assetService: AssetService) {}

@@ -16,7 +16,7 @@ export class InvestorProfile {
   /**
    * One investor profile per user
    */
-  @OneToOne(() => User)
+  @OneToOne(() => User, { eager: true })
   @JoinColumn()
   user: User;
 

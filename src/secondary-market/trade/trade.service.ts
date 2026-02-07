@@ -1,99 +1,138 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { Trade, TradeStatus } from './trade.entity';
+
+import { Trade } from './trade.entity';
+import { TradeStatus } from './enums/trade-status.enum';
 import { CreateTradeDto } from './dto/create-trade.dto';
-import { ExecuteTradeDto } from './dto/excute-trade.dto';
-import { WalletService } from 'src/wallet/wallet.service';
-import { LedgerService } from 'src/ledger/ledger.service';
-import { LedgerType } from 'src/ledger/enums/ledger-type.enum';
-import { LedgerSource } from 'src/ledger/enums/ledger-source.enum';
 import { TradeLockService } from './trade-lock.service';
-import { User } from 'src/user/user.entity';
-import { Investment } from 'src/investment/investment.entity';
+import { OwnershipService } from 'src/ownership/ownership.service';
+import { InvestorProfile } from 'src/investor/investor.entity';
+import { Asset } from 'src/asset/asset.entity';
+
 @Injectable()
 export class TradeService {
   constructor(
     @InjectRepository(Trade)
     private readonly tradeRepo: Repository<Trade>,
-    private readonly walletService: WalletService,
-    private readonly ledgerService: LedgerService,
+    private readonly ownershipService: OwnershipService,
     private readonly tradeLockService: TradeLockService,
   ) {}
 
-  async createTrade(dto: CreateTradeDto, seller: User): Promise<Trade> {
+  /*
+  =====================================================
+  CREATE TRADE
+  =====================================================
+  */
+  async createTrade(
+    sellerProfile: InvestorProfile,
+    dto: CreateTradeDto,
+  ): Promise<Trade> {
+    if (!sellerProfile) throw new BadRequestException('Invalid seller profile');
+    if (dto.units <= 0)
+      throw new BadRequestException('Units must be greater than 0');
+    if (dto.pricePerUnit <= 0)
+      throw new BadRequestException('Price must be greater than 0');
+
+    // ✅ Check seller units using userId
+    const ownedUnits = await this.ownershipService.getUserUnitsForAsset(
+      sellerProfile.user.id,
+      dto.assetId,
+    );
+
+    if (ownedUnits < dto.units)
+      throw new BadRequestException(
+        `Insufficient units. You own ${ownedUnits}`,
+      );
+
     const trade = this.tradeRepo.create({
-      investment: { id: dto.investmentId } as Investment,
-      seller,
-      price: dto.price,
+      seller: sellerProfile,
+      asset: { id: dto.assetId } as Asset,
+      units: dto.units,
+      pricePerUnit: dto.pricePerUnit,
+      totalPrice: dto.units * dto.pricePerUnit,
       status: TradeStatus.PENDING,
     });
+
     return this.tradeRepo.save(trade);
   }
 
-  async executeTrade(dto: ExecuteTradeDto, buyer: User): Promise<Trade> {
+  /*
+  =====================================================
+  EXECUTE TRADE
+  =====================================================
+  */
+  async executeTrade(
+    tradeId: string,
+    buyerProfile: InvestorProfile,
+  ): Promise<Trade> {
+    if (!buyerProfile) throw new BadRequestException('Invalid buyer profile');
+
+    // 🔍 Fetch trade with seller and asset including user relation
     const trade = await this.tradeRepo.findOne({
-      where: { id: dto.tradeId },
-      relations: ['seller', 'investment'],
+      where: { id: tradeId },
+      relations: ['seller', 'seller.user', 'asset'],
     });
+
     if (!trade) throw new BadRequestException('Trade not found');
     if (trade.status !== TradeStatus.PENDING)
       throw new BadRequestException('Trade already executed');
+    if (trade.seller.id === buyerProfile.id)
+      throw new BadRequestException('Cannot execute own trade');
 
-    // Phase 8: Lock
-    if (!this.tradeLockService.lock(trade.id)) {
-      throw new BadRequestException(
-        'Trade is being executed by another process',
-      );
-    }
+    if (!trade.seller.user)
+      throw new BadRequestException('Seller user not loaded');
+
+    // 🔐 LOCK trade execution
+    if (!this.tradeLockService.lock(trade.id))
+      throw new BadRequestException('Trade being executed elsewhere');
 
     try {
-      // Phase 8: Debit buyer
-      await this.walletService.debit(
-        buyer.id,
-        trade.price,
-        'Secondary market purchase',
+      const sellerUserId = trade.seller.user.id; // for getUserUnitsForAsset
+      const sellerInvestorId = trade.seller.id; // for removeUnits
+      const buyerUserId = buyerProfile.user.id; // for addUnits via string
+      const buyerInvestorId = buyerProfile.id; // for addUnits via object
+
+      // 1️⃣ Check seller units using userId
+      const sellerUnits = await this.ownershipService.getUserUnitsForAsset(
+        sellerUserId,
+        trade.asset.id,
       );
 
-      // Phase 8: Credit seller
-      await this.walletService.credit(
-        trade.seller.id,
-        trade.price,
-        LedgerSource.PAYOUT_COMPLETED,
-        'Secondary market sale',
-      );
+      if (sellerUnits < trade.units)
+        throw new BadRequestException('Seller no longer owns required units');
 
-      // Phase 7: Update trade
-      trade.buyer = buyer;
+      // 2️⃣ Transfer ownership
+      await this.ownershipService.removeUnits(
+        trade.seller.id, // investorId
+        trade.asset.id,
+        trade.units,
+      );
+      await this.ownershipService.addUnits(
+        buyerUserId,
+        trade.asset.id,
+        trade.units,
+      ); // pass userId string
+
+      // 3️⃣ Update trade record
+      trade.buyer = buyerProfile;
       trade.status = TradeStatus.COMPLETED;
-      await this.tradeRepo.save(trade);
+      trade.executedAt = new Date();
 
-      // Ledger entry
-      await this.ledgerService.record({
-        userId: buyer.id,
-        amount: trade.price,
-        type: LedgerType.PAYOUT,
-        source: LedgerSource.PAYOUT_COMPLETED,
-        reference: trade.id,
-      });
-
-      await this.ledgerService.record({
-        userId: trade.seller.id,
-        amount: trade.price,
-        type: LedgerType.DISTRIBUTION,
-        source: LedgerSource.DISTRIBUTION_ENGINE,
-        reference: trade.id,
-      });
-
-      return trade;
+      return await this.tradeRepo.save(trade);
     } finally {
       this.tradeLockService.unlock(trade.id);
     }
   }
 
+  /*
+  =====================================================
+  GET ALL TRADES
+  =====================================================
+  */
   async getTrades(): Promise<Trade[]> {
     return this.tradeRepo.find({
-      relations: ['buyer', 'seller', 'investment'],
+      relations: ['buyer', 'buyer.user', 'seller', 'seller.user', 'asset'],
     });
   }
 }
