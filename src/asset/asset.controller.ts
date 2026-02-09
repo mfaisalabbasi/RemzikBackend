@@ -18,12 +18,7 @@ import { UpdateAssetStatusDto } from './dto/update-asset.dto';
 import { KycGuard } from 'src/auth/guards/kyc.guard';
 import { PartnerApprovedGuard } from 'src/auth/guards/partner-approved.guard';
 
-@UseGuards(
-  JwtAuthGuard,
-  RolesGuard,
-  // KycGuard,
-  // PartnerApprovedGuard
-)
+@UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('assets')
 export class AssetController {
   constructor(private readonly assetService: AssetService) {}
@@ -32,6 +27,7 @@ export class AssetController {
    * PARTNER submits asset
    */
   @Post()
+  @UseGuards(KycGuard, PartnerApprovedGuard)
   @Roles(UserRole.PARTNER)
   create(@Req() req, @Body() dto: CreateAssetDto) {
     return this.assetService.createAsset(req.user.userId, dto);

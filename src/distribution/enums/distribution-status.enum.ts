@@ -1,4 +1,4 @@
 export enum RevenueStatus {
-  PENDING = 'pending',
-  DISTRIBUTED = 'distributed',
+  PENDING = 'PENDING',
+  DISTRIBUTED = 'DISTRIBUTED',
 }

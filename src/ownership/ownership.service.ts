@@ -26,7 +26,6 @@ export class OwnershipService {
     });
 
     if (!investor) {
-      console.log('No investor found for userId:', userId);
       throw new BadRequestException('Investor profile not found!');
     }
 

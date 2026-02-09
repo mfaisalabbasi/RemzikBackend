@@ -16,11 +16,7 @@ import { UserRole } from '../user/enums/user-role.enum';
 import { CreateInvestmentDto } from './dto/create-investment.dto';
 import { KycGuard } from 'src/auth/guards/kyc.guard';
 
-@UseGuards(
-  JwtAuthGuard,
-  RolesGuard,
-  // KycGuard
-)
+@UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('investments')
 export class InvestmentController {
   constructor(private readonly investmentService: InvestmentService) {}
@@ -29,6 +25,7 @@ export class InvestmentController {
    * INVESTOR invests
    */
   @Post()
+  @UseGuards(KycGuard)
   @Roles(UserRole.INVESTOR)
   create(@Req() req, @Body() dto: CreateInvestmentDto) {
     return this.investmentService.createInvestment(req.user.userId, dto);

@@ -1,16 +1,26 @@
 import { Injectable } from '@nestjs/common';
 import { Trade } from './trade.entity';
 import { TradeStatus } from './enums/trade-status.enum';
+
+export interface ExecutedTrade {
+  buyerId: string;
+  sellerId: string;
+  assetId: string;
+  units: number;
+  pricePerUnit: number;
+}
+
 @Injectable()
 export class MatchingEngineService {
   /**
    * Match buy and sell orders
-   * Returns pairs of trades that can be executed
+   * Supports multi-asset, partial fills, and price-time priority
+   * Returns array of executed trade objects
    */
-  match(buyOrders: Trade[], sellOrders: Trade[]): [Trade, Trade][] {
-    const matches: [Trade, Trade][] = [];
+  match(buyOrders: Trade[], sellOrders: Trade[]): ExecutedTrade[] {
+    const executedTrades: ExecutedTrade[] = [];
 
-    // Filter only PENDING orders
+    // 1️⃣ Filter only PENDING orders
     const pendingBuys = buyOrders.filter(
       (b) => b.status === TradeStatus.PENDING,
     );
@@ -18,39 +28,63 @@ export class MatchingEngineService {
       (s) => s.status === TradeStatus.PENDING,
     );
 
-    // Sort: highest buy price first, lowest sell price first
-    pendingBuys.sort((a, b) => b.pricePerUnit - a.pricePerUnit);
-    pendingSells.sort((a, b) => a.pricePerUnit - b.pricePerUnit);
+    // 2️⃣ Group orders by asset for multi-asset support
+    const assets = Array.from(
+      new Set([...pendingBuys, ...pendingSells].map((o) => o.asset.id)),
+    );
 
-    for (const buy of pendingBuys) {
-      for (const sell of pendingSells) {
-        if (sell.status !== TradeStatus.PENDING) continue;
+    for (const assetId of assets) {
+      const buys = pendingBuys.filter((b) => b.asset.id === assetId);
+      const sells = pendingSells.filter((s) => s.asset.id === assetId);
 
-        // Match if buyer price >= seller price
-        if (buy.pricePerUnit >= sell.pricePerUnit) {
-          // Determine units to trade (partial fills supported)
-          const unitsToTrade = Math.min(buy.units, sell.units);
+      // 3️⃣ Sort orders by price-time priority
+      buys.sort(
+        (a, b) =>
+          b.pricePerUnit - a.pricePerUnit ||
+          a.createdAt.getTime() - b.createdAt.getTime(),
+      );
+      sells.sort(
+        (a, b) =>
+          a.pricePerUnit - b.pricePerUnit ||
+          a.createdAt.getTime() - b.createdAt.getTime(),
+      );
 
-          // Reduce units from orders
-          buy.units -= unitsToTrade;
-          sell.units -= unitsToTrade;
+      // 4️⃣ Match loop
+      for (const buy of buys) {
+        if (buy.units <= 0) continue;
 
-          // Mark trades as completed if fully filled
-          if (buy.units === 0) buy.status = TradeStatus.COMPLETED;
-          if (sell.units === 0) sell.status = TradeStatus.COMPLETED;
+        for (const sell of sells) {
+          if (sell.units <= 0) continue;
 
-          // Clone trades for the match to represent the executed amount
-          const executedBuy = { ...buy, units: unitsToTrade } as Trade;
-          const executedSell = { ...sell, units: unitsToTrade } as Trade;
+          // Check price condition
+          if (buy.pricePerUnit >= sell.pricePerUnit) {
+            // Determine units to trade (partial fill)
+            const unitsToTrade = Math.min(buy.units, sell.units);
 
-          matches.push([executedBuy, executedSell]);
+            // Reduce units from both orders
+            buy.units -= unitsToTrade;
+            sell.units -= unitsToTrade;
 
-          // Stop if buy is fully matched
-          if (buy.units === 0) break;
+            // Mark as completed if fully filled
+            if (buy.units === 0) buy.status = TradeStatus.COMPLETED;
+            if (sell.units === 0) sell.status = TradeStatus.COMPLETED;
+
+            // Add executed trade
+            executedTrades.push({
+              buyerId: buy.buyer?.id || buy.seller.id, // buyerProfile.id must be provided when creating buy order
+              sellerId: sell.seller.id,
+              assetId,
+              units: unitsToTrade,
+              pricePerUnit: sell.pricePerUnit, // seller price is executed price
+            });
+
+            // Stop if buy is fully matched
+            if (buy.units === 0) break;
+          }
         }
       }
     }
 
-    return matches;
+    return executedTrades;
   }
 }

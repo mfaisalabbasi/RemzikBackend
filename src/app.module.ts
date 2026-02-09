@@ -23,6 +23,7 @@ import { WalletModule } from './wallet/wallet.module';
 import { LedgerModule } from './ledger/ledger.module';
 import { PayoutModule } from './payout/payout.module';
 import { SecondaryMarketModule } from './secondary-market/secondary-market.module';
+import { DistributionModule } from './distribution/distribution.module';
 
 @Module({
   imports: [
@@ -48,6 +49,7 @@ import { SecondaryMarketModule } from './secondary-market/secondary-market.modul
         WalletModule,
         LedgerModule,
         SecondaryMarketModule,
+        DistributionModule,
         forwardRef(() => PayoutModule),
       ],
       inject: [ConfigService],
