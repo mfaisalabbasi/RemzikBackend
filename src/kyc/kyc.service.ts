@@ -5,11 +5,15 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
+
 import { KycProfile } from './kyc.entity';
 import { SubmitKycDto } from './dto/submit-kyc.dto';
 import { ReviewKycDto } from './dto/review-kyc.dto';
+
 import { User } from '../user/user.entity';
 import { KycStatus } from './enums/kyc-status.enum';
+
+import { StorageService } from '../storage/storage.service';
 
 @Injectable()
 export class KycService {
@@ -19,12 +23,33 @@ export class KycService {
 
     @InjectRepository(User)
     private readonly userRepo: Repository<User>,
+
+    private readonly storageService: StorageService,
   ) {}
 
-  // USER submits KYC
-  async submitKyc(userId: string, dto: SubmitKycDto): Promise<KycProfile> {
-    const user = await this.userRepo.findOne({ where: { id: userId } });
-    if (!user) throw new NotFoundException('User not found');
+  async submitKyc(
+    userId: string,
+    dto: SubmitKycDto,
+    idDocument: Express.Multer.File,
+    addressProof: Express.Multer.File,
+  ): Promise<KycProfile> {
+    const user = await this.userRepo.findOne({
+      where: { id: userId },
+    });
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    const idUrl = await this.storageService.uploadFile(
+      idDocument,
+      'kyc/id-documents',
+    );
+
+    const addressUrl = await this.storageService.uploadFile(
+      addressProof,
+      'kyc/address-proofs',
+    );
 
     let kyc = await this.kycRepo.findOne({
       where: { user: { id: userId } },
@@ -38,28 +63,35 @@ export class KycService {
     if (!kyc) {
       kyc = this.kycRepo.create({
         user,
-        documentNumber: dto.documentNumber,
-        country: dto.country,
+        fullName: dto.fullName,
+        dob: dto.dob,
+        idDocumentUrl: idUrl,
+        addressProofUrl: addressUrl,
         status: KycStatus.PENDING,
       });
     } else {
-      kyc.documentNumber = dto.documentNumber;
-      kyc.country = dto.country;
+      kyc.fullName = dto.fullName;
+      kyc.dob = dto.dob;
+      kyc.idDocumentUrl = idUrl;
+      kyc.addressProofUrl = addressUrl;
       kyc.status = KycStatus.PENDING;
     }
 
     return this.kycRepo.save(kyc);
   }
 
-  // ADMIN reviews KYC
   async reviewKyc(id: string, dto: ReviewKycDto): Promise<KycProfile> {
     const kyc = await this.kycRepo.findOne({
       where: { id },
       relations: ['user'],
     });
-    if (!kyc) throw new NotFoundException('KYC not found');
+
+    if (!kyc) {
+      throw new NotFoundException('KYC not found');
+    }
 
     kyc.status = dto.status;
+
     return this.kycRepo.save(kyc);
   }
 
@@ -71,10 +103,11 @@ export class KycService {
     }
 
     kyc.status = KycStatus.APPROVED;
+
     await this.kycRepo.save(kyc);
   }
 
-  async reject(kycId: string, reason?: string) {
+  async reject(kycId: string, reason: string) {
     const kyc = await this.kycRepo.findOneBy({ id: kycId });
 
     if (!kyc) {
@@ -82,7 +115,7 @@ export class KycService {
     }
 
     kyc.status = KycStatus.REJECTED;
-    // kyc.rejectionReason = reason;
+    kyc.rejectionReason = reason;
 
     await this.kycRepo.save(kyc);
   }

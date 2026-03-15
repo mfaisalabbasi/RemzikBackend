@@ -16,14 +16,20 @@ export class KycProfile {
   id: string;
 
   @OneToOne(() => User, { nullable: false })
-  @JoinColumn({ name: 'userId' }) // 🔴 REQUIRED
+  @JoinColumn({ name: 'userId' })
   user: User;
 
-  @Column({ unique: true })
-  documentNumber: string;
+  @Column()
+  fullName: string;
 
   @Column()
-  country: string;
+  dob: string;
+
+  @Column()
+  idDocumentUrl: string;
+
+  @Column()
+  addressProofUrl: string;
 
   @Column({
     type: 'enum',
@@ -31,6 +37,9 @@ export class KycProfile {
     default: KycStatus.PENDING,
   })
   status: KycStatus;
+
+  @Column({ nullable: true })
+  rejectionReason?: string;
 
   @CreateDateColumn()
   createdAt: Date;

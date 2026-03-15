@@ -3,9 +3,9 @@ import { IsString, IsNotEmpty } from 'class-validator';
 export class SubmitKycDto {
   @IsString()
   @IsNotEmpty()
-  documentNumber: string;
+  fullName: string;
 
   @IsString()
   @IsNotEmpty()
-  country: string;
+  dob: string;
 }

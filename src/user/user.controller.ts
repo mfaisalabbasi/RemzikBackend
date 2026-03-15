@@ -1,25 +1,17 @@
-import { Controller, Post, Body } from '@nestjs/common';
+import { Controller, Post, Body, Res } from '@nestjs/common';
+import type { Response } from 'express';
 import { UserService } from './user.service';
 import { CreateUserDto } from './dto/create-user.dto';
-import { LoginUserDto } from './dto/login-user.dto';
 
-@Controller('users')
+@Controller('auth')
 export class UserController {
   constructor(private readonly userService: UserService) {}
 
-  @Post('register')
-  register(@Body() dto: CreateUserDto) {
-    return this.userService.register(dto);
-  }
-
-  @Post('login')
-  async login(@Body() dto: LoginUserDto) {
-    const user = await this.userService.validateUser(dto.email, dto.password);
-
-    if (!user) {
-      throw new Error('Invalid credentials');
-    }
-
-    return user; // JWT comes next step
+  @Post('signup')
+  register(
+    @Body() dto: CreateUserDto,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    return this.userService.register(dto, res);
   }
 }

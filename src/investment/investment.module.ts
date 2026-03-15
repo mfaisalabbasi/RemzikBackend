@@ -11,7 +11,7 @@ import { OwnershipModule } from 'src/ownership/ownership.module';
 
 @Module({
   imports: [
-    KycModule,
+    KycModule, // This now provides access to KycProfile repositories
     TypeOrmModule.forFeature([Investment, InvestorProfile, Asset, AssetToken]),
     OwnershipModule,
   ],

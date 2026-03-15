@@ -1,5 +1,5 @@
 // src/admin/admin.service.ts
-import { Injectable } from '@nestjs/common';
+import { Injectable, BadRequestException } from '@nestjs/common';
 import { PartnerService } from 'src/partner/partner.service';
 import { AssetService } from 'src/asset/asset.service';
 import { KycService } from 'src/kyc/kyc.service';
@@ -19,7 +19,13 @@ export class AdminService {
   async handlePartnerAction(dto: AdminActionDto, adminId: string) {
     if (dto.action === AdminAction.APPROVE) {
       await this.partnerService.approve(dto.targetId);
-    } else if (dto.action === AdminAction.REJECT) {
+    }
+
+    if (dto.action === AdminAction.REJECT) {
+      if (!dto.reason) {
+        throw new BadRequestException('Rejection reason is required');
+      }
+
       await this.partnerService.reject(dto.targetId, dto.reason);
     }
 
@@ -34,7 +40,9 @@ export class AdminService {
   async handleAssetAction(dto: AdminActionDto, adminId: string) {
     if (dto.action === AdminAction.APPROVE) {
       await this.assetService.approve(dto.targetId);
-    } else if (dto.action === AdminAction.FREEZE) {
+    }
+
+    if (dto.action === AdminAction.FREEZE) {
       await this.assetService.freeze(dto.targetId);
     }
 
@@ -49,7 +57,13 @@ export class AdminService {
   async handleKycAction(dto: AdminActionDto, adminId: string) {
     if (dto.action === AdminAction.APPROVE) {
       await this.kycService.approve(dto.targetId);
-    } else if (dto.action === AdminAction.REJECT) {
+    }
+
+    if (dto.action === AdminAction.REJECT) {
+      if (!dto.reason) {
+        throw new BadRequestException('Rejection reason is required');
+      }
+
       await this.kycService.reject(dto.targetId, dto.reason);
     }
 
