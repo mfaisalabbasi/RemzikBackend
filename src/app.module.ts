@@ -24,6 +24,7 @@ import { LedgerModule } from './ledger/ledger.module';
 import { PayoutModule } from './payout/payout.module';
 import { SecondaryMarketModule } from './secondary-market/secondary-market.module';
 import { DistributionModule } from './distribution/distribution.module';
+import { StorageModule } from './storage/storage.module';
 
 @Module({
   imports: [
@@ -64,6 +65,7 @@ import { DistributionModule } from './distribution/distribution.module';
         synchronize: true, // dev only
       }),
     }),
+    StorageModule,
   ],
   controllers: [AppController],
   providers: [

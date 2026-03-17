@@ -7,6 +7,7 @@ import { AssetController } from './asset.controller';
 
 import { PartnerProfile } from '../partner/partner.entity';
 import { KycProfile } from '../kyc/kyc.entity';
+import { StorageModule } from '../../src/storage/storage.module';
 
 @Module({
   imports: [
@@ -15,6 +16,7 @@ import { KycProfile } from '../kyc/kyc.entity';
       PartnerProfile,
       KycProfile, // ⭐ ADD THIS
     ]),
+    StorageModule,
   ],
   providers: [AssetService],
   controllers: [AssetController],
