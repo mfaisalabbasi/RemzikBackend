@@ -7,6 +7,8 @@ import {
   Param,
   Req,
   UseGuards,
+  UseInterceptors,
+  UploadedFile,
 } from '@nestjs/common';
 import { PartnerService } from './partner.service';
 import { JwtAuthGuard } from 'src/auth/guards/jwt.gaurd';
@@ -16,25 +18,19 @@ import { UserRole } from '../user/enums/user-role.enum';
 import { CreatePartnerProfileDto } from './dto/create-partner-profile.dto';
 import { UpdatePartnerCompanyDto } from './dto/update-partner-only.dto';
 import { UpdatePartnerStatusDto } from './dto/update-admin-only.dto';
+import { FileInterceptor } from '@nestjs/platform-express';
 
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('partners')
 export class PartnerController {
   constructor(private readonly partnerService: PartnerService) {}
 
-  /**
-   * PARTNER creates their profile
-   */
-  @UseGuards(JwtAuthGuard)
   @Post('me')
   @Roles(UserRole.PARTNER)
   createMyProfile(@Req() req, @Body() dto: CreatePartnerProfileDto) {
     return this.partnerService.createProfile(req.user.userId, dto);
   }
 
-  /**
-   * PARTNER views own profile
-   */
   @Get('me')
   @Roles(UserRole.PARTNER)
   getMyProfile(@Req() req) {
@@ -51,5 +47,32 @@ export class PartnerController {
   @Roles(UserRole.ADMIN)
   updateStatus(@Param('id') id: string, @Body() dto: UpdatePartnerStatusDto) {
     return this.partnerService.updateStatus(id, dto.status);
+  }
+
+  // ✅ PROFILE
+  @Get('profile')
+  @Roles(UserRole.PARTNER)
+  getProfile(@Req() req) {
+    return this.partnerService.getProfile(req.user.userId);
+  }
+
+  @Patch('profile')
+  @Roles(UserRole.PARTNER)
+  updateProfile(@Req() req, @Body() body) {
+    return this.partnerService.updateProfile(req.user.userId, body);
+  }
+
+  @Get('profile/stats')
+  @Roles(UserRole.PARTNER)
+  getStats(@Req() req) {
+    return this.partnerService.getProfileStats(req.user.userId);
+  }
+
+  // ✅ AVATAR UPLOAD
+  @Post('profile/avatar')
+  @Roles(UserRole.PARTNER)
+  @UseInterceptors(FileInterceptor('file'))
+  uploadAvatar(@Req() req, @UploadedFile() file: Express.Multer.File) {
+    return this.partnerService.uploadAvatar(req.user.userId, file);
   }
 }

@@ -8,19 +8,23 @@ import { Repository } from 'typeorm';
 import { PartnerProfile } from './partner.entity';
 import { CreatePartnerProfileDto } from './dto/create-partner-profile.dto';
 import { UpdatePartnerCompanyDto } from './dto/update-partner-only.dto';
-import { User } from '../user/user.entity';
 import { PartnerStatus } from './enums/partner-status.enum';
+import { Asset } from '../asset/asset.entity';
+import { StorageService } from '../storage/storage.service';
+import { v4 as uuid } from 'uuid'; // ✅ NEW
 
 @Injectable()
 export class PartnerService {
   constructor(
     @InjectRepository(PartnerProfile)
     private readonly partnerRepo: Repository<PartnerProfile>,
+
+    @InjectRepository(Asset)
+    private readonly assetRepo: Repository<Asset>,
+
+    private readonly storageService: StorageService,
   ) {}
 
-  /**
-   * Create partner profile for logged-in PARTNER user
-   */
   async createProfile(
     userId: string,
     dto: CreatePartnerProfileDto,
@@ -29,6 +33,7 @@ export class PartnerService {
       where: { user: { id: userId } },
       relations: ['user'],
     });
+
     if (existing) {
       throw new BadRequestException('Partner profile already exists');
     }
@@ -42,9 +47,6 @@ export class PartnerService {
     return this.partnerRepo.save(profile);
   }
 
-  /**
-   * Get partner profile for logged-in user
-   */
   async getMyProfile(userId: string): Promise<PartnerProfile> {
     const profile = await this.partnerRepo.findOne({
       where: { user: { id: userId } },
@@ -57,10 +59,6 @@ export class PartnerService {
 
     return profile;
   }
-
-  /**
-   * Admin-only update (approve / reject / edit)
-   */
 
   async updateCompany(
     userId: string,
@@ -75,7 +73,6 @@ export class PartnerService {
       throw new NotFoundException('Partner profile not found');
     }
 
-    // Optional business rule
     if (profile.status !== PartnerStatus.PENDING) {
       throw new BadRequestException('Cannot update company after approval');
     }
@@ -117,8 +114,118 @@ export class PartnerService {
     }
 
     partner.status = PartnerStatus.REJECTED;
-    //partner.rejectionReason = reason;
-
     await this.partnerRepo.save(partner);
+  }
+
+  async getProfile(userId: string) {
+    const profile = await this.partnerRepo.findOne({
+      where: { user: { id: userId } },
+      relations: ['user'],
+    });
+
+    if (!profile) {
+      throw new NotFoundException('Profile not found');
+    }
+
+    return {
+      id: profile.id,
+      companyName: profile.companyName,
+      status: profile.status,
+      avatar: profile.avatar || null,
+      address: profile.address || null,
+
+      name: profile.user?.name,
+      email: profile.user?.email,
+      phone: profile.user?.phone,
+    };
+  }
+
+  async updateProfile(userId: string, body: any) {
+    const profile = await this.partnerRepo.findOne({
+      where: { user: { id: userId } },
+      relations: ['user'],
+    });
+
+    if (!profile) {
+      throw new NotFoundException('Profile not found');
+    }
+
+    if (body.name) profile.user.name = body.name;
+    if (body.address) profile.address = body.address;
+    if (body.avatar) profile.avatar = body.avatar;
+
+    await this.partnerRepo.save(profile);
+    await this.partnerRepo.manager.save(profile.user);
+
+    return { message: 'Profile updated successfully' };
+  }
+
+  async getProfileStats(userId: string) {
+    const profile = await this.partnerRepo.findOne({
+      where: { user: { id: userId } },
+    });
+
+    if (!profile) {
+      throw new NotFoundException('Profile not found');
+    }
+
+    const assets = await this.assetRepo.find({
+      where: { partner: { id: profile.id } },
+    });
+
+    const totalAssets = assets.length;
+
+    const totalFunding = assets.reduce(
+      (sum, a: any) => sum + (a.totalValue || 0),
+      0,
+    );
+
+    const totalInvestors = Math.floor(totalFunding / 10000);
+
+    return {
+      totalAssets,
+      totalFunding,
+      totalInvestors,
+    };
+  }
+
+  /**
+   * ✅ FIXED AVATAR UPLOAD (NO BROKEN URL)
+   */
+  async uploadAvatar(userId: string, file: Express.Multer.File) {
+    const profile = await this.partnerRepo.findOne({
+      where: { user: { id: userId } },
+    });
+
+    if (!profile) {
+      throw new NotFoundException('Profile not found');
+    }
+
+    if (!file) {
+      throw new BadRequestException('No file uploaded');
+    }
+
+    // ✅ FIX: CLEAN FILE NAME
+    const ext = file.originalname.split('.').pop();
+    const safeName = `${uuid()}-${Date.now()}.${ext}`;
+
+    // override filename before upload
+    const cleanFile = {
+      ...file,
+      originalname: safeName,
+    };
+
+    const avatarUrl = await this.storageService.uploadFile(
+      cleanFile as Express.Multer.File,
+      'partner/avatars',
+    );
+
+    profile.avatar = avatarUrl;
+
+    await this.partnerRepo.save(profile);
+
+    return {
+      url: avatarUrl,
+    };
   }
 }

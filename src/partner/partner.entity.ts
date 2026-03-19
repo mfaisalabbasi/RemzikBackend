@@ -33,6 +33,12 @@ export class PartnerProfile {
   })
   status: PartnerStatus;
 
+  @Column({ nullable: true })
+  avatar?: string;
+
+  @Column({ nullable: true })
+  address?: string;
+
   @CreateDateColumn()
   createdAt: Date;
 

@@ -120,4 +120,60 @@ export class AssetController {
   getApproved() {
     return this.assetService.getApprovedAssets();
   }
+
+  @Get('partner/performance')
+  @Roles(UserRole.PARTNER)
+  getPerformance(@Req() req) {
+    return this.assetService.getPartnerPerformance(req.user.id);
+  }
+
+  @Get('partner/kpi')
+  getKPI(@Req() req) {
+    return this.assetService.getPartnerKPI(req.user.id);
+  }
+
+  @Get('partner/live-funding')
+  getLiveFunding(@Req() req) {
+    return this.assetService.getPartnerLiveFunding(req.user.id);
+  }
+
+  @Get('partner/funding-table')
+  getFundingTable(@Req() req) {
+    return this.assetService.getPartnerFundingTable(req.user.id);
+  }
+
+  @Get('partner/activity')
+  getActivity(@Req() req) {
+    return this.assetService.getRecentActivity(req.user.id);
+  }
+
+  @Get('partner/assets')
+  getPartnerAssets(@Req() req) {
+    return this.assetService.getPartnerAssets(req.user.id);
+  }
+
+  @Get('partner/investors')
+  getInvestors(@Req() req) {
+    return this.assetService.getPartnerInvestors(req.user.id);
+  }
+
+  @Get('partner/withdrawals')
+  getWithdrawals(@Req() req) {
+    return this.assetService.getWithdrawalRequests(req.user.id);
+  }
+
+  @Get('partner/funding')
+  getPartnerFunding(@Req() req) {
+    return this.assetService.getPartnerFunding(req.user.id);
+  }
+
+  @Get('partner/distributions')
+  getDistributions(@Req() req) {
+    return this.assetService.getPartnerDistributions(req.user.id);
+  }
+
+  @Get('partner/documents')
+  getPartnerDocs(@Req() req) {
+    return this.assetService.getPartnerDocuments(req.user.id);
+  }
 }
