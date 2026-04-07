@@ -1,9 +1,9 @@
-// src/audit/audit.service.ts
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, EntityManager } from 'typeorm'; // ✅ Added EntityManager
 import { AuditLog } from './audit.entity';
-import { AdminAction } from 'src/admin/enums/admin-action.enum';
+import { AdminAction } from './enums/audit-action.enum';
+
 @Injectable()
 export class AuditService {
   constructor(
@@ -11,21 +11,33 @@ export class AuditService {
     private readonly auditRepo: Repository<AuditLog>,
   ) {}
 
-  async log(data: {
-    adminId: string;
-    targetId: string;
-    action: AdminAction;
-    reason?: string;
-  }) {
-    const log = this.auditRepo.create(data);
-    return this.auditRepo.save(log);
+  /**
+   * ✅ FIXED: Now handles transactions (The 2nd Argument Fix)
+   * GLOBAL LOG METHOD
+   * @param data.adminId - The ID of the person performing the action
+   * @param data.targetId - The ID of the object being affected
+   * @param manager - Optional transaction manager
+   */
+  async log(
+    data: {
+      adminId: string;
+      targetId: string;
+      action: AdminAction;
+      reason?: string;
+    },
+    manager?: EntityManager, // ✅ Added optional manager
+  ) {
+    // Switch to transaction repo if manager is present, otherwise use standard repo
+    const repo = manager ? manager.getRepository(AuditLog) : this.auditRepo;
+
+    const log = repo.create(data);
+    return await repo.save(log);
   }
 
-  // audit.service.ts
   async findAll(action?: AdminAction) {
-    if (action) {
-      return this.auditRepo.find({ where: { action } });
-    }
-    return this.auditRepo.find();
+    return this.auditRepo.find({
+      where: action ? { action } : {},
+      order: { createdAt: 'DESC' },
+    });
   }
 }

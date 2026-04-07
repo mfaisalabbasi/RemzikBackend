@@ -1,11 +1,11 @@
-// WHAT kind of financial event this entry represents
 export enum LedgerType {
-  INVESTMENT = 'INVESTMENT', // investor added funds
-  DISTRIBUTION = 'DISTRIBUTION', // profit/rent distributed
-  PAYOUT = 'PAYOUT', // cash-out request
-  REFUND = 'REFUND', // returned funds
-  ADJUSTMENT = 'ADJUSTMENT', // admin adjustment
-  CREDIT = 'CREDIT', // admin adjustment
+  INVESTMENT = 'INVESTMENT',
+  DISTRIBUTION = 'DISTRIBUTION',
+  PAYOUT = 'PAYOUT',
+  REFUND = 'REFUND',
+  ADJUSTMENT = 'ADJUSTMENT',
+  CREDIT = 'CREDIT',
+  DEBIT = 'DEBIT',
   DISPUTE_ADJUSTMENT = 'DISPUTE_ADJUSTMENT',
   ESCROW_LOCK = 'ESCROW_LOCK',
   ESCROW_RELEASE = 'ESCROW_RELEASE',

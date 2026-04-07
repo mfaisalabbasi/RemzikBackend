@@ -1,6 +1,6 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { EntityManager, Repository } from 'typeorm';
 import { Ownership } from './ownership.entity';
 import { InvestorProfile } from '../investor/investor.entity';
 import { Asset } from '../asset/asset.entity';
@@ -16,13 +16,19 @@ export class OwnershipService {
   ) {}
 
   /**
+   * Internal Helper: Switches between global repo and transactional manager.
+   */
+  private getRepo(manager?: EntityManager) {
+    return manager ? manager.getRepository(Ownership) : this.ownershipRepo;
+  }
+
+  /**
    * Get InvestorProfile by User ID
-   * Throws exception if not found
    */
   async getInvestorByUserId(userId: string): Promise<InvestorProfile> {
     const investor = await this.investorRepo.findOne({
       where: { user: { id: userId } },
-      relations: ['user'], // ✅ ensures user relation is loaded
+      relations: ['user'],
     });
 
     if (!investor) {
@@ -33,23 +39,25 @@ export class OwnershipService {
   }
 
   /**
-   * Add shares & units to investor ownership (for investment confirmation)
+   * Add shares & units (for initial investment confirmation)
    */
   async addShares(
     investor: InvestorProfile,
     asset: Asset,
     shares: number,
+    manager?: EntityManager,
   ): Promise<void> {
-    const ownership = await this.ownershipRepo.findOne({
+    const repo = this.getRepo(manager);
+    const ownership = await repo.findOne({
       where: { investorId: investor.id, assetId: asset.id },
     });
 
     if (ownership) {
       ownership.shares = Number(ownership.shares) + Number(shares);
       ownership.units = Number(ownership.units) + Number(shares);
-      await this.ownershipRepo.save(ownership);
+      await repo.save(ownership);
     } else {
-      const newOwnership = this.ownershipRepo.create({
+      const newOwnership = repo.create({
         investor,
         investorId: investor.id,
         asset,
@@ -57,53 +65,64 @@ export class OwnershipService {
         shares,
         units: shares,
       });
-      await this.ownershipRepo.save(newOwnership);
+      await repo.save(newOwnership);
     }
   }
 
   /**
-   * Remove units from investor (for trade/sale)
+   * ✅ FIXED: Uses manager to prevent "Record not found" during transactions
    */
   async removeUnits(
     investorId: string,
     assetId: string,
     units: number,
+    manager?: EntityManager,
   ): Promise<void> {
-    const ownership = await this.ownershipRepo.findOne({
+    const repo = this.getRepo(manager);
+
+    const ownership = await repo.findOne({
       where: { investorId, assetId },
     });
 
-    if (!ownership) throw new BadRequestException('Ownership record not found');
+    if (!ownership) {
+      throw new BadRequestException(
+        `Ownership record not found for Investor: ${investorId}`,
+      );
+    }
 
-    if (ownership.units < units)
+    if (Number(ownership.units) < Number(units)) {
       throw new BadRequestException('Insufficient units to remove');
+    }
 
     ownership.units = Number(ownership.units) - Number(units);
-
-    await this.ownershipRepo.save(ownership);
+    await repo.save(ownership);
   }
+
   /**
-   * Add units to investor (for trade/buy)
+   * ✅ FIXED: Uses manager and handles "Fresh Investor" creation
    */
   async addUnits(
     investor: InvestorProfile | string,
     assetId: string,
     units: number,
+    manager?: EntityManager,
   ): Promise<void> {
+    const repo = this.getRepo(manager);
+
     const investorProfile =
       typeof investor === 'string'
         ? await this.getInvestorByUserId(investor)
         : investor;
 
-    const ownership = await this.ownershipRepo.findOne({
+    const ownership = await repo.findOne({
       where: { investorId: investorProfile.id, assetId },
     });
 
     if (ownership) {
       ownership.units = Number(ownership.units) + Number(units);
-      await this.ownershipRepo.save(ownership);
+      await repo.save(ownership);
     } else {
-      const newOwnership = this.ownershipRepo.create({
+      const newOwnership = repo.create({
         investor: investorProfile,
         investorId: investorProfile.id,
         asset: { id: assetId } as Asset,
@@ -111,21 +130,15 @@ export class OwnershipService {
         shares: units,
         units,
       });
-      await this.ownershipRepo.save(newOwnership);
+      await repo.save(newOwnership);
     }
   }
 
-  /**
-   * Get number of units a user owns for a specific asset
-   * Expects userId (safe for listing & trade)
-   */
   async getUserUnitsForAsset(userId: string, assetId: string): Promise<number> {
     const investor = await this.getInvestorByUserId(userId);
-
     const ownership = await this.ownershipRepo.findOne({
       where: { investorId: investor.id, assetId },
     });
-
-    return ownership?.units ?? 0;
+    return ownership?.units ? Number(ownership.units) : 0;
   }
 }

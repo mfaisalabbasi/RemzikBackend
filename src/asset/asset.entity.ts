@@ -14,13 +14,13 @@ import { AssetStatus } from './enums/asset-status.enum';
 @Entity('assets')
 export class Asset {
   @PrimaryGeneratedColumn('uuid')
-  id: string;
+  id!: string;
 
   /**
    * Partner who submitted the asset
    */
   @ManyToOne(() => PartnerProfile, { nullable: false })
-  partner: PartnerProfile;
+  partner!: PartnerProfile;
 
   /**
    * Asset category
@@ -29,49 +29,49 @@ export class Asset {
     type: 'enum',
     enum: AssetType,
   })
-  type: AssetType;
+  type!: AssetType;
 
   /**
    * Asset title
    */
   @Column()
-  title: string;
+  title!: string;
 
   /**
    * Description
    */
   @Column('text')
-  description: string;
+  description!: string;
 
   /**
    * Asset valuation
    */
   @Column('decimal', { precision: 15, scale: 2 })
-  totalValue: number;
+  totalValue!: number;
 
   /**
    * Property gallery images
    */
   @Column('text', { array: true, nullable: true })
-  galleryImages: string[];
+  galleryImages!: string[];
 
   /**
    * Legal ownership documents
    */
   @Column('text', { array: true, nullable: true })
-  legalDocuments: string[];
+  legalDocuments!: string[];
 
   /**
    * Financial / valuation reports
    */
   @Column('text', { array: true, nullable: true })
-  financialDocuments: string[];
+  financialDocuments!: string[];
 
   /**
    * Other supporting documents
    */
   @Column('text', { array: true, nullable: true })
-  otherDocuments: string[];
+  otherDocuments!: string[];
 
   /**
    * Lifecycle status
@@ -81,7 +81,7 @@ export class Asset {
     enum: AssetStatus,
     default: AssetStatus.SUBMITTED,
   })
-  status: AssetStatus;
+  status!: AssetStatus;
 
   /**
    * Admin rejection reason
@@ -93,7 +93,7 @@ export class Asset {
    * Property location
    */
   @Column({ type: 'text', nullable: true }) // You can also use 'varchar'
-  location: string | null;
+  location!: string | null;
 
   /**
    * Expected yearly yield %
@@ -103,7 +103,7 @@ export class Asset {
     scale: 2,
     nullable: true,
   })
-  expectedYield: number | null;
+  expectedYield!: number | null;
 
   /**
    * Annual rental income
@@ -113,7 +113,7 @@ export class Asset {
     scale: 2,
     nullable: true,
   })
-  rentalIncome: number | null;
+  rentalIncome!: number | null;
 
   /**
    * Property size
@@ -123,17 +123,26 @@ export class Asset {
     scale: 2,
     nullable: true,
   })
-  assetSize: number | null;
+  assetSize!: number | null;
 
   /**
    * Token supply for fractionalization
    */
   @Column('bigint', { nullable: true })
-  tokenSupply: number | null;
+  tokenSupply!: number | null;
+
+  @Column('decimal', { precision: 15, scale: 2, default: 0 })
+  funded!: number;
+
+  /**
+   * Count of unique investors
+   */
+  @Column('int', { default: 0 })
+  investors!: number;
 
   @CreateDateColumn()
-  createdAt: Date;
+  createdAt!: Date;
 
   @UpdateDateColumn()
-  updatedAt: Date;
+  updatedAt!: Date;
 }

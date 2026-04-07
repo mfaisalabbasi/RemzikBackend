@@ -13,7 +13,13 @@ export class AuthService {
     const user = await this.userService.validateUser(email, password);
     if (!user) throw new UnauthorizedException('Invalid credentials');
 
-    const payload = { sub: user.id, role: user.role };
+    // ✅ FIX: Explicitly include userId in payload to match Guard/Controller expectations
+    const payload = {
+      userId: user.id,
+      sub: user.id,
+      role: user.role,
+    };
+
     const accessToken = this.jwtService.sign(payload);
 
     return {

@@ -1,36 +1,40 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PayoutService } from '../payout/payout.service';
-import { UpdatePayoutStatusDto } from '../payout/dto/update-payout-status.dto';
 import { PayoutStatus } from '../payout/enums/payout-status.enum';
 
 @Injectable()
 export class CronService {
   private readonly logger = new Logger(CronService.name);
-
   constructor(private readonly payoutService: PayoutService) {}
 
-  // Run every minute for testing
-  @Cron(CronExpression.EVERY_MINUTE)
-  async processPayouts() {
-    const payouts = await this.payoutService.getPendingPayouts();
+  @Cron(CronExpression.EVERY_HOUR) // Process withdrawals every hour
+  async autoProcessWithdrawals() {
+    const pending = await this.payoutService.getPendingRequests();
 
-    for (const payout of payouts) {
-      // Mark as processing
-      const processingDto = new UpdatePayoutStatusDto();
-      processingDto.status = PayoutStatus.PROCESSING;
-      await this.payoutService.updatePayoutStatus(payout.id, processingDto);
+    for (const req of pending) {
+      try {
+        // 1. Integration: Here you would call an API like Stripe, PayPal, or a local Saudi Bank API
+        const isBankTransferSuccess = await this.simulateBankApi(req);
 
-      // Execute payout
-      const success = await this.payoutService.executePayout(payout);
-
-      // Update status accordingly
-      const updateDto = new UpdatePayoutStatusDto();
-      updateDto.status = success ? PayoutStatus.COMPLETED : PayoutStatus.FAILED;
-      updateDto.reason = success ? 'Payout processed' : 'Payout failed';
-      await this.payoutService.updatePayoutStatus(payout.id, updateDto);
+        if (isBankTransferSuccess) {
+          await this.payoutService.finalizePayout(req.id, {
+            status: PayoutStatus.COMPLETED,
+          });
+        } else {
+          await this.payoutService.finalizePayout(req.id, {
+            status: PayoutStatus.FAILED,
+            reason: 'Bank rejected transfer',
+          });
+        }
+      } catch (err) {
+        this.logger.error(`Failed to process payout ${req.id}: ${err.message}`);
+      }
     }
+  }
 
-    this.logger.log(`Processed ${payouts.length} payouts`);
+  private async simulateBankApi(payout: any): Promise<boolean> {
+    // In the future, replace this with your real bank gateway
+    return true;
   }
 }

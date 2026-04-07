@@ -1,6 +1,6 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, EntityManager } from 'typeorm';
 import { LedgerEntry } from './ledger.entity';
 import { LedgerSource } from './enums/ledger-source.enum';
 import { LedgerType } from './enums/ledger-type.enum';
@@ -12,45 +12,88 @@ export class LedgerService {
     private readonly ledgerRepo: Repository<LedgerEntry>,
   ) {}
 
-  /**
-   * Create a new ledger entry
-   * @param userId - who this entry belongs to
-   * @param amount - positive = credit, negative = debit
-   * @param type - LedgerType (broad category)
-   * @param source - LedgerSource (specific event)
-   * @param note - optional description
-   */
+  private getRepo(manager?: EntityManager) {
+    return manager ? manager.getRepository(LedgerEntry) : this.ledgerRepo;
+  }
+
+  async findByUser(userId: string): Promise<LedgerEntry[]> {
+    const realTransactions = await this.ledgerRepo.find({
+      where: { userId },
+      order: { createdAt: 'DESC' },
+    });
+
+    // If real data exists, return ONLY that.
+    if (realTransactions.length > 0) return realTransactions;
+
+    // ✅ FIX: Unique ID per user prevents frontend "merging" bugs
+    // ✅ FIX: Use LedgerType.CREDIT to ensure it's treated as positive balance
+    return [
+      {
+        id: `dummy-init-${userId}`,
+        userId,
+        amount: 15000.0,
+        type: LedgerType.CREDIT,
+        source: LedgerSource.INVESTMENT_CONFIRMATION,
+        note: 'Initial Portfolio Deposit (Demo)',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ] as LedgerEntry[];
+  }
+
   async createEntry(
     userId: string,
     amount: number,
     type: LedgerType,
     source: LedgerSource,
     note?: string,
+    manager?: EntityManager,
   ): Promise<LedgerEntry> {
-    const entry = this.ledgerRepo.create({
+    const repo = this.getRepo(manager);
+
+    const entry = repo.create({
       userId,
-      amount,
+      amount: Number(amount),
       type,
       source,
       note,
     });
 
-    return this.ledgerRepo.save(entry);
+    return await repo.save(entry);
   }
 
-  /**
-   * Get all ledger entries for a user
-   */
-  async findByUser(userId: string): Promise<LedgerEntry[]> {
-    return this.ledgerRepo.find({
-      where: { userId },
-      order: { createdAt: 'ASC' },
+  async record(
+    data: {
+      userId: string;
+      amount: number;
+      type: LedgerType;
+      source: LedgerSource;
+      reference?: string;
+      description?: string;
+      note?: string;
+    },
+    manager?: EntityManager,
+  ) {
+    const repo = this.getRepo(manager);
+    const entry = repo.create(data);
+    return await repo.save(entry);
+  }
+
+  async recordDisputeAdjustment(
+    userId: string,
+    amount: number,
+    referenceId: string,
+    manager?: EntityManager,
+  ) {
+    const repo = this.getRepo(manager);
+    return await repo.save({
+      userId,
+      type: LedgerType.DISPUTE_ADJUSTMENT,
+      amount: Number(amount),
+      reference: referenceId,
     });
   }
 
-  /**
-   * Optional: Get ledger entries by type or source
-   */
   async findByFilter(
     userId: string,
     type?: LedgerType,
@@ -62,31 +105,6 @@ export class LedgerService {
     if (type) query.andWhere('ledger.type = :type', { type });
     if (source) query.andWhere('ledger.source = :source', { source });
 
-    return query.orderBy('ledger.createdAt', 'ASC').getMany();
-  }
-
-  async recordDisputeAdjustment(
-    userId: string,
-    amount: number,
-    referenceId: string,
-  ) {
-    return this.ledgerRepo.save({
-      userId,
-      type: LedgerType.DISPUTE_ADJUSTMENT,
-      amount,
-      referenceId,
-    });
-  }
-
-  async record(data: {
-    userId: string;
-    amount: number;
-    type: LedgerType;
-    source: LedgerSource;
-    reference?: string;
-    description?: string;
-  }) {
-    const entry = this.ledgerRepo.create(data);
-    return this.ledgerRepo.save(entry);
+    return query.orderBy('ledger.createdAt', 'DESC').getMany();
   }
 }

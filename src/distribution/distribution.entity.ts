@@ -11,38 +11,38 @@ import { InvestorProfile } from 'src/investor/investor.entity';
 @Entity('distributions')
 export class Distribution {
   @PrimaryGeneratedColumn('uuid')
-  id: string;
+  id!: string;
 
   /**
    * Asset generating income
    */
   @ManyToOne(() => Asset, { nullable: false })
-  asset: Asset;
+  asset!: Asset;
 
   /**
    * Investor receiving payout
    */
   @ManyToOne(() => InvestorProfile, { nullable: false })
-  investor: InvestorProfile;
+  investor!: InvestorProfile;
 
   /**
    * Amount paid
    */
   @Column('decimal', { precision: 15, scale: 2 })
-  amount: number;
+  amount!: number;
 
   /**
    * Period reference (e.g. 2025-01)
    */
   @Column()
-  period: string;
+  period!: string;
 
   /**
    * Paid or not
    */
   @Column({ default: false })
-  paid: boolean;
+  paid!: boolean;
 
   @CreateDateColumn()
-  createdAt: Date;
+  createdAt!: Date;
 }

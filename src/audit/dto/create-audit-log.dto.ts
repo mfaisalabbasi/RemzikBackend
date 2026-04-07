@@ -1,6 +1,7 @@
 import { IsEnum, IsString, IsOptional } from 'class-validator';
 import { AuditActor } from '../enums/audit-actor.enum';
-import { AuditAction } from '../enums/audit-action.enum';
+// 🛡️ FIX: Import 'AdminAction' because that is the exported name in your enum file
+import { AdminAction } from '../enums/audit-action.enum';
 
 export class CreateAuditLogDto {
   @IsEnum(AuditActor)
@@ -9,8 +10,9 @@ export class CreateAuditLogDto {
   @IsString()
   actorId: string;
 
-  @IsEnum(AuditAction)
-  action: AuditAction;
+  // 🛡️ FIX: Use 'AdminAction' here to match the import
+  @IsEnum(AdminAction)
+  action: AdminAction;
 
   @IsString()
   targetType: string;

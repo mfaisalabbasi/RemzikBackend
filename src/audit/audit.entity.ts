@@ -1,28 +1,30 @@
-// src/audit/audit.entity.ts
 import {
   Entity,
   PrimaryGeneratedColumn,
   Column,
   CreateDateColumn,
+  Index,
 } from 'typeorm';
-import { AdminAction } from 'src/admin/enums/admin-action.enum';
+import { AdminAction } from './enums/audit-action.enum';
 @Entity('audit_logs')
 export class AuditLog {
   @PrimaryGeneratedColumn('uuid')
-  id: string;
+  id!: string;
 
+  @Index() // Speed up searches for specific users/admins
   @Column()
-  adminId: string;
+  adminId!: string;
 
+  @Index()
   @Column()
-  targetId: string;
+  targetId!: string;
 
   @Column({ type: 'enum', enum: AdminAction })
-  action: AdminAction;
+  action!: AdminAction;
 
-  @Column({ nullable: true })
+  @Column({ type: 'text', nullable: true })
   reason?: string;
 
   @CreateDateColumn()
-  createdAt: Date;
+  createdAt!: Date;
 }

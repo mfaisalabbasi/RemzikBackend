@@ -24,31 +24,24 @@ export class TradeController {
     private readonly investorRepo: Repository<InvestorProfile>,
   ) {}
 
-  /**
-   * ✅ Create Trade
-   * Seller identity resolved via InvestorProfile
-   */
   @Post('create')
   async create(
     @CurrentUser('userId') userId: string,
     @Body() dto: CreateTradeDto,
   ) {
     if (!userId) throw new BadRequestException('Invalid user session');
-    // Fetch seller's investor profile including 'user' relation
+
     const sellerProfile = await this.investorRepo.findOne({
       where: { user: { id: userId } },
-      relations: ['user'], // ✅ important to avoid null result
+      relations: ['user'],
     });
+
     if (!sellerProfile)
       throw new BadRequestException('Investor profile for seller not found');
-    // Delegate trade creation
+
     return this.tradeService.createTrade(sellerProfile, dto);
   }
 
-  /**
-   * ✅ Execute Trade
-   * Buyer identity resolved via InvestorProfile
-   */
   @Post('execute/:tradeId')
   async execute(
     @CurrentUser('userId') userId: string,
@@ -56,21 +49,17 @@ export class TradeController {
   ) {
     if (!userId) throw new BadRequestException('Invalid user session');
 
-    // Fetch buyer's investor profile including 'user' relation
     const buyerProfile = await this.investorRepo.findOne({
       where: { user: { id: userId } },
-      relations: ['user'], // ✅ important to avoid null result
+      relations: ['user'],
     });
 
     if (!buyerProfile)
       throw new BadRequestException('Investor profile for buyer not found');
-    // Delegate trade execution
+
     return this.tradeService.executeTrade(tradeId, buyerProfile);
   }
 
-  /**
-   * ✅ Get all trades
-   */
   @Get()
   async allTrades() {
     return this.tradeService.getTrades();

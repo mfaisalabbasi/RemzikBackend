@@ -1,13 +1,9 @@
-import {
-  BadRequestException,
-  Injectable,
-  NotFoundException,
-} from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { LedgerService } from '../ledger/ledger.service';
 import { LedgerSource } from '../ledger/enums/ledger-source.enum';
 import { LedgerType } from '../ledger/enums/ledger-type.enum';
 import { WalletResponseDto } from './dto/wallet-response.dto';
-import { Repository } from 'typeorm';
+import { Repository, EntityManager } from 'typeorm';
 import { Wallet } from './wallet.entity';
 import { InjectRepository } from '@nestjs/typeorm';
 
@@ -19,8 +15,13 @@ export class WalletService {
     private readonly walletRepo: Repository<Wallet>,
   ) {}
 
+  private getRepo(manager?: EntityManager) {
+    return manager ? manager.getRepository(Wallet) : this.walletRepo;
+  }
+
   /**
-   * Get full wallet balances for a user
+   * ✅ FIXED: Ensures zero-persistence.
+   * Local variables prevent balance leakage between user sessions.
    */
   async getWallet(userId: string): Promise<WalletResponseDto> {
     const entries = await this.ledgerService.findByUser(userId);
@@ -38,34 +39,35 @@ export class WalletService {
           available += amount;
           earned += amount;
           break;
-
         case LedgerSource.PAYOUT_REQUEST:
           available -= amount;
           pending += amount;
           break;
-
         case LedgerSource.PAYOUT_COMPLETED:
           pending -= amount;
           break;
-
         case LedgerSource.PAYOUT_FAILED:
           available += amount;
           pending -= amount;
           break;
-
         case LedgerSource.INVESTMENT_CONFIRMATION:
         case LedgerSource.ADMIN_ADJUSTMENT:
+        case LedgerSource.WALLET_DEPOSIT:
+        case LedgerSource.SECONDARY_MARKET_SELL: // ✅ Added explicit sell logic
           available += amount;
           break;
-
         case LedgerSource.ESCROW_LOCK:
           locked += amount;
           available -= amount;
           break;
-
         case LedgerSource.ESCROW_RELEASE:
           locked -= amount;
           available += amount;
+          break;
+        case LedgerSource.ASSET_INVESTMENT:
+        case LedgerSource.SECONDARY_MARKET_BUY:
+          // ✅ FIX: Ensure buy always subtracts absolute value
+          available -= Math.abs(amount);
           break;
       }
     }
@@ -75,110 +77,140 @@ export class WalletService {
       lockedBalance: locked,
       pendingPayout: pending,
       totalEarned: earned,
-      balance: available + locked, // ✅ total balance
+      balance: available + locked,
     };
   }
 
-  /**
-   * Shortcut to get only available balance
-   */
   async getBalance(userId: string): Promise<number> {
     const wallet = await this.getWallet(userId);
     return wallet.availableBalance;
   }
 
-  /**
-   * Debit wallet (money leaves wallet)
-   */
-  async debit(userId: string, amount: number, note?: string) {
+  async topUpDummy(userId: string, amount: number, manager?: EntityManager) {
+    await this.creditAvailable(userId, amount, manager);
     return this.ledgerService.createEntry(
       userId,
-      -Math.abs(amount), // amount leaving
-      LedgerType.PAYOUT,
-      LedgerSource.PAYOUT_COMPLETED,
-      note,
+      amount,
+      LedgerType.CREDIT,
+      LedgerSource.WALLET_DEPOSIT,
+      'Demo Funds Top-up',
+      manager,
     );
   }
 
-  /**
-   * Credit wallet (money enters wallet)
-   */
+  private async getOrCreateWallet(
+    userId: string,
+    manager?: EntityManager,
+  ): Promise<Wallet> {
+    const repo = this.getRepo(manager);
+    let wallet = await repo.findOne({ where: { userId } });
+
+    if (!wallet) {
+      wallet = repo.create({
+        userId,
+        availableBalance: 0,
+        lockedBalance: 0,
+      });
+      await repo.save(wallet);
+    }
+    return wallet;
+  }
+
   async credit(
     userId: string,
     amount: number,
     source: LedgerSource,
     note?: string,
+    manager?: EntityManager,
   ) {
+    await this.creditAvailable(userId, amount, manager);
     return this.ledgerService.createEntry(
       userId,
       Math.abs(amount),
-      LedgerType.PAYOUT,
+      LedgerType.CREDIT,
       source,
       note,
+      manager,
     );
   }
 
-  /**
-   * Lock funds for escrow or pending operations
-   */
-  async lockFunds(userId: string, amount: number): Promise<void> {
-    const wallet = await this.walletRepo.findOne({ where: { userId } });
-    if (!wallet) throw new NotFoundException('Wallet not found');
-    if (wallet.availableBalance < amount)
+  async debitAvailable(
+    userId: string,
+    amount: number,
+    manager?: EntityManager,
+  ): Promise<void> {
+    const wallet = await this.getOrCreateWallet(userId, manager);
+
+    if (Number(wallet.availableBalance) < amount) {
+      throw new BadRequestException('Insufficient available balance');
+    }
+
+    wallet.availableBalance = Number(wallet.availableBalance) - Number(amount);
+    await this.getRepo(manager).save(wallet);
+  }
+
+  async creditAvailable(
+    userId: string,
+    amount: number,
+    manager?: EntityManager,
+  ): Promise<void> {
+    const wallet = await this.getOrCreateWallet(userId, manager);
+    wallet.availableBalance = Number(wallet.availableBalance) + Number(amount);
+    await this.getRepo(manager).save(wallet);
+  }
+
+  async lockFunds(
+    userId: string,
+    amount: number,
+    manager?: EntityManager,
+  ): Promise<void> {
+    const wallet = await this.getOrCreateWallet(userId, manager);
+    if (Number(wallet.availableBalance) < amount)
       throw new BadRequestException('Insufficient available balance');
 
-    wallet.availableBalance -= amount;
-    wallet.lockedBalance += amount;
-
-    await this.walletRepo.save(wallet);
+    wallet.availableBalance = Number(wallet.availableBalance) - Number(amount);
+    wallet.lockedBalance = Number(wallet.lockedBalance) + Number(amount);
+    await this.getRepo(manager).save(wallet);
   }
 
-  /**
-   * Unlock previously locked funds
-   */
-  async unlockFunds(userId: string, amount: number): Promise<void> {
-    const wallet = await this.walletRepo.findOne({ where: { userId } });
-    if (!wallet) throw new NotFoundException('Wallet not found');
-
-    wallet.lockedBalance -= amount;
-    wallet.availableBalance += amount;
-
-    await this.walletRepo.save(wallet);
+  async unlockFunds(
+    userId: string,
+    amount: number,
+    manager?: EntityManager,
+  ): Promise<void> {
+    const wallet = await this.getOrCreateWallet(userId, manager);
+    wallet.lockedBalance = Number(wallet.lockedBalance) - Number(amount);
+    wallet.availableBalance = Number(wallet.availableBalance) + Number(amount);
+    await this.getRepo(manager).save(wallet);
   }
 
-  /**
-   * Adjust balance directly (admin use)
-   */
-  async adjustBalance(userId: string, amount: number): Promise<void> {
-    const wallet = await this.walletRepo.findOne({ where: { userId } });
-    if (!wallet) throw new NotFoundException('Wallet not found');
-
-    // Update both total balance and available balance
-    wallet.availableBalance += amount;
-    await this.walletRepo.save(wallet);
+  async adjustBalance(
+    userId: string,
+    amount: number,
+    manager?: EntityManager,
+  ): Promise<void> {
+    const wallet = await this.getOrCreateWallet(userId, manager);
+    wallet.availableBalance = Number(wallet.availableBalance) + Number(amount);
+    await this.getRepo(manager).save(wallet);
   }
 
-  /**
-   * Debit available balance only
-   */
-  async debitAvailable(userId: string, amount: number): Promise<void> {
-    const wallet = await this.walletRepo.findOne({ where: { userId } });
-    if (!wallet) throw new NotFoundException('Wallet not found');
-    if (wallet.availableBalance < amount)
-      throw new BadRequestException('Insufficient available balance');
-
-    wallet.availableBalance -= amount;
-    await this.walletRepo.save(wallet);
+  async getAvailableBalance(userId: string): Promise<number> {
+    const wallet = await this.getOrCreateWallet(userId);
+    return Number(wallet.availableBalance);
   }
 
-  /**
-   * Credit available balance only
-   */
-  async creditAvailable(userId: string, amount: number): Promise<void> {
-    const wallet = await this.walletRepo.findOne({ where: { userId } });
-    if (!wallet) throw new NotFoundException('Wallet not found');
+  async debitLocked(
+    userId: string,
+    amount: number,
+    manager?: EntityManager,
+  ): Promise<void> {
+    const wallet = await this.getOrCreateWallet(userId, manager);
 
-    wallet.availableBalance += amount;
-    await this.walletRepo.save(wallet);
+    if (Number(wallet.lockedBalance) < amount) {
+      throw new BadRequestException('Insufficient locked funds');
+    }
+
+    wallet.lockedBalance = Number(wallet.lockedBalance) - Number(amount);
+    await this.getRepo(manager).save(wallet);
   }
 }

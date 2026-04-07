@@ -5,7 +5,7 @@ import { AssetService } from 'src/asset/asset.service';
 import { KycService } from 'src/kyc/kyc.service';
 import { AuditService } from 'src/audit/audit.service';
 import { AdminActionDto } from './dto/admin-action.dto';
-import { AdminAction } from './enums/admin-action.enum';
+import { AdminAction } from 'src/audit/enums/audit-action.enum';
 
 @Injectable()
 export class AdminService {

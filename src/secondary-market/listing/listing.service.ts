@@ -1,10 +1,16 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  BadRequestException,
+  NotFoundException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { SecondaryMarketListing } from './listing.entity';
 import { CreateListingDto } from './dto/create-listing.dto';
 import { OwnershipService } from '../../ownership/ownership.service';
 import { ListingStatus } from './enums/listing-status.enum';
+import { AuditService } from 'src/audit/audit.service';
+import { AdminAction } from 'src/audit/enums/audit-action.enum';
 
 @Injectable()
 export class ListingService {
@@ -12,31 +18,24 @@ export class ListingService {
     @InjectRepository(SecondaryMarketListing)
     private readonly listingRepo: Repository<SecondaryMarketListing>,
     private readonly ownershipService: OwnershipService,
+    private readonly auditService: AuditService,
   ) {}
 
-  /**
-   * Create a secondary market listing
-   */
   async createListing(
-    sellerId: string, // ✅ MUST be UUID string
+    sellerId: string,
     dto: CreateListingDto,
   ): Promise<SecondaryMarketListing> {
-    if (!sellerId) {
-      throw new BadRequestException('Invalid seller id');
-    }
-
-    // 1️⃣ Check ownership
     const ownedUnits = await this.ownershipService.getUserUnitsForAsset(
       sellerId,
       dto.assetId,
     );
+
     if (ownedUnits < dto.unitsForSale) {
       throw new BadRequestException(
-        `Insufficient units. You own ${ownedUnits} units.`,
+        `Insufficient units. You own ${ownedUnits} but tried to list ${dto.unitsForSale}.`,
       );
     }
 
-    // 2️⃣ Create listing
     const listing = this.listingRepo.create({
       sellerId,
       assetId: dto.assetId,
@@ -46,38 +45,64 @@ export class ListingService {
       status: ListingStatus.ACTIVE,
     });
 
-    // 3️⃣ Save
-    return this.listingRepo.save(listing);
+    const savedListing = await this.listingRepo.save(listing);
+
+    await this.auditService.log({
+      adminId: sellerId,
+      targetId: savedListing.id,
+      action: AdminAction.LISTING_CREATED,
+      reason: `Created listing for ${dto.unitsForSale} units of asset ${dto.assetId}`,
+    });
+
+    return savedListing;
   }
 
-  /**
-   * Get active listings by asset
-   */
-  async getActiveListingsByAsset(assetId: string) {
+  async getActiveListingsByAsset(
+    assetId: string,
+  ): Promise<SecondaryMarketListing[]> {
     return this.listingRepo.find({
-      where: {
-        assetId,
-        status: ListingStatus.ACTIVE,
-      },
+      where: { assetId, status: ListingStatus.ACTIVE },
+      relations: ['asset'],
+      order: { pricePerUnit: 'ASC', createdAt: 'ASC' },
+    });
+  }
+
+  async getListingsBySeller(
+    sellerId: string,
+  ): Promise<SecondaryMarketListing[]> {
+    return this.listingRepo.find({
+      where: { sellerId },
+      relations: ['asset'],
       order: { createdAt: 'DESC' },
     });
   }
 
-  /**
-   * Cancel listing
-   */
-  async cancelListing(listingId: string, sellerId: string) {
-    const listing = await this.listingRepo.findOne({
-      where: { id: listingId },
+  async getAllActiveListings(): Promise<SecondaryMarketListing[]> {
+    return this.listingRepo.find({
+      where: { status: ListingStatus.ACTIVE },
+      relations: ['asset'],
+      order: { createdAt: 'DESC' },
     });
+  }
 
-    if (!listing) {
-      throw new BadRequestException('Listing not found');
-    }
+  async getListingById(id: string): Promise<SecondaryMarketListing> {
+    const listing = await this.listingRepo.findOne({
+      where: { id },
+      relations: ['asset'],
+    });
+    if (!listing) throw new NotFoundException('Listing not found');
+    return listing;
+  }
 
-    if (listing.sellerId !== sellerId) {
-      throw new BadRequestException('Unauthorized action');
-    }
+  async cancelListing(
+    listingId: string,
+    sellerId: string,
+  ): Promise<SecondaryMarketListing> {
+    const listing = await this.getListingById(listingId);
+    if (listing.sellerId !== sellerId)
+      throw new BadRequestException('Unauthorized');
+    if (listing.status !== ListingStatus.ACTIVE)
+      throw new BadRequestException('Already handled');
 
     listing.status = ListingStatus.CANCELLED;
     return this.listingRepo.save(listing);

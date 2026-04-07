@@ -1,14 +1,23 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  BadRequestException,
+  InternalServerErrorException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
-
+import { Repository, EntityManager } from 'typeorm';
 import { Trade } from './trade.entity';
 import { TradeStatus } from './enums/trade-status.enum';
-import { CreateTradeDto } from './dto/create-trade.dto';
 import { TradeLockService } from './trade-lock.service';
 import { OwnershipService } from 'src/ownership/ownership.service';
+import { WalletService } from 'src/wallet/wallet.service';
+import { ListingService } from '../listing/listing.service';
+import { ListingStatus } from '../listing/enums/listing-status.enum';
 import { InvestorProfile } from 'src/investor/investor.entity';
 import { Asset } from 'src/asset/asset.entity';
+import { LedgerSource } from 'src/ledger/enums/ledger-source.enum';
+import { AuditService } from 'src/audit/audit.service';
+import { AdminAction } from 'src/audit/enums/audit-action.enum';
+import { CreateTradeDto } from './dto/create-trade.dto';
 
 @Injectable()
 export class TradeService {
@@ -16,123 +25,159 @@ export class TradeService {
     @InjectRepository(Trade)
     private readonly tradeRepo: Repository<Trade>,
     private readonly ownershipService: OwnershipService,
+    private readonly walletService: WalletService,
     private readonly tradeLockService: TradeLockService,
+    private readonly listingService: ListingService,
+    private readonly auditService: AuditService,
   ) {}
 
-  /*
-  =====================================================
-  CREATE TRADE
-  =====================================================
-  */
   async createTrade(
-    sellerProfile: InvestorProfile,
+    seller: InvestorProfile,
     dto: CreateTradeDto,
   ): Promise<Trade> {
-    if (!sellerProfile) throw new BadRequestException('Invalid seller profile');
-    if (dto.units <= 0)
-      throw new BadRequestException('Units must be greater than 0');
-    if (dto.pricePerUnit <= 0)
-      throw new BadRequestException('Price must be greater than 0');
-
-    // ✅ Check seller units using userId
     const ownedUnits = await this.ownershipService.getUserUnitsForAsset(
-      sellerProfile.user.id,
+      seller.user.id,
       dto.assetId,
     );
 
-    if (ownedUnits < dto.units)
+    if (Number(ownedUnits) < Number(dto.units)) {
       throw new BadRequestException(
         `Insufficient units. You own ${ownedUnits}`,
       );
+    }
 
     const trade = this.tradeRepo.create({
-      seller: sellerProfile,
+      seller,
       asset: { id: dto.assetId } as Asset,
       units: dto.units,
       pricePerUnit: dto.pricePerUnit,
-      totalPrice: dto.units * dto.pricePerUnit,
+      totalPrice: Number(dto.units) * Number(dto.pricePerUnit),
       status: TradeStatus.PENDING,
     });
 
     return this.tradeRepo.save(trade);
   }
 
-  /*
-  =====================================================
-  EXECUTE TRADE
-  =====================================================
-  */
   async executeTrade(
-    tradeId: string,
-    buyerProfile: InvestorProfile,
+    listingId: string,
+    buyer: InvestorProfile,
   ): Promise<Trade> {
-    if (!buyerProfile) throw new BadRequestException('Invalid buyer profile');
+    const listing = await this.listingService.getListingById(listingId);
 
-    // 🔍 Fetch trade with seller and asset including user relation
-    const trade = await this.tradeRepo.findOne({
-      where: { id: tradeId },
-      relations: ['seller', 'seller.user', 'asset'],
-    });
+    if (!listing || listing.status !== ListingStatus.ACTIVE) {
+      throw new BadRequestException('Listing is no longer active');
+    }
 
-    if (!trade) throw new BadRequestException('Trade not found');
-    if (trade.status !== TradeStatus.PENDING)
-      throw new BadRequestException('Trade already executed');
-    if (trade.seller.id === buyerProfile.id)
-      throw new BadRequestException('Cannot execute own trade');
+    const unitsToBuy = Number(listing.unitsForSale);
+    const totalPrice = unitsToBuy * Number(listing.pricePerUnit);
 
-    if (!trade.seller.user)
-      throw new BadRequestException('Seller user not loaded');
+    // Prevent self-trading
+    if (listing.sellerId === buyer.id || listing.sellerId === buyer.user.id) {
+      throw new BadRequestException('Self-trading is not permitted');
+    }
 
-    // 🔐 LOCK trade execution
-    if (!this.tradeLockService.lock(trade.id))
-      throw new BadRequestException('Trade being executed elsewhere');
+    const buyerBalance = await this.walletService.getAvailableBalance(
+      buyer.user.id,
+    );
+
+    if (Number(buyerBalance) < totalPrice) {
+      throw new BadRequestException(
+        `Insufficient balance. Have: ${buyerBalance} SAR, Need: ${totalPrice} SAR`,
+      );
+    }
+
+    if (!this.tradeLockService.lock(listingId)) {
+      throw new BadRequestException('Transaction in progress...');
+    }
 
     try {
-      const sellerUserId = trade.seller.user.id; // for getUserUnitsForAsset
-      const sellerInvestorId = trade.seller.id; // for removeUnits
-      const buyerUserId = buyerProfile.user.id; // for addUnits via string
-      const buyerInvestorId = buyerProfile.id; // for addUnits via object
+      return await this.tradeRepo.manager.transaction(
+        async (manager: EntityManager) => {
+          // --- 1. RESOLVE SELLER CONTEXT ---
+          // This is the CRITICAL fix. We find the InvestorProfile linked to the sellerId.
+          // This ensures we get the real investorId even if the listing stored a userId.
+          const sellerProfile = await this.ownershipService.getInvestorByUserId(
+            listing.sellerId,
+          );
 
-      // 1️⃣ Check seller units using userId
-      const sellerUnits = await this.ownershipService.getUserUnitsForAsset(
-        sellerUserId,
-        trade.asset.id,
+          // --- 2. FINANCIAL SETTLEMENT ---
+          await this.walletService.debitAvailable(
+            buyer.user.id,
+            totalPrice,
+            manager,
+          );
+
+          await this.walletService.credit(
+            listing.sellerId,
+            totalPrice,
+            LedgerSource.SECONDARY_MARKET_SELL,
+            `Sale of ${unitsToBuy} units of ${listing.assetId}`,
+            manager,
+          );
+
+          // --- 3. OWNERSHIP TRANSFER ---
+          // Use sellerProfile.id to guarantee the lookup in the ownerships table works.
+          await this.ownershipService.removeUnits(
+            sellerProfile.id,
+            listing.assetId,
+            unitsToBuy,
+            manager,
+          );
+
+          // Buyer gains units. Passing the profile object handles "add or create" logic.
+          await this.ownershipService.addUnits(
+            buyer,
+            listing.assetId,
+            unitsToBuy,
+            manager,
+          );
+
+          // --- 4. UPDATE LISTING ---
+          listing.status = ListingStatus.SOLD;
+          await manager.save(listing);
+
+          // --- 5. RECORD TRADE ---
+          const trade = this.tradeRepo.create({
+            buyer,
+            seller: sellerProfile, // Now using the full resolved profile
+            asset: { id: listing.assetId } as any,
+            units: unitsToBuy,
+            pricePerUnit: listing.pricePerUnit,
+            totalPrice: totalPrice,
+            status: TradeStatus.COMPLETED,
+            executedAt: new Date(),
+          });
+
+          const savedTrade = await manager.save(trade);
+
+          // --- 6. AUDIT ---
+          await this.auditService.log(
+            {
+              adminId: buyer.user.id,
+              targetId: savedTrade.id,
+              action: AdminAction.TRADE_EXECUTED,
+              reason: `P2P Purchase: ${unitsToBuy} units @ ${listing.pricePerUnit} SAR`,
+            },
+            manager,
+          );
+
+          return savedTrade;
+        },
       );
-
-      if (sellerUnits < trade.units)
-        throw new BadRequestException('Seller no longer owns required units');
-
-      // 2️⃣ Transfer ownership
-      await this.ownershipService.removeUnits(
-        trade.seller.id, // investorId
-        trade.asset.id,
-        trade.units,
+    } catch (error: any) {
+      console.error('Execution Error Details:', error.message);
+      throw new InternalServerErrorException(
+        'Execution failed: ' + error.message,
       );
-      await this.ownershipService.addUnits(
-        buyerUserId,
-        trade.asset.id,
-        trade.units,
-      ); // pass userId string
-
-      // 3️⃣ Update trade record
-      trade.buyer = buyerProfile;
-      trade.status = TradeStatus.COMPLETED;
-      trade.executedAt = new Date();
-
-      return await this.tradeRepo.save(trade);
     } finally {
-      this.tradeLockService.unlock(trade.id);
+      this.tradeLockService.unlock(listingId);
     }
   }
 
-  /*
-  =====================================================
-  GET ALL TRADES
-  =====================================================
-  */
-  async getTrades(): Promise<Trade[]> {
+  async getTrades() {
     return this.tradeRepo.find({
-      relations: ['buyer', 'buyer.user', 'seller', 'seller.user', 'asset'],
+      relations: ['seller', 'buyer', 'asset'],
+      order: { executedAt: 'DESC' },
     });
   }
 }

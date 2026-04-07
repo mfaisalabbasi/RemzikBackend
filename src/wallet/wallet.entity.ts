@@ -1,17 +1,27 @@
-import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
+import {
+  Column,
+  Entity,
+  PrimaryGeneratedColumn,
+  UpdateDateColumn,
+} from 'typeorm';
 
 @Entity('wallets')
 export class Wallet {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  @Column()
+  @Column({ unique: true })
   userId: string;
-  @Column({ type: 'decimal', default: 0 })
-  lockedBalance: number; // ✅ add this
 
   @Column('decimal', { precision: 15, scale: 2, default: 0 })
-  balance: number;
-  @Column({ type: 'decimal', default: 0 })
   availableBalance: number;
+
+  @Column('decimal', { precision: 15, scale: 2, default: 0 })
+  lockedBalance: number;
+
+  @Column('decimal', { precision: 15, scale: 2, default: 0 })
+  totalEarned: number; // For tracking total profit distributions
+
+  @UpdateDateColumn()
+  updatedAt: Date;
 }

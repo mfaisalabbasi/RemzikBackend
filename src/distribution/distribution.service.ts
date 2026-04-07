@@ -1,66 +1,78 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, EntityManager } from 'typeorm';
 import { Distribution } from './distribution.entity';
 import { Ownership } from '../ownership/ownership.entity';
 import { Asset } from '../asset/asset.entity';
 import { AssetToken } from 'src/tokenization/entities/asset-token.entity';
+import { WalletService } from 'src/wallet/wallet.service';
+import { LedgerSource } from 'src/ledger/enums/ledger-source.enum';
 
 @Injectable()
 export class DistributionService {
   constructor(
     @InjectRepository(Distribution)
     private readonly distributionRepo: Repository<Distribution>,
-
     @InjectRepository(Ownership)
     private readonly ownershipRepo: Repository<Ownership>,
-
     @InjectRepository(AssetToken)
     private readonly assetTokenRepo: Repository<AssetToken>,
+    private readonly walletService: WalletService, // Added to pay investors
   ) {}
 
   /**
-   * Distribute income for an asset
+   * Calculate and pay out income (Rent/Dividends) to all shareholders
    */
   async distributeIncome(
     asset: Asset,
     totalIncome: number,
-    period: string,
+    period: string, // e.g., "March 2026"
   ): Promise<void> {
-    // 1️⃣ Get all ownerships for this asset
-    const ownerships = await this.ownershipRepo.find({
-      where: { asset: { id: asset.id } },
-      relations: ['investor', 'asset'],
-    });
+    return this.distributionRepo.manager.transaction(
+      async (manager: EntityManager) => {
+        // 1. Get Asset Token details to know total shares
+        const token = await manager.findOne(AssetToken, {
+          where: { asset: { id: asset.id } },
+        });
+        if (!token) throw new BadRequestException('Asset metadata not found');
 
-    if (!ownerships || ownerships.length === 0) {
-      throw new BadRequestException('No ownerships found for this asset');
-    }
+        // 2. Find everyone who owns a piece of this asset
+        const ownerships = await manager.find(Ownership, {
+          where: { assetId: asset.id },
+          relations: ['investor', 'investor.user'],
+        });
 
-    // 2️⃣ Get the token record for this asset
-    const token = await this.assetTokenRepo.findOne({
-      where: { asset: { id: asset.id } },
-    });
+        if (!ownerships.length)
+          throw new BadRequestException('No investors found for this asset');
 
-    if (!token) {
-      throw new BadRequestException('Asset not tokenized yet');
-    }
+        for (const ownership of ownerships) {
+          // 3. Math: (My Shares / Total Shares) * Total Income
+          const shareRatio =
+            Number(ownership.shares) / Number(token.totalShares);
+          const payoutAmount = totalIncome * shareRatio;
 
-    // 3️⃣ Loop over each ownership and calculate payout
-    for (const ownership of ownerships) {
-      const shareRatio = Number(ownership.shares) / Number(token.totalShares);
-      const payout = totalIncome * shareRatio;
+          if (payoutAmount <= 0) continue;
 
-      // 4️⃣ Create distribution record
-      const record = this.distributionRepo.create({
-        asset,
-        investor: ownership.investor,
-        amount: payout,
-        period,
-        paid: false,
-      });
+          // 4. Record the Distribution for tax/reporting
+          const record = manager.create(Distribution, {
+            asset,
+            investor: ownership.investor,
+            amount: payoutAmount,
+            period,
+            paid: true, // Marking true because we credit the wallet immediately
+          });
+          await manager.save(record);
 
-      await this.distributionRepo.save(record);
-    }
+          // 5. CREDIT WALLET: The money actually moves to the user's available balance
+          const userId = ownership.investor.user.id;
+          await this.walletService.credit(
+            userId,
+            payoutAmount,
+            LedgerSource.DIVIDEND_PAYOUT,
+            `Income Distribution for ${asset.title} - ${period}`,
+          );
+        }
+      },
+    );
   }
 }

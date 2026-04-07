@@ -22,15 +22,13 @@ export class AuthController {
     @Res({ passthrough: true }) res: Response,
   ) {
     const result = await this.authService.login(dto.email, dto.password);
-    console.log('Login endpoint hit', dto.email); //
-    console.log('Generated JWT:', result.accessToken);
-    console.log('Generated JWT:');
-    // Set cookie
+
+    // Set cookie with explicit root path
     res.cookie('accessToken', result.accessToken, {
       httpOnly: true,
-      secure: false, // true in HTTPS
-      sameSite: 'lax', // or 'none' if cross-domain with HTTPS
-      path: '/',
+      secure: false, // Set to true in Production with HTTPS
+      sameSite: 'lax',
+      path: '/', // 👈 Set here
       maxAge: 1000 * 60 * 60 * 24,
     });
 
@@ -56,10 +54,12 @@ export class AuthController {
 
   @Post('logout')
   logout(@Res({ passthrough: true }) res: Response) {
+    // ✅ THE FIX: Path must match the login path to be cleared
     res.clearCookie('accessToken', {
       httpOnly: true,
       sameSite: 'lax',
       secure: false,
+      path: '/', // 👈 REQUIRED to delete the root cookie
     });
 
     return { message: 'Logged out successfully' };

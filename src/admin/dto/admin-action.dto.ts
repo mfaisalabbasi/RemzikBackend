@@ -1,7 +1,6 @@
 // src/admin/dto/admin-action.dto.ts
 import { IsEnum, IsUUID, IsOptional, IsString } from 'class-validator';
-import { AdminAction } from '../enums/admin-action.enum';
-
+import { AdminAction } from 'src/audit/enums/audit-action.enum';
 export class AdminActionDto {
   @IsEnum(AdminAction)
   action: AdminAction;
