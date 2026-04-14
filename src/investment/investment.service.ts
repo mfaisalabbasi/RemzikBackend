@@ -100,14 +100,14 @@ export class InvestmentService {
     );
 
     // Trigger Notification
-    // await this.notificationOrchestrator.buildAndSave(
-    //   userId,
-    //   'investment.created',
-    //   {
-    //     amount: savedInvestment.amount,
-    //     asset: savedInvestment.asset.title,
-    //   },
-    // );
+    await this.notificationOrchestrator.buildAndSave(
+      userId,
+      'investment.created',
+      {
+        amount: savedInvestment.amount,
+        asset: savedInvestment.asset.title,
+      },
+    );
 
     return savedInvestment;
   }
