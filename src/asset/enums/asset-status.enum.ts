@@ -4,4 +4,5 @@ export enum AssetStatus {
   APPROVED = 'APPROVED',
   REJECTED = 'REJECTED',
   FREEZ = 'FREEZ',
+  PAID = 'PAID',
 }

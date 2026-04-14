@@ -3,32 +3,41 @@ import {
   PrimaryGeneratedColumn,
   Column,
   CreateDateColumn,
+  ManyToOne,
+  JoinColumn,
+  Index,
 } from 'typeorm';
-import { NotificationType } from '../enums/notification-type.enum';
+import { User } from 'src/user/user.entity';
 
 @Entity('notifications')
 export class Notification {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
+  // We keep the string column for easy querying...
+  @Column()
+  @Index()
+  userId: string;
+
+  // ...but we link it to the User entity for database integrity
+  @ManyToOne(() => User, (user) => user.id, { onDelete: 'CASCADE' })
+  @JoinColumn({ name: 'userId' })
+  user: User;
+
   @Column()
   title: string;
 
-  @Column('text')
+  @Column({ nullable: true, type: 'text' }) // Use 'text' for longer messages
   message: string;
 
-  @Column({
-    type: 'enum',
-    enum: NotificationType,
-    default: NotificationType.INFO,
-  })
-  type: NotificationType;
-
-  @Column({ nullable: true })
-  userId?: string;
+  @Column({ default: 'info' })
+  type: string; // 'info', 'success', 'warning', 'error'
 
   @Column({ default: false })
   read: boolean;
+
+  @Column({ nullable: true })
+  actionUrl: string;
 
   @CreateDateColumn()
   createdAt: Date;

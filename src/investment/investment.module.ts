@@ -9,16 +9,22 @@ import { KycModule } from 'src/kyc/kyc.module';
 import { AssetToken } from 'src/tokenization/entities/asset-token.entity';
 import { OwnershipModule } from 'src/ownership/ownership.module';
 import { WalletModule } from 'src/wallet/wallet.module';
+import { EventEmitterModule } from '@nestjs/event-emitter';
+import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
+import { NotificationsModule } from 'src/notifications/notifications.module';
 
 @Module({
   imports: [
-    KycModule, // This now provides access to KycProfile repositories
+    KycModule,
     TypeOrmModule.forFeature([Investment, InvestorProfile, Asset, AssetToken]),
     OwnershipModule,
     WalletModule,
+    // ✅ Use .forRoot() to initialize the provider for the InvestmentService
+    EventEmitterModule.forRoot(),
+    NotificationsModule,
   ],
-  providers: [InvestmentService],
+  providers: [InvestmentService, NotificationOrchestrator],
   controllers: [InvestmentController],
-  exports: [InvestmentService],
+  exports: [InvestmentService, NotificationOrchestrator],
 })
 export class InvestmentModule {}

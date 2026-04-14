@@ -1,8 +1,7 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Notification } from './entities/notification.entity';
-import { CreateNotificationDto } from './dto/create-notification.dto';
 
 @Injectable()
 export class NotificationsService {
@@ -11,23 +10,31 @@ export class NotificationsService {
     private readonly repo: Repository<Notification>,
   ) {}
 
-  async create(data: CreateNotificationDto): Promise<Notification> {
-    const notification = this.repo.create(data);
-    return this.repo.save(notification);
+  async create(data: Partial<Notification>): Promise<Notification> {
+    // Force read to false on creation
+    const notification = this.repo.create({ ...data, read: false });
+    return await this.repo.save(notification);
   }
 
-  async markAsRead(id: string) {
-    return this.repo.update(id, { read: true });
-  }
+  async getByUser(userId: string): Promise<Notification[]> {
+    console.log('DEBUG: Looking for notifications for userId:', userId);
 
-  async getByUser(userId: string) {
-    return this.repo.find({
+    const notifications = await this.repo.find({
       where: { userId },
       order: { createdAt: 'DESC' },
     });
+
+    console.log('DEBUG: Notifications found in DB:', notifications.length);
+    return notifications;
   }
 
-  async getAll() {
-    return this.repo.find({ order: { createdAt: 'DESC' } });
+  async markAsRead(id: string, userId: string) {
+    // Added userId check to ensure users can only mark THEIR OWN notifications
+    const result = await this.repo.update({ id, userId }, { read: true });
+    if (result.affected === 0)
+      throw new NotFoundException(
+        `Notification ${id} not found or access denied`,
+      );
+    return { success: true };
   }
 }

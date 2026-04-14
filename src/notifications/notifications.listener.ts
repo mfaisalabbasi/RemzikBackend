@@ -1,29 +1,30 @@
-import { Injectable } from '@nestjs/common';
-import { OnEvent } from '@nestjs/event-emitter';
-import { NotificationsService } from './notifications.service';
-import { NotificationType } from './enums/notification-type.enum';
+import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
+import { NotificationOrchestrator } from './notifications.orchestrator';
 
 @Injectable()
-export class NotificationsListener {
-  constructor(private readonly notificationsService: NotificationsService) {}
+export class NotificationsListener implements OnModuleInit {
+  private readonly logger = new Logger(NotificationsListener.name);
 
-  @OnEvent('investment.created')
-  async handleInvestmentCreated(payload: any) {
-    await this.notificationsService.create({
-      title: 'New Investment',
-      message: `User ${payload.userId} invested ${payload.amount} SAR`,
-      type: NotificationType.SUCCESS,
-      userId: payload.userId,
-    });
-  }
+  constructor(
+    private readonly orchestrator: NotificationOrchestrator,
+    private readonly eventEmitter: EventEmitter2,
+  ) {}
 
-  @OnEvent('payout.success')
-  async handlePayoutSuccess(payload: any) {
-    await this.notificationsService.create({
-      title: 'Payout Successful',
-      message: `Payout of ${payload.amount} SAR completed`,
-      type: NotificationType.SUCCESS,
-      userId: payload.userId,
+  onModuleInit() {
+    this.eventEmitter.on('investment.created', async (payload: any) => {
+      const { userId, ...data } = payload;
+      if (!userId) return;
+
+      try {
+        await this.orchestrator.buildAndSave(
+          userId,
+          'investment.created',
+          data,
+        );
+      } catch (error) {
+        this.logger.error(`Listener failed: ${error}`);
+      }
     });
   }
 }

@@ -14,6 +14,7 @@ import { AssetToken } from 'src/tokenization/entities/asset-token.entity';
 import { OwnershipService } from 'src/ownership/ownership.service';
 import { WalletService } from 'src/wallet/wallet.service';
 import { LedgerSource } from 'src/ledger/enums/ledger-source.enum';
+import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
 
 @Injectable()
 export class InvestmentService {
@@ -23,22 +24,15 @@ export class InvestmentService {
 
     @InjectRepository(AssetToken)
     private readonly assettokenRepo: Repository<AssetToken>,
-
+    private readonly notificationOrchestrator: NotificationOrchestrator,
     private readonly ownershipService: OwnershipService,
     private readonly walletService: WalletService,
   ) {}
 
-  /**
-   * PRIMARY MARKET INVESTMENT
-   * Process: Checks balance -> Deducts Wallet -> Updates Token Supply ->
-   * Updates Asset Aggregates (Funded/Investors) -> Creates Investment Record ->
-   * Updates Ownership Table.
-   */
   async createInvestment(
     userId: string,
     dto: CreateInvestmentDto,
   ): Promise<Investment> {
-    // 1️⃣ FAST-FAIL CHECK
     const availableBalance = await this.walletService.getBalance(userId);
     if (availableBalance < dto.amount) {
       throw new BadRequestException(
@@ -46,9 +40,8 @@ export class InvestmentService {
       );
     }
 
-    return this.investmentRepo.manager.transaction(
+    const savedInvestment = await this.investmentRepo.manager.transaction(
       async (manager: EntityManager) => {
-        // 2️⃣ LOAD INVESTOR
         const investor = await manager.findOne(InvestorProfile, {
           where: { user: { id: userId } },
           relations: ['user'],
@@ -56,7 +49,6 @@ export class InvestmentService {
         if (!investor)
           throw new BadRequestException('Investor profile not found');
 
-        // 3️⃣ LOCK ASSET TOKEN & ASSET: Pessimistic write lock to prevent race conditions
         const token = await manager
           .getRepository(AssetToken)
           .createQueryBuilder('token')
@@ -71,7 +63,6 @@ export class InvestmentService {
         });
         if (!asset) throw new BadRequestException('Asset not found');
 
-        // 4️⃣ SHARE CALCULATION
         const sharesToBuy = dto.amount / Number(token.sharePrice);
         if (sharesToBuy > token.availableShares) {
           throw new BadRequestException(
@@ -79,7 +70,6 @@ export class InvestmentService {
           );
         }
 
-        // 5️⃣ FINANCIAL HANDSHAKE
         await this.walletService.debitAvailable(userId, dto.amount);
         await this.walletService.credit(
           userId,
@@ -88,84 +78,95 @@ export class InvestmentService {
           `Investment in ${asset.title} (Primary Market)`,
         );
 
-        // 6️⃣ UPDATE TOKEN SUPPLY
         token.availableShares -= sharesToBuy;
         await manager.save(token);
 
-        // 7️⃣ 🔥 SYNC ASSET AGGREGATES (The Fix for 0% Funded)
-        // Increment total funded amount
         asset.funded = Number(asset.funded) + Number(dto.amount);
-
-        // Check if this is a new investor for this specific asset to increment count
-        // For simplicity, we increment; for strictness, check Ownership table first.
         asset.investors = (asset.investors || 0) + 1;
         await manager.save(asset);
 
-        // 8️⃣ CREATE INVESTMENT RECORD
         const investment = manager.create(Investment, {
           investor,
           asset,
           amount: dto.amount,
           status: InvestmentStatus.CONFIRMED,
         });
-        const savedInvestment = await manager.save(investment);
+        const result = await manager.save(investment);
 
-        // 9️⃣ UPDATE OWNERSHIP
         await this.ownershipService.addShares(investor, asset, sharesToBuy);
 
-        return savedInvestment;
+        return result;
       },
     );
+
+    // Trigger Notification
+    // await this.notificationOrchestrator.buildAndSave(
+    //   userId,
+    //   'investment.created',
+    //   {
+    //     amount: savedInvestment.amount,
+    //     asset: savedInvestment.asset.title,
+    //   },
+    // );
+
+    return savedInvestment;
   }
 
-  /**
-   * ADMIN CONFIRMATION: Manual flow updates.
-   * Now also updates the Asset Aggregate totals upon manual confirmation.
-   */
   async confirmInvestment(id: string): Promise<Investment> {
     const investment = await this.investmentRepo.findOne({
       where: { id },
-      relations: ['investor', 'asset'],
+      relations: ['investor', 'investor.user', 'asset'],
     });
 
     if (!investment) throw new NotFoundException('Investment record not found');
     if (investment.status === InvestmentStatus.CONFIRMED) return investment;
 
-    // Use transaction for manual confirmation to ensure Asset table stays in sync
-    return this.investmentRepo.manager.transaction(async (manager) => {
-      investment.status = InvestmentStatus.CONFIRMED;
+    const confirmedInvestment = await this.investmentRepo.manager.transaction(
+      async (manager) => {
+        investment.status = InvestmentStatus.CONFIRMED;
 
-      const token = await manager.findOne(AssetToken, {
-        where: { asset: { id: investment.asset.id } },
-      });
+        const token = await manager.findOne(AssetToken, {
+          where: { asset: { id: investment.asset.id } },
+        });
 
-      if (!token)
-        throw new BadRequestException('Token metadata missing for asset');
+        if (!token)
+          throw new BadRequestException('Token metadata missing for asset');
 
-      const shares = investment.amount / Number(token.sharePrice);
+        const shares = investment.amount / Number(token.sharePrice);
 
-      // Update Asset Totals
-      const asset = investment.asset;
-      asset.funded = Number(asset.funded) + Number(investment.amount);
-      asset.investors = (asset.investors || 0) + 1;
+        const asset = investment.asset;
+        asset.funded = Number(asset.funded) + Number(investment.amount);
+        asset.investors = (asset.investors || 0) + 1;
 
-      await manager.save(asset);
-      await manager.save(investment);
+        await manager.save(asset);
+        const result = await manager.save(investment);
 
-      // Synchronize to the Ownership table
-      await this.ownershipService.addShares(
-        investment.investor,
-        investment.asset,
-        shares,
+        await this.ownershipService.addShares(
+          investment.investor,
+          investment.asset,
+          shares,
+        );
+
+        return result;
+      },
+    );
+
+    const userId = confirmedInvestment.investor?.user?.id;
+    if (userId) {
+      // Trigger Notification
+      await this.notificationOrchestrator.buildAndSave(
+        userId,
+        'investment.created',
+        {
+          amount: confirmedInvestment.amount,
+          asset: confirmedInvestment.asset.title,
+        },
       );
+    }
 
-      return investment;
-    });
+    return confirmedInvestment;
   }
 
-  /**
-   * PORTFOLIO RETRIEVAL
-   */
   async getMyInvestments(userId: string): Promise<Investment[]> {
     return this.investmentRepo.find({
       where: { investor: { user: { id: userId } } },
@@ -173,8 +174,6 @@ export class InvestmentService {
       order: { createdAt: 'DESC' },
     });
   }
-
-  // -------------------- ANALYTICS & STATS --------------------
 
   async getByUser(userId: string): Promise<Investment[]> {
     return this.investmentRepo.find({

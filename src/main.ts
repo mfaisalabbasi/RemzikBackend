@@ -8,19 +8,19 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
   app.setGlobalPrefix('api');
-
   app.use(cookieParser());
 
   app.enableCors({
-    origin: 'http://localhost:3000', // your frontend
-    credentials: true, // cookies allowed
+    origin: 'http://localhost:3000',
+    credentials: true,
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
   });
 
   app.use(helmet());
   app.use(
     rateLimit({
       windowMs: 60 * 1000,
-      max: 50,
+      max: 500, // Increased to avoid 429 errors during development
     }),
   );
 

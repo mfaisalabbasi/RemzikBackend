@@ -1,4 +1,4 @@
-import { IsString, IsOptional, IsEnum } from 'class-validator';
+import { IsString, IsOptional, IsEnum, IsObject } from 'class-validator';
 import { NotificationType } from '../enums/notification-type.enum';
 
 export class CreateNotificationDto {
@@ -14,5 +14,14 @@ export class CreateNotificationDto {
 
   @IsOptional()
   @IsString()
-  userId?: string; // optional, if notification is user-specific
+  userId?: string;
+
+  // ✅ ADD THESE NEW FIELDS
+  @IsOptional()
+  @IsString()
+  actionUrl?: string;
+
+  @IsOptional()
+  @IsObject()
+  metadata?: any;
 }

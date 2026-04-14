@@ -4,7 +4,6 @@ import { ExtractJwt, Strategy } from 'passport-jwt';
 import { ConfigService } from '@nestjs/config';
 import type { Request } from 'express';
 
-// Extract JWT from the cookie named 'accessToken'
 const cookieExtractor = (req: Request): string | null => {
   if (req && req.cookies) {
     return req.cookies['accessToken'] || null;
@@ -18,13 +17,13 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     super({
       jwtFromRequest: ExtractJwt.fromExtractors([cookieExtractor]),
       ignoreExpiration: false,
-      secretOrKey: config.getOrThrow<string>('JWT_SECRET'), // must exist
+      secretOrKey: config.getOrThrow<string>('JWT_SECRET'),
       passReqToCallback: false,
     });
   }
 
   async validate(payload: any) {
-    // payload.sub = user ID
+    // Reverted: Keeping your structure so other functions aren't broken
     return { userId: payload.sub, role: payload.role };
   }
 }

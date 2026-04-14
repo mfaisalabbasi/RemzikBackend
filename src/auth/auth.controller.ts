@@ -23,12 +23,11 @@ export class AuthController {
   ) {
     const result = await this.authService.login(dto.email, dto.password);
 
-    // Set cookie with explicit root path
     res.cookie('accessToken', result.accessToken, {
       httpOnly: true,
-      secure: false, // Set to true in Production with HTTPS
+      secure: false,
       sameSite: 'lax',
-      path: '/', // 👈 Set here
+      path: '/',
       maxAge: 1000 * 60 * 60 * 24,
     });
 
@@ -47,19 +46,18 @@ export class AuthController {
   @Get('me')
   getMe(@Req() req: Request & { user?: any }) {
     return {
-      id: req.user?.userId,
+      id: req.user?.userId, // Reverted to match your original Strategy
       role: req.user?.role,
     };
   }
 
   @Post('logout')
   logout(@Res({ passthrough: true }) res: Response) {
-    // ✅ THE FIX: Path must match the login path to be cleared
     res.clearCookie('accessToken', {
       httpOnly: true,
       sameSite: 'lax',
       secure: false,
-      path: '/', // 👈 REQUIRED to delete the root cookie
+      path: '/',
     });
 
     return { message: 'Logged out successfully' };
