@@ -19,21 +19,15 @@ export class WalletService {
     return manager ? manager.getRepository(Wallet) : this.walletRepo;
   }
 
-  /**
-   * ✅ FIXED: Ensures zero-persistence.
-   * Local variables prevent balance leakage between user sessions.
-   */
   async getWallet(userId: string): Promise<WalletResponseDto> {
     const entries = await this.ledgerService.findByUser(userId);
-
-    let available = 0;
-    let pending = 0;
-    let locked = 0;
-    let earned = 0;
+    let available = 0,
+      pending = 0,
+      locked = 0,
+      earned = 0;
 
     for (const entry of entries) {
       const amount = Number(entry.amount);
-
       switch (entry.source) {
         case LedgerSource.DISTRIBUTION_ENGINE:
           available += amount;
@@ -53,7 +47,7 @@ export class WalletService {
         case LedgerSource.INVESTMENT_CONFIRMATION:
         case LedgerSource.ADMIN_ADJUSTMENT:
         case LedgerSource.WALLET_DEPOSIT:
-        case LedgerSource.SECONDARY_MARKET_SELL: // ✅ Added explicit sell logic
+        case LedgerSource.SECONDARY_MARKET_SELL:
           available += amount;
           break;
         case LedgerSource.ESCROW_LOCK:
@@ -66,12 +60,10 @@ export class WalletService {
           break;
         case LedgerSource.ASSET_INVESTMENT:
         case LedgerSource.SECONDARY_MARKET_BUY:
-          // ✅ FIX: Ensure buy always subtracts absolute value
           available -= Math.abs(amount);
           break;
       }
     }
-
     return {
       availableBalance: available,
       lockedBalance: locked,
@@ -104,16 +96,43 @@ export class WalletService {
   ): Promise<Wallet> {
     const repo = this.getRepo(manager);
     let wallet = await repo.findOne({ where: { userId } });
-
     if (!wallet) {
-      wallet = repo.create({
-        userId,
-        availableBalance: 0,
-        lockedBalance: 0,
-      });
+      wallet = repo.create({ userId, availableBalance: 0, lockedBalance: 0 });
       await repo.save(wallet);
     }
     return wallet;
+  }
+
+  // ✅ FIXED: Using atomic updates to prevent race conditions
+  async creditAvailable(
+    userId: string,
+    amount: number,
+    manager?: EntityManager,
+  ): Promise<void> {
+    const repo = this.getRepo(manager);
+    await repo
+      .createQueryBuilder()
+      .update(Wallet)
+      .set({ availableBalance: () => `availableBalance + ${amount}` })
+      .where('userId = :userId', { userId })
+      .execute();
+  }
+
+  async debitAvailable(
+    userId: string,
+    amount: number,
+    manager?: EntityManager,
+  ): Promise<void> {
+    const repo = this.getRepo(manager);
+    const wallet = await this.getOrCreateWallet(userId, manager);
+    if (Number(wallet.availableBalance) < amount)
+      throw new BadRequestException('Insufficient available balance');
+    await repo
+      .createQueryBuilder()
+      .update(Wallet)
+      .set({ availableBalance: () => `availableBalance - ${amount}` })
+      .where('userId = :userId', { userId })
+      .execute();
   }
 
   async credit(
@@ -134,43 +153,24 @@ export class WalletService {
     );
   }
 
-  async debitAvailable(
-    userId: string,
-    amount: number,
-    manager?: EntityManager,
-  ): Promise<void> {
-    const wallet = await this.getOrCreateWallet(userId, manager);
-
-    if (Number(wallet.availableBalance) < amount) {
-      throw new BadRequestException('Insufficient available balance');
-    }
-
-    wallet.availableBalance = Number(wallet.availableBalance) - Number(amount);
-    await this.getRepo(manager).save(wallet);
-  }
-
-  async creditAvailable(
-    userId: string,
-    amount: number,
-    manager?: EntityManager,
-  ): Promise<void> {
-    const wallet = await this.getOrCreateWallet(userId, manager);
-    wallet.availableBalance = Number(wallet.availableBalance) + Number(amount);
-    await this.getRepo(manager).save(wallet);
-  }
-
   async lockFunds(
     userId: string,
     amount: number,
     manager?: EntityManager,
   ): Promise<void> {
+    const repo = this.getRepo(manager);
     const wallet = await this.getOrCreateWallet(userId, manager);
     if (Number(wallet.availableBalance) < amount)
       throw new BadRequestException('Insufficient available balance');
-
-    wallet.availableBalance = Number(wallet.availableBalance) - Number(amount);
-    wallet.lockedBalance = Number(wallet.lockedBalance) + Number(amount);
-    await this.getRepo(manager).save(wallet);
+    await repo
+      .createQueryBuilder()
+      .update(Wallet)
+      .set({
+        availableBalance: () => `availableBalance - ${amount}`,
+        lockedBalance: () => `lockedBalance + ${amount}`,
+      })
+      .where('userId = :userId', { userId })
+      .execute();
   }
 
   async unlockFunds(
@@ -178,10 +178,16 @@ export class WalletService {
     amount: number,
     manager?: EntityManager,
   ): Promise<void> {
-    const wallet = await this.getOrCreateWallet(userId, manager);
-    wallet.lockedBalance = Number(wallet.lockedBalance) - Number(amount);
-    wallet.availableBalance = Number(wallet.availableBalance) + Number(amount);
-    await this.getRepo(manager).save(wallet);
+    const repo = this.getRepo(manager);
+    await repo
+      .createQueryBuilder()
+      .update(Wallet)
+      .set({
+        lockedBalance: () => `lockedBalance - ${amount}`,
+        availableBalance: () => `availableBalance + ${amount}`,
+      })
+      .where('userId = :userId', { userId })
+      .execute();
   }
 
   async adjustBalance(
@@ -189,9 +195,13 @@ export class WalletService {
     amount: number,
     manager?: EntityManager,
   ): Promise<void> {
-    const wallet = await this.getOrCreateWallet(userId, manager);
-    wallet.availableBalance = Number(wallet.availableBalance) + Number(amount);
-    await this.getRepo(manager).save(wallet);
+    const repo = this.getRepo(manager);
+    await repo
+      .createQueryBuilder()
+      .update(Wallet)
+      .set({ availableBalance: () => `availableBalance + ${amount}` })
+      .where('userId = :userId', { userId })
+      .execute();
   }
 
   async getAvailableBalance(userId: string): Promise<number> {
@@ -204,13 +214,15 @@ export class WalletService {
     amount: number,
     manager?: EntityManager,
   ): Promise<void> {
+    const repo = this.getRepo(manager);
     const wallet = await this.getOrCreateWallet(userId, manager);
-
-    if (Number(wallet.lockedBalance) < amount) {
+    if (Number(wallet.lockedBalance) < amount)
       throw new BadRequestException('Insufficient locked funds');
-    }
-
-    wallet.lockedBalance = Number(wallet.lockedBalance) - Number(amount);
-    await this.getRepo(manager).save(wallet);
+    await repo
+      .createQueryBuilder()
+      .update(Wallet)
+      .set({ lockedBalance: () => `lockedBalance - ${amount}` })
+      .where('userId = :userId', { userId })
+      .execute();
   }
 }

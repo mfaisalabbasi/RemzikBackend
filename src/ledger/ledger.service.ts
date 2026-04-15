@@ -22,14 +22,11 @@ export class LedgerService {
       order: { createdAt: 'DESC' },
     });
 
-    // If real data exists, return ONLY that.
     if (realTransactions.length > 0) return realTransactions;
 
-    // ✅ FIX: Unique ID per user prevents frontend "merging" bugs
-    // ✅ FIX: Use LedgerType.CREDIT to ensure it's treated as positive balance
     return [
       {
-        id: `dummy-init-${userId}`,
+        id: `dummy-init-${userId}`, // Unique ID per user
         userId,
         amount: 15000.0,
         type: LedgerType.CREDIT,
@@ -50,7 +47,6 @@ export class LedgerService {
     manager?: EntityManager,
   ): Promise<LedgerEntry> {
     const repo = this.getRepo(manager);
-
     const entry = repo.create({
       userId,
       amount: Number(amount),
@@ -58,7 +54,6 @@ export class LedgerService {
       source,
       note,
     });
-
     return await repo.save(entry);
   }
 
@@ -101,10 +96,8 @@ export class LedgerService {
   ): Promise<LedgerEntry[]> {
     const query = this.ledgerRepo.createQueryBuilder('ledger');
     query.where('ledger.userId = :userId', { userId });
-
     if (type) query.andWhere('ledger.type = :type', { type });
     if (source) query.andWhere('ledger.source = :source', { source });
-
     return query.orderBy('ledger.createdAt', 'DESC').getMany();
   }
 }
