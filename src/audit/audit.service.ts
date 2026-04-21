@@ -34,10 +34,26 @@ export class AuditService {
     return await repo.save(log);
   }
 
+  async findRecent() {
+    return this.auditRepo.find({
+      order: { createdAt: 'DESC' },
+      take: 5, // ✅ Limit to 5 at the database level
+    });
+  }
+
   async findAll(action?: AdminAction) {
     return this.auditRepo.find({
       where: action ? { action } : {},
       order: { createdAt: 'DESC' },
+    });
+  }
+
+  async findLatest(): Promise<AuditLog | null> {
+    return this.auditRepo.findOne({
+      where: {}, // We want any record
+      order: {
+        createdAt: 'DESC', // Sort by newest first
+      },
     });
   }
 }

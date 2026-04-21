@@ -6,10 +6,11 @@ import { NotificationsController } from './notifications.controller';
 import { NotificationsGateway } from './notifications.gateway';
 import { NotificationsListener } from './notifications.listener';
 import { NotificationOrchestrator } from './notifications.orchestrator'; // <--- 1. Import it
+import { BroadcastModule } from 'src/broadcast/broadcast.module';
 
 @Global()
 @Module({
-  imports: [TypeOrmModule.forFeature([Notification])],
+  imports: [TypeOrmModule.forFeature([Notification]), BroadcastModule],
   controllers: [NotificationsController],
   providers: [
     NotificationsService,

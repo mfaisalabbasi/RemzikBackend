@@ -726,4 +726,42 @@ export class AssetService {
         return 'Pending';
     }
   }
+
+  async findAllPending() {
+    return this.assetRepo.find({
+      where: {
+        // Using SUBMITTED because that is your default state in the entity
+        status: AssetStatus.SUBMITTED,
+      },
+      // Adding the partner relation might be useful for the Urgent Queue title
+      relations: ['partner'],
+    });
+  }
+
+  // src/asset/asset.service.ts
+
+  // src/asset/asset.service.ts
+
+  async getPipelineStats() {
+    const [dueDiligence, awaitingTokenization] = await Promise.all([
+      // 1. Assets submitted but not yet reviewed/approved
+      this.assetRepo.count({
+        where: { status: AssetStatus.SUBMITTED },
+      }),
+
+      // 2. Assets approved but NOT yet live or fully funded
+      // We filter by status APPROVED and ensure 'funded' is still 0 (or less than totalValue)
+      this.assetRepo.count({
+        where: {
+          status: AssetStatus.APPROVED,
+          funded: 0, // Only count assets where the tokenization/funding hasn't started
+        },
+      }),
+    ]);
+
+    return {
+      dueDiligence,
+      awaitingTokenization,
+    };
+  }
 }

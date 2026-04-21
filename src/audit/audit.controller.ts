@@ -12,6 +12,20 @@ import { UserRole } from '../user/enums/user-role.enum';
 export class AuditController {
   constructor(private readonly auditService: AuditService) {}
 
+  /**
+   * Specifically for the Dashboard activity feed
+   * GET /api/audit/recent
+   */
+  @Get('recent')
+  @Roles(UserRole.ADMIN)
+  async getRecentLogs() {
+    return this.auditService.findRecent();
+  }
+
+  /**
+   * Full history with optional filtering
+   * GET /api/audit
+   */
   @Get()
   @Roles(UserRole.ADMIN)
   async getLogs(@Query('action') action?: AdminAction) {

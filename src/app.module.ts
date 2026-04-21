@@ -26,6 +26,9 @@ import { PayoutModule } from './payout/payout.module';
 import { SecondaryMarketModule } from './secondary-market/secondary-market.module';
 import { DistributionModule } from './distribution/distribution.module';
 import { StorageModule } from './storage/storage.module';
+import { AnalyticsModule } from './analytics/analytics.module';
+import { AuditModule } from './audit/audit.module';
+import { BroadcastModule } from './broadcast/broadcast.module';
 
 @Module({
   imports: [
@@ -50,6 +53,7 @@ import { StorageModule } from './storage/storage.module';
 
     // ✅ All modules imported here, NOT inside TypeORM
     UserModule,
+    AnalyticsModule,
     AuthModule,
     PartnerModule,
     AssetModule,
@@ -66,6 +70,8 @@ import { StorageModule } from './storage/storage.module';
     DistributionModule,
     NotificationsModule,
     StorageModule,
+    AuditModule,
+    BroadcastModule,
     forwardRef(() => PayoutModule),
   ],
   controllers: [AppController],

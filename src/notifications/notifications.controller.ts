@@ -1,4 +1,12 @@
-import { Controller, Get, Param, Patch, UseGuards, Req } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Param,
+  Patch,
+  UseGuards,
+  Req,
+  Query,
+} from '@nestjs/common';
 import { NotificationsService } from './notifications.service';
 import { JwtAuthGuard } from 'src/auth/guards/jwt.gaurd';
 
@@ -8,9 +16,12 @@ export class NotificationsController {
   constructor(private readonly service: NotificationsService) {}
 
   @Get()
-  async getMyNotifications(@Req() req: any) {
-    // Reverted to use 'req.user.userId' which aligns with your JwtStrategy
-    return this.service.getByUser(req.user.userId);
+  async getMyNotifications(
+    @Req() req: any,
+    @Query('role') role?: string, // 👈 FIXED: Added Query parameter to capture the role
+  ) {
+    // Passes the role from the URL to the service
+    return this.service.getByUser(req.user.userId, role);
   }
 
   @Patch(':id/read')

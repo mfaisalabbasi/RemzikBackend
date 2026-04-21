@@ -6,6 +6,7 @@ import { OwnershipModule } from 'src/ownership/ownership.module';
 import { AnalyticsController } from './analytics.controller';
 import { AnalyticsService } from './analytics.service';
 import { PayoutModule } from 'src/payout/payout.module';
+import { PartnerModule } from 'src/partner/partner.module';
 
 @Module({
   imports: [
@@ -14,6 +15,7 @@ import { PayoutModule } from 'src/payout/payout.module';
     OwnershipModule,
     LedgerModule,
     PayoutModule,
+    PartnerModule,
   ],
   controllers: [AnalyticsController],
   providers: [AnalyticsService],

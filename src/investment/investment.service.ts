@@ -195,15 +195,34 @@ export class InvestmentService {
     return Number(result?.total) || 0;
   }
 
+  // src/investment/investment.service.ts
+
   async getTotalInvested(): Promise<number> {
     const result = await this.investmentRepo
       .createQueryBuilder('investment')
-      .select('SUM(investment.amount)', 'total')
+      // We use COALESCE to avoid nulls and cast to FLOAT for the return
+      .select('SUM(CAST(investment.amount AS FLOAT))', 'total')
       .where('investment.status = :status', {
         status: InvestmentStatus.CONFIRMED,
       })
       .getRawOne();
 
-    return Number(result?.total) || 0;
+    // Log this to your terminal so you can see the raw DB response
+    console.log('--- AUM DEBUG ---');
+    console.log('Raw Result from DB:', result);
+
+    const total = result?.total ? parseFloat(result.total) : 0;
+    return total;
+  }
+
+  async countUniqueInvestors(): Promise<number> {
+    const result = await this.investmentRepo
+      .createQueryBuilder('investment')
+      // We reference the 'investor' property from your Entity class
+      // TypeORM automatically handles the foreign key column mapping
+      .select('COUNT(DISTINCT(investment.investorId))', 'count')
+      .getRawOne();
+
+    return parseInt(result?.count || '0');
   }
 }

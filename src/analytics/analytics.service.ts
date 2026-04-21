@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { AssetService } from 'src/asset/asset.service';
 import { InvestmentService } from 'src/investment/investment.service';
+import { PartnerService } from 'src/partner/partner.service';
 import { PayoutService } from 'src/payout/payout.service';
 
 @Injectable()
@@ -9,6 +10,7 @@ export class AnalyticsService {
     private readonly investmentService: InvestmentService,
     private readonly payoutService: PayoutService,
     private readonly assetService: AssetService,
+    private readonly partnerService: PartnerService,
   ) {}
 
   // Get analytics for a user
@@ -47,9 +49,12 @@ export class AnalyticsService {
   // Admin-wide analytics
   async getAdminAnalytics() {
     return {
-      totalInvested: await this.investmentService.getTotalInvested(),
-      totalPayouts: await this.payoutService.getTotalPayouts(),
-      totalAssets: await this.assetService.countAssets(),
+      // AUM: Total amount invested across the entire system
+      totalAUM: await this.investmentService.getTotalInvested(),
+      // Counts from respective services
+      investorCount: await this.investmentService.countUniqueInvestors(),
+      partnerCount: await this.partnerService.countPartners(), // Ensure partnerService is injected
+      liveAssets: await this.assetService.countAssets(),
     };
   }
 }

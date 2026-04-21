@@ -29,7 +29,19 @@ export class Investment {
   /**
    * Amount invested
    */
-  @Column('decimal', { precision: 15, scale: 2 })
+  // src/investment/investment.entity.ts
+
+  @Column({
+    type: 'decimal',
+    precision: 15,
+    scale: 2,
+    transformer: {
+      // When saving to DB, keep it as is
+      to: (value: number) => value,
+      // When reading from DB, turn the string into a number
+      from: (value: string) => parseFloat(value),
+    },
+  })
   amount: number;
 
   /**

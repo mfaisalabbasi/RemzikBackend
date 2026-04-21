@@ -222,4 +222,17 @@ export class PartnerService {
       url: avatarUrl,
     };
   }
+
+  async countPartners(): Promise<number> {
+    return await this.partnerRepo.count();
+  }
+
+  async findAllPending() {
+    return this.partnerRepo.find({
+      where: {
+        // 2. Use the Enum reference
+        status: PartnerStatus.PENDING,
+      },
+    });
+  }
 }

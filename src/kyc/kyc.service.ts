@@ -119,4 +119,14 @@ export class KycService {
 
     await this.kycRepo.save(kyc);
   }
+
+  async findAllPending() {
+    return this.kycRepo.find({
+      where: {
+        // 2. Use the Enum reference instead of the "PENDING" string
+        status: KycStatus.PENDING,
+      }, // Or whatever your pending string/enum is
+      relations: ['user'], // Important for the "KYC Review: [Name]" logic
+    });
+  }
 }
