@@ -18,9 +18,20 @@ export class BroadcastGateway
 
   handleConnection(client: Socket) {
     const role = client.handshake.query.role as string;
+    const userId = client.handshake.query.userId as string;
 
+    // 1. JOIN PRIVATE USER ROOM (Crucial for sendTargeted)
+    if (userId && userId !== 'undefined') {
+      const privateRoom = `user-${userId}`;
+      client.join(privateRoom);
+      console.log(
+        `[Remzik] Client ${client.id} joined private room: ${privateRoom}`,
+      );
+    }
+
+    // 2. JOIN ROLE ROOM (Standard Broadcasts)
     if (role && role !== 'undefined') {
-      // Standardize: 'INVESTORS', 'investors', 'Investor' -> 'investor'
+      // Standardize: 'INVESTORS' -> 'investor'
       const room = role.toLowerCase().trim().replace(/s$/, '');
       client.join(room);
       console.log(
@@ -38,10 +49,10 @@ export class BroadcastGateway
   }
 
   emitNewBroadcast(payload: any) {
-    // FORCE every property the frontend list needs
+    // Force every property the frontend list needs
     const enhancedPayload = {
       ...payload,
-      id: payload.id, // Ensure the DB ID is passed
+      id: payload.id,
       isBroadcast: true,
       createdAt: new Date().toISOString(),
     };
@@ -50,7 +61,6 @@ export class BroadcastGateway
       this.server.emit('broadcast:general', enhancedPayload);
     } else {
       const room = payload.target.toLowerCase().trim().replace(/s$/, '');
-      // Use the enhancedPayload here
       this.server.to(room).emit('broadcast:targeted', enhancedPayload);
       console.log(`[Remzik] Targeted broadcast sent to room: ${room}`);
     }

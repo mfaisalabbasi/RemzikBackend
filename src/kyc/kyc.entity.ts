@@ -15,9 +15,18 @@ export class KycProfile {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  @OneToOne(() => User, { nullable: false })
+  /**
+   * Relation to the Main User
+   */
+  @OneToOne(() => User, { nullable: false, onDelete: 'CASCADE' })
   @JoinColumn({ name: 'userId' })
   user: User;
+
+  /**
+   * Explicit userId column for direct querying
+   */
+  @Column()
+  userId: string;
 
   @Column()
   fullName: string;
@@ -25,10 +34,14 @@ export class KycProfile {
   @Column()
   dob: string;
 
-  @Column()
+  /**
+   * nullable: true fixes the 'contains null values' sync error.
+   * This allows the database to update without crashing.
+   */
+  @Column({ type: 'text', nullable: true })
   idDocumentUrl: string;
 
-  @Column()
+  @Column({ type: 'text', nullable: true })
   addressProofUrl: string;
 
   @Column({
@@ -38,7 +51,7 @@ export class KycProfile {
   })
   status: KycStatus;
 
-  @Column({ nullable: true })
+  @Column({ nullable: true, type: 'text' })
   rejectionReason?: string;
 
   @CreateDateColumn()

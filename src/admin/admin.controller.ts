@@ -7,6 +7,7 @@ import {
   Get,
   Param,
   Patch,
+  Query,
 } from '@nestjs/common';
 import { AdminService } from './admin.service';
 import { AdminActionDto } from './dto/admin-action.dto';
@@ -27,6 +28,20 @@ export class AdminController {
     private readonly adminService: AdminService,
     private readonly broadcastService: BroadcastService,
   ) {}
+
+  /**
+   * USER NOTIFICATIONS ENDPOINT
+   * Now passing the 'role' to the service to prevent cross-role data leaks.
+   */
+  @Get('notifications')
+  @Roles(UserRole.INVESTOR, UserRole.PARTNER, UserRole.ADMIN)
+  async getUserNotifications(
+    @Query('userId') userId: string,
+    @Query('role') role: string,
+  ) {
+    // FIXED: Added 'role' as the third argument
+    return this.broadcastService.getRecent(20, userId, role);
+  }
 
   @Get('urgent-queue')
   @Roles(UserRole.ADMIN)
@@ -79,14 +94,12 @@ export class AdminController {
   @Post('broadcasts')
   @Roles(UserRole.ADMIN)
   async sendBroadcast(@Body() dto: CreateBroadcastDto, @Req() req) {
-    // Ensuring result returns the full object with ID for the admin dashboard list
     return await this.broadcastService.create(dto, req.user.userId);
   }
 
   @Get('investors')
   @Roles(UserRole.ADMIN)
   async getInvestors() {
-    // This calls the method we added to your AdminService
     return this.adminService.getInvestorsList();
   }
 
@@ -95,13 +108,30 @@ export class AdminController {
   async getInvestorDetail(@Param('id') id: string) {
     return this.adminService.getInvestorDetail(id);
   }
+
   @Patch('investors/:id/approve-kyc')
+  @Roles(UserRole.ADMIN)
   async approveKyc(@Param('id') id: string) {
     return this.adminService.approveKyc(id);
   }
 
   @Patch('investors/:id/toggle-freeze')
+  @Roles(UserRole.ADMIN)
   async toggleFreeze(@Param('id') id: string, @Body('reason') reason: string) {
     return this.adminService.toggleAccountFreeze(id, reason);
+  }
+
+  @Patch('investors/:userId/broadcast')
+  @Roles(UserRole.ADMIN)
+  async sendTargetedBroadcast(
+    @Param('userId') userId: string,
+    @Body() dto: { title: string; message: string; type: any },
+  ) {
+    return this.broadcastService.sendTargeted(
+      userId,
+      dto.title,
+      dto.message,
+      dto.type,
+    );
   }
 }

@@ -15,13 +15,20 @@ import { Investment } from 'src/investment/investment.entity';
 import { Trade } from 'src/secondary-market/trade/trade.entity';
 import { Wallet } from 'src/wallet/wallet.entity';
 import { LedgerModule } from 'src/ledger/ledger.module';
+import { KycProfile } from 'src/kyc/kyc.entity';
 
 @Module({
   controllers: [AdminController],
   providers: [AdminService],
   exports: [AdminService],
   imports: [
-    TypeOrmModule.forFeature([InvestorProfile, Investment, Trade, Wallet]),
+    TypeOrmModule.forFeature([
+      InvestorProfile,
+      Investment,
+      Trade,
+      Wallet,
+      KycProfile,
+    ]),
     PartnerModule,
     AssetModule,
     AuditModule,

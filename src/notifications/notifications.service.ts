@@ -19,35 +19,42 @@ export class NotificationsService {
     return await this.repo.save(notification);
   }
 
-  // src/notifications/notifications.service.ts
   async getByUser(userId: string, role?: string): Promise<any[]> {
-    // 1. Get private notifications
+    // 1. Get private automated notifications (Investment confirmed, etc.)
     const privates = await this.repo.find({
       where: { userId },
       order: { createdAt: 'DESC' },
     });
 
-    // 2. Get Broadcasts for this role (INVESTORS/PARTNERS/ALL)
+    // 2. Build Query for Broadcasts and Targeted Admin Messages
     const targetRole = role?.toUpperCase();
+    const broadcastConditions: any[] = [
+      { target: BroadcastTarget.ALL },
+      { target: BroadcastTarget.TARGETED, adminId: userId }, // Private admin-to-user messages
+    ];
+
+    if (targetRole?.includes('INVESTOR')) {
+      broadcastConditions.push({ target: BroadcastTarget.INVESTORS });
+    }
+    if (targetRole?.includes('PARTNER')) {
+      broadcastConditions.push({ target: BroadcastTarget.PARTNERS });
+    }
+
     const broadcasts = await this.broadcastRepo.find({
-      where: [
-        { target: BroadcastTarget.ALL },
-        ...(targetRole ? [{ target: targetRole as any }] : []),
-      ],
+      where: broadcastConditions,
       order: { createdAt: 'DESC' },
       take: 30,
     });
 
-    // 3. MAP BROADCASTS TO MATCH NOTIFICATION SHAPE
-    // This ensures the "id" is stable on refresh
+    // 3. Map Broadcasts to match frontend NotificationItem shape
     const mappedBroadcasts = broadcasts.map((b) => ({
       ...b,
-      id: `bcast-${b.id}`, // STABLE ID
+      id: `bcast-${b.id}`,
       isBroadcast: true,
-      read: false,
+      read: false, // UI handles this via LocalStorage
     }));
 
-    // 4. Merge and return
+    // 4. Merge both sources and sort by newest first
     return [...privates, ...mappedBroadcasts].sort(
       (a, b) =>
         new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
@@ -56,15 +63,12 @@ export class NotificationsService {
 
   async markAsRead(id: string, userId: string) {
     if (id.startsWith('bcast-')) {
-      // Broadcast read status is handled on frontend LocalStorage
       return { success: true };
     }
 
     const result = await this.repo.update({ id, userId }, { read: true });
     if (result.affected === 0)
-      throw new NotFoundException(
-        `Notification ${id} not found or access denied`,
-      );
+      throw new NotFoundException(`Notification ${id} not found`);
     return { success: true };
   }
 }
