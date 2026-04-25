@@ -3,22 +3,20 @@ import {
   PrimaryGeneratedColumn,
   Column,
   OneToOne,
+  OneToMany, // Added
   JoinColumn,
   CreateDateColumn,
   UpdateDateColumn,
 } from 'typeorm';
 import { User } from '../user/user.entity';
 import { PartnerStatus } from './enums/partner-status.enum';
+import { Asset } from '../asset/asset.entity'; // Import Asset
 
 @Entity('partner_profiles')
 export class PartnerProfile {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  /**
-   * One user can have only ONE partner profile
-   * This enforces clean business identity
-   */
   @OneToOne(() => User)
   @JoinColumn()
   user: User;
@@ -32,6 +30,25 @@ export class PartnerProfile {
     default: PartnerStatus.PENDING,
   })
   status: PartnerStatus;
+
+  @OneToMany(() => Asset, (asset) => asset.partner)
+  assets: Asset[];
+
+  // --- NEW KYC DOCUMENT COLUMNS (All Nullable) ---
+
+  @Column({ type: 'text', nullable: true })
+  articlesOfAssociation?: string;
+
+  @Column({ type: 'text', nullable: true })
+  commercialRegistration?: string;
+
+  @Column({ type: 'text', nullable: true })
+  signatoryId?: string;
+
+  @Column({ type: 'text', nullable: true })
+  amlPolicy?: string;
+
+  // --- END NEW COLUMNS ---
 
   @Column({ nullable: true })
   avatar?: string;

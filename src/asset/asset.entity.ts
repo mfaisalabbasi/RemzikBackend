@@ -18,8 +18,11 @@ export class Asset {
 
   /**
    * Partner who submitted the asset
+   * Merged: Added (partner) => partner.assets to enable TypeORM joins
    */
-  @ManyToOne(() => PartnerProfile, { nullable: false })
+  @ManyToOne(() => PartnerProfile, (partner) => partner.assets, {
+    nullable: false,
+  })
   partner!: PartnerProfile;
 
   /**
@@ -92,7 +95,7 @@ export class Asset {
   /**
    * Property location
    */
-  @Column({ type: 'text', nullable: true }) // You can also use 'varchar'
+  @Column({ type: 'text', nullable: true })
   location!: string | null;
 
   /**

@@ -134,4 +134,42 @@ export class AdminController {
       dto.type,
     );
   }
+  @Get('partners')
+  @Roles(UserRole.ADMIN)
+  async getPartners() {
+    return this.adminService.getPartnersList();
+  }
+
+  @Get('partners/:id')
+  @Roles(UserRole.ADMIN)
+  async getPartnerDetail(@Param('id') id: string) {
+    return this.adminService.getPartnerDetail(id);
+  }
+
+  @Post('partners/message')
+  async sendPartnerMessage(
+    @Body()
+    body: {
+      userId: string;
+      title: string;
+      message: string;
+      priority: string;
+    },
+  ) {
+    // This triggers the real-time socket emit you already have in BroadcastService
+    return await this.broadcastService.sendTargeted(
+      body.userId,
+      body.title,
+      body.message,
+      body.priority === 'HIGH' ? 'URGENT' : 'DIRECTIVE',
+    );
+  }
+
+  @Patch('partners/:id/status')
+  async updatePartnerStatus(
+    @Param('id') id: string,
+    @Body('status') status: string,
+  ) {
+    return await this.adminService.updatePartnerStatus(id, status);
+  }
 }

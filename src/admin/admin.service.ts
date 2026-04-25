@@ -1,4 +1,9 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  BadRequestException,
+  NotFoundException,
+  InternalServerErrorException,
+} from '@nestjs/common';
 import { PartnerService } from 'src/partner/partner.service';
 import { AssetService } from 'src/asset/asset.service';
 import { KycService } from 'src/kyc/kyc.service';
@@ -21,7 +26,8 @@ import { LedgerSource } from 'src/ledger/enums/ledger-source.enum';
 import { LedgerType } from 'src/ledger/enums/ledger-type.enum';
 import { KycProfile } from 'src/kyc/kyc.entity';
 import { KycStatus } from 'src/kyc/enums/kyc-status.enum';
-
+import { PartnerProfile } from 'src/partner/partner.entity';
+import { PartnerStatus } from 'src/partner/enums/partner-status.enum';
 @Injectable()
 export class AdminService {
   constructor(
@@ -41,6 +47,8 @@ export class AdminService {
     private readonly walletRepo: Repository<Wallet>,
     @InjectRepository(KycProfile)
     private readonly kycRepo: Repository<KycProfile>,
+    @InjectRepository(PartnerProfile)
+    private readonly partnerRepo: Repository<PartnerProfile>,
   ) {}
 
   async getUrgentQueue(): Promise<UrgentTask[]> {
@@ -245,6 +253,40 @@ export class AdminService {
     };
   }
 
+  // --- PARTNER MANAGEMENT METHODS ---
+
+  async getPartnersList(): Promise<PartnerProfile[]> {
+    return this.partnerRepo.find({
+      relations: ['user'],
+      order: { createdAt: 'DESC' },
+    });
+  }
+
+  async getPartnerDetail(id: string): Promise<any> {
+    const partner = await this.partnerRepo.findOne({
+      where: { id },
+      relations: ['user', 'assets'], // CRITICAL: Loads the linked User account
+    });
+
+    if (!partner) throw new NotFoundException('Partner not found');
+
+    // Calculate unique investors across all assets for this partner
+    const uniqueInvestors = await this.investmentRepo
+      .createQueryBuilder('inv')
+      .innerJoin('inv.asset', 'asset')
+      .where('asset.partnerId = :partnerId', { partnerId: id })
+      .andWhere('inv.status = :status', { status: InvestmentStatus.CONFIRMED })
+      .select('COUNT(DISTINCT inv.investorId)', 'count')
+      .getRawOne();
+
+    return {
+      ...partner,
+      investorCount: parseInt(uniqueInvestors?.count || '0', 10),
+    };
+  }
+
+  // --- HELPERS ---
+
   private mapSourceToMarketType(
     source: LedgerSource,
   ): 'PRIMARY' | 'SECONDARY' | 'CASH' {
@@ -298,5 +340,32 @@ export class AdminService {
       success: true,
       newStatus: profile.user.isActive ? 'Active' : 'Frozen',
     };
+  }
+
+  async updatePartnerStatus(id: string, status: string) {
+    const partner = await this.partnerRepo.findOne({ where: { id } });
+    if (!partner) throw new NotFoundException('Partner not found');
+
+    // Check what your enum actually contains
+    console.log('Available Enum Values:', Object.values(PartnerStatus));
+
+    // Force the status to match your enum's format
+    // If your enum is lowercase ('verified'), use .toLowerCase()
+    // If your enum is uppercase ('VERIFIED'), use .toUpperCase()
+    const formattedStatus = status.toUpperCase();
+
+    // Check if the formatted status exists in your Enum
+    const isValid = Object.values(PartnerStatus).includes(
+      formattedStatus as any,
+    );
+
+    if (!isValid) {
+      throw new BadRequestException(
+        `Invalid status: ${status}. Expected one of: ${Object.values(PartnerStatus).join(', ')}`,
+      );
+    }
+
+    partner.status = formattedStatus as any;
+    return await this.partnerRepo.save(partner);
   }
 }

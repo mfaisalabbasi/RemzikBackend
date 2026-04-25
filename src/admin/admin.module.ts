@@ -16,6 +16,7 @@ import { Trade } from 'src/secondary-market/trade/trade.entity';
 import { Wallet } from 'src/wallet/wallet.entity';
 import { LedgerModule } from 'src/ledger/ledger.module';
 import { KycProfile } from 'src/kyc/kyc.entity';
+import { PartnerProfile } from 'src/partner/partner.entity';
 
 @Module({
   controllers: [AdminController],
@@ -28,6 +29,7 @@ import { KycProfile } from 'src/kyc/kyc.entity';
       Trade,
       Wallet,
       KycProfile,
+      PartnerProfile,
     ]),
     PartnerModule,
     AssetModule,
