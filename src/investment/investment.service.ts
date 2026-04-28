@@ -49,6 +49,7 @@ export class InvestmentService {
         if (!investor)
           throw new BadRequestException('Investor profile not found');
 
+        // 1. Fetch token with a write lock to prevent race conditions during supply updates
         const token = await manager
           .getRepository(AssetToken)
           .createQueryBuilder('token')
@@ -64,23 +65,29 @@ export class InvestmentService {
         if (!asset) throw new BadRequestException('Asset not found');
 
         const sharesToBuy = dto.amount / Number(token.sharePrice);
-        if (sharesToBuy > token.availableShares) {
+
+        // Use Number() to ensure accurate comparison against decimal/numeric types
+        if (sharesToBuy > Number(token.availableShares)) {
           throw new BadRequestException(
             'Not enough shares available for this purchase',
           );
         }
 
-        await this.walletService.debitAvailable(userId, dto.amount);
+        // 2. Settlement using the transactional manager to ensure atomicity
+        await this.walletService.debitAvailable(userId, dto.amount, manager);
         await this.walletService.credit(
           userId,
           -dto.amount,
           LedgerSource.ASSET_INVESTMENT,
           `Investment in ${asset.title} (Primary Market)`,
+          manager,
         );
 
-        token.availableShares -= sharesToBuy;
+        // 3. Update Available Supply - THE FIX
+        token.availableShares = Number(token.availableShares) - sharesToBuy;
         await manager.save(token);
 
+        // 4. Update Asset Aggregates
         asset.funded = Number(asset.funded) + Number(dto.amount);
         asset.investors = (asset.investors || 0) + 1;
         await manager.save(asset);
@@ -93,13 +100,19 @@ export class InvestmentService {
         });
         const result = await manager.save(investment);
 
-        await this.ownershipService.addShares(investor, asset, sharesToBuy);
+        // 5. Record Ownership within the same transaction
+        await this.ownershipService.addShares(
+          investor,
+          asset,
+          sharesToBuy,
+          manager,
+        );
 
         return result;
       },
     );
 
-    // Trigger Notification
+    // Trigger Notification (Post-transaction)
     await this.notificationOrchestrator.buildAndSave(
       userId,
       'investment.created',
@@ -134,6 +147,10 @@ export class InvestmentService {
 
         const shares = investment.amount / Number(token.sharePrice);
 
+        // Update Supply on confirmation to maintain consistency
+        token.availableShares = Number(token.availableShares) - shares;
+        await manager.save(token);
+
         const asset = investment.asset;
         asset.funded = Number(asset.funded) + Number(investment.amount);
         asset.investors = (asset.investors || 0) + 1;
@@ -145,6 +162,7 @@ export class InvestmentService {
           investment.investor,
           investment.asset,
           shares,
+          manager,
         );
 
         return result;
@@ -153,7 +171,6 @@ export class InvestmentService {
 
     const userId = confirmedInvestment.investor?.user?.id;
     if (userId) {
-      // Trigger Notification
       await this.notificationOrchestrator.buildAndSave(
         userId,
         'investment.created',
@@ -195,21 +212,14 @@ export class InvestmentService {
     return Number(result?.total) || 0;
   }
 
-  // src/investment/investment.service.ts
-
   async getTotalInvested(): Promise<number> {
     const result = await this.investmentRepo
       .createQueryBuilder('investment')
-      // We use COALESCE to avoid nulls and cast to FLOAT for the return
       .select('SUM(CAST(investment.amount AS FLOAT))', 'total')
       .where('investment.status = :status', {
         status: InvestmentStatus.CONFIRMED,
       })
       .getRawOne();
-
-    // Log this to your terminal so you can see the raw DB response
-    console.log('--- AUM DEBUG ---');
-    console.log('Raw Result from DB:', result);
 
     const total = result?.total ? parseFloat(result.total) : 0;
     return total;
@@ -218,8 +228,6 @@ export class InvestmentService {
   async countUniqueInvestors(): Promise<number> {
     const result = await this.investmentRepo
       .createQueryBuilder('investment')
-      // We reference the 'investor' property from your Entity class
-      // TypeORM automatically handles the foreign key column mapping
       .select('COUNT(DISTINCT(investment.investorId))', 'count')
       .getRawOne();
 

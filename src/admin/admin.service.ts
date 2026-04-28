@@ -28,6 +28,8 @@ import { KycProfile } from 'src/kyc/kyc.entity';
 import { KycStatus } from 'src/kyc/enums/kyc-status.enum';
 import { PartnerProfile } from 'src/partner/partner.entity';
 import { PartnerStatus } from 'src/partner/enums/partner-status.enum';
+import { Asset } from 'src/asset/asset.entity';
+import { AssetStatus } from 'src/asset/enums/asset-status.enum';
 @Injectable()
 export class AdminService {
   constructor(
@@ -49,6 +51,8 @@ export class AdminService {
     private readonly kycRepo: Repository<KycProfile>,
     @InjectRepository(PartnerProfile)
     private readonly partnerRepo: Repository<PartnerProfile>,
+    @InjectRepository(Asset)
+    private readonly assetRepo: Repository<Asset>,
   ) {}
 
   async getUrgentQueue(): Promise<UrgentTask[]> {
@@ -367,5 +371,99 @@ export class AdminService {
 
     partner.status = formattedStatus as any;
     return await this.partnerRepo.save(partner);
+  }
+
+  async findAllAssets(): Promise<Asset[]> {
+    try {
+      return await this.assetRepo.find({
+        relations: ['partner'], // Joins partner info to show in the grid
+        order: {
+          createdAt: 'DESC',
+        },
+      });
+    } catch (error) {
+      console.error('Error fetching assets for directory:', error);
+      throw new Error('Could not retrieve asset directory.');
+    }
+  }
+
+  async findAssetDetail(id: string) {
+    return await this.assetRepo.findOne({
+      where: { id },
+
+      relations: ['partner', 'token'], // CRITICAL: This must be here
+    });
+  }
+
+  async updateAssetStatus(
+    id: string,
+    status: string,
+    rejectionReason?: string,
+  ): Promise<Asset> {
+    const asset = await this.assetRepo.findOne({
+      where: { id },
+      relations: ['partner'],
+    });
+
+    if (!asset) {
+      throw new NotFoundException(
+        `Asset record ${id} not found in secure ledger.`,
+      );
+    }
+
+    // 1. Business Logic Guardrails
+    if (status === AssetStatus.PAID && asset.status !== AssetStatus.APPROVED) {
+      throw new BadRequestException(
+        'Asset must be APPROVED before it can be marked as PAID.',
+      );
+    }
+
+    // 2. Handle Rejection State
+    if (status === AssetStatus.REJECTED) {
+      if (!rejectionReason) {
+        throw new BadRequestException(
+          'A rejection reason is mandatory for auditing purposes.',
+        );
+      }
+      asset.rejectionReason = rejectionReason;
+    } else {
+      // Clear rejection reason if moving to any other state
+      asset.rejectionReason = undefined;
+    }
+
+    // 3. Handle Freeze Logic (Optional: Add a timestamp for when it was frozen)
+    if (status === AssetStatus.FREEZ) {
+      // You could trigger a notification to the partner here
+      console.log(`Asset ${id} has been frozen by Admin.`);
+    }
+
+    // Apply the new status
+    asset.status = status as AssetStatus;
+
+    const updatedAsset = await this.assetRepo.save(asset);
+
+    // 4. Audit Log Integration (Optional)
+    // You could call an AuditService here to log: "Admin [User] changed Asset [ID] to [Status]"
+
+    return updatedAsset;
+  }
+
+  async getAssetActivity(assetId: string) {
+    // 1. Fetch confirmed investments
+    const investments = await this.investmentRepo.find({
+      where: { asset: { id: assetId }, status: InvestmentStatus.CONFIRMED },
+      relations: ['investor', 'investor.user'],
+      order: { createdAt: 'DESC' },
+      take: 10,
+    });
+
+    // 2. Map them to a unified activity format
+    return investments.map((inv) => ({
+      type: 'BUY',
+      participantId: inv.investor.id,
+      participantName: inv.investor.user?.name,
+      amount: inv.amount,
+      timestamp: inv.createdAt,
+    }));
   }
 }

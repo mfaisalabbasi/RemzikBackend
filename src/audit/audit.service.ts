@@ -56,4 +56,11 @@ export class AuditService {
       },
     });
   }
+
+  async findByTarget(targetId: string) {
+    return this.auditRepo.find({
+      where: { targetId },
+      order: { createdAt: 'DESC' },
+    });
+  }
 }

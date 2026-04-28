@@ -24,7 +24,7 @@ export class AssetToken {
   /**
    * Total number of shares
    */
-  @Column()
+  @Column({ type: 'decimal', precision: 18, scale: 6, default: 0 })
   totalShares: number;
 
   /**
@@ -36,7 +36,7 @@ export class AssetToken {
   /**
    * Shares still available
    */
-  @Column()
+  @Column({ type: 'decimal', precision: 18, scale: 6, default: 0 })
   availableShares: number;
 
   @CreateDateColumn()

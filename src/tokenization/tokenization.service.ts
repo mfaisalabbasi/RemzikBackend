@@ -11,36 +11,40 @@ export class TokenizationService {
   constructor(
     @InjectRepository(AssetToken)
     private readonly tokenRepo: Repository<AssetToken>,
-
     @InjectRepository(Asset)
     private readonly assetRepo: Repository<Asset>,
   ) {}
 
-  /**
-   * ADMIN tokenizes an asset
-   */
   async tokenizeAsset(assetId: string, dto: CreateTokenizationDto) {
-    const asset = await this.assetRepo.findOne({ where: { id: assetId } });
+    return await this.assetRepo.manager.transaction(async (manager) => {
+      // 1. Find Asset
+      const asset = await manager.findOne(Asset, { where: { id: assetId } });
+      if (!asset) throw new BadRequestException('Asset not found');
 
-    if (!asset || asset.status !== AssetStatus.APPROVED) {
-      throw new BadRequestException('Asset not approved');
-    }
+      // 2. Strict Check for existing Token (The 'Already Initialized' Guard)
+      const existing = await manager.findOne(AssetToken, {
+        where: { asset: { id: assetId } },
+      });
 
-    const existing = await this.tokenRepo.findOne({
-      where: { asset: { id: assetId } },
+      if (existing) {
+        throw new BadRequestException('Asset ledger is already initialized.');
+      }
+
+      // 3. Create the Token record (This makes it show up in Investing List)
+      const token = manager.create(AssetToken, {
+        asset,
+        totalShares: dto.totalShares,
+        sharePrice: dto.sharePrice,
+        availableShares: dto.totalShares,
+      });
+
+      const savedToken = await manager.save(token);
+
+      // 4. Update Asset Status (Keeping it APPROVED as you requested)
+      asset.status = AssetStatus.APPROVED;
+      await manager.save(asset);
+
+      return savedToken;
     });
-
-    if (existing) {
-      throw new BadRequestException('Asset already tokenized');
-    }
-
-    const token = this.tokenRepo.create({
-      asset,
-      totalShares: dto.totalShares,
-      sharePrice: dto.sharePrice,
-      availableShares: dto.totalShares,
-    });
-
-    return this.tokenRepo.save(token);
   }
 }

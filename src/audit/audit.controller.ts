@@ -1,5 +1,5 @@
 // audit.controller.ts
-import { Controller, Get, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, Param, Query, UseGuards } from '@nestjs/common';
 import { AuditService } from './audit.service';
 import { AdminAction } from './enums/audit-action.enum';
 import { JwtAuthGuard } from 'src/auth/guards/jwt.gaurd';
@@ -30,5 +30,11 @@ export class AuditController {
   @Roles(UserRole.ADMIN)
   async getLogs(@Query('action') action?: AdminAction) {
     return this.auditService.findAll(action);
+  }
+
+  @Get('target/:id') // New route: GET /api/audit/target/098118...
+  @Roles(UserRole.ADMIN)
+  async getLogsByTarget(@Param('id') targetId: string) {
+    return this.auditService.findByTarget(targetId);
   }
 }

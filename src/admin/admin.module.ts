@@ -17,6 +17,7 @@ import { Wallet } from 'src/wallet/wallet.entity';
 import { LedgerModule } from 'src/ledger/ledger.module';
 import { KycProfile } from 'src/kyc/kyc.entity';
 import { PartnerProfile } from 'src/partner/partner.entity';
+import { Asset } from 'src/asset/asset.entity';
 
 @Module({
   controllers: [AdminController],
@@ -30,6 +31,7 @@ import { PartnerProfile } from 'src/partner/partner.entity';
       Wallet,
       KycProfile,
       PartnerProfile,
+      Asset,
     ]),
     PartnerModule,
     AssetModule,

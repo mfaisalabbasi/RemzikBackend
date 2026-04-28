@@ -8,6 +8,7 @@ import {
   Param,
   Patch,
   Query,
+  NotFoundException,
 } from '@nestjs/common';
 import { AdminService } from './admin.service';
 import { AdminActionDto } from './dto/admin-action.dto';
@@ -171,5 +172,37 @@ export class AdminController {
     @Body('status') status: string,
   ) {
     return await this.adminService.updatePartnerStatus(id, status);
+  }
+  @Get('assets')
+  async getAllAssets() {
+    // This should return relations like ['partner'] to show who originated the asset
+    return await this.adminService.findAllAssets();
+  }
+  @Get('assets/:id') // Make sure this ':id' exists
+  async getAssetById(@Param('id') id: string) {
+    const asset = await this.adminService.findAssetDetail(id);
+    if (!asset) {
+      throw new NotFoundException(`Asset with ID ${id} not found`);
+    }
+    return asset;
+  }
+
+  @Patch('assets/:id/status')
+  async updateAssetStatus(
+    @Param('id') id: string,
+    @Body() body: { status: string; rejectionReason?: string },
+  ) {
+    return await this.adminService.updateAssetStatus(
+      id,
+      body.status,
+      body.rejectionReason,
+    );
+  }
+
+  @Get('assets/:id/activity') // This matches the URL we used in the Frontend
+  @Roles(UserRole.ADMIN)
+  async getAssetActivity(@Param('id') assetId: string) {
+    // Call the new service method you just created
+    return this.adminService.getAssetActivity(assetId);
   }
 }
