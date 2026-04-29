@@ -31,17 +31,12 @@ export class AdminController {
     private readonly broadcastService: BroadcastService,
   ) {}
 
-  /**
-   * USER NOTIFICATIONS ENDPOINT
-   * Now passing the 'role' to the service to prevent cross-role data leaks.
-   */
   @Get('notifications')
   @Roles(UserRole.INVESTOR, UserRole.PARTNER, UserRole.ADMIN)
   async getUserNotifications(
     @Query('userId') userId: string,
     @Query('role') role: string,
   ) {
-    // FIXED: Added 'role' as the third argument
     return this.broadcastService.getRecent(20, userId, role);
   }
 
@@ -113,14 +108,20 @@ export class AdminController {
 
   @Patch('investors/:id/approve-kyc')
   @Roles(UserRole.ADMIN)
-  async approveKyc(@Param('id') id: string) {
-    return this.adminService.approveKyc(id);
+  async approveKyc(@Param('id') id: string, @Req() req) {
+    // FIXED: Passing req.user.userId
+    return this.adminService.approveKyc(id, req.user.userId);
   }
 
   @Patch('investors/:id/toggle-freeze')
   @Roles(UserRole.ADMIN)
-  async toggleFreeze(@Param('id') id: string, @Body('reason') reason: string) {
-    return this.adminService.toggleAccountFreeze(id, reason);
+  async toggleFreeze(
+    @Param('id') id: string,
+    @Body('reason') reason: string,
+    @Req() req,
+  ) {
+    // FIXED: Passing req.user.userId
+    return this.adminService.toggleAccountFreeze(id, reason, req.user.userId);
   }
 
   @Patch('investors/:userId/broadcast')
@@ -136,6 +137,7 @@ export class AdminController {
       dto.type,
     );
   }
+
   @Get('partners')
   @Roles(UserRole.ADMIN)
   async getPartners() {
@@ -158,7 +160,6 @@ export class AdminController {
       priority: string;
     },
   ) {
-    // This triggers the real-time socket emit you already have in BroadcastService
     return await this.broadcastService.sendTargeted(
       body.userId,
       body.title,
@@ -168,18 +169,26 @@ export class AdminController {
   }
 
   @Patch('partners/:id/status')
+  @Roles(UserRole.ADMIN)
   async updatePartnerStatus(
     @Param('id') id: string,
     @Body('status') status: string,
+    @Req() req,
   ) {
-    return await this.adminService.updatePartnerStatus(id, status);
+    // FIXED: Passing req.user.userId
+    return await this.adminService.updatePartnerStatus(
+      id,
+      status,
+      req.user.userId,
+    );
   }
+
   @Get('assets')
   async getAllAssets() {
-    // This should return relations like ['partner'] to show who originated the asset
     return await this.adminService.findAllAssets();
   }
-  @Get('assets/:id') // Make sure this ':id' exists
+
+  @Get('assets/:id')
   async getAssetById(@Param('id') id: string) {
     const asset = await this.adminService.findAssetDetail(id);
     if (!asset) {
@@ -189,35 +198,36 @@ export class AdminController {
   }
 
   @Patch('assets/:id/status')
+  @Roles(UserRole.ADMIN)
   async updateAssetStatus(
     @Param('id') id: string,
     @Body() body: { status: string; rejectionReason?: string },
+    @Req() req,
   ) {
+    // FIXED: Passing req.user.userId and fallback for reason
     return await this.adminService.updateAssetStatus(
       id,
       body.status,
-      body.rejectionReason,
+      req.user.userId,
+      body.rejectionReason || '',
     );
   }
 
-  @Get('assets/:id/activity') // This matches the URL we used in the Frontend
+  @Get('assets/:id/activity')
   @Roles(UserRole.ADMIN)
   async getAssetActivity(@Param('id') assetId: string) {
-    // Call the new service method you just created
     return this.adminService.getAssetActivity(assetId);
   }
 
   @Get('me')
   @Roles(UserRole.ADMIN)
   async getMe(@Req() req) {
-    // We extract userId because that's what your AuthService puts in the token
     return this.adminService.getAdminIdentity(req.user.userId);
   }
 
   @Get('my-activity')
   @Roles(UserRole.ADMIN)
   async getMyActivity(@Req() req) {
-    // req.user.userId comes from your JWT/Auth guard
     return this.adminService.getMyAdminActivity(req.user.userId);
   }
 }

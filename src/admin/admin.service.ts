@@ -32,6 +32,7 @@ import { Asset } from 'src/asset/asset.entity';
 import { AssetStatus } from 'src/asset/enums/asset-status.enum';
 import { AuditLog } from 'src/audit/audit.entity';
 import { User } from 'src/user/user.entity';
+
 @Injectable()
 export class AdminService {
   constructor(
@@ -236,7 +237,7 @@ export class AdminService {
 
     return {
       id: investorProfile.id,
-      userId: mainUserId, // Crucial for Direct Messaging
+      userId: mainUserId,
       name: investorProfile.user.name,
       email: investorProfile.user.email,
       isActive: investorProfile.user.isActive,
@@ -261,8 +262,6 @@ export class AdminService {
     };
   }
 
-  // --- PARTNER MANAGEMENT METHODS ---
-
   async getPartnersList(): Promise<PartnerProfile[]> {
     return this.partnerRepo.find({
       relations: ['user'],
@@ -273,12 +272,11 @@ export class AdminService {
   async getPartnerDetail(id: string): Promise<any> {
     const partner = await this.partnerRepo.findOne({
       where: { id },
-      relations: ['user', 'assets'], // CRITICAL: Loads the linked User account
+      relations: ['user', 'assets'],
     });
 
     if (!partner) throw new NotFoundException('Partner not found');
 
-    // Calculate unique investors across all assets for this partner
     const uniqueInvestors = await this.investmentRepo
       .createQueryBuilder('inv')
       .innerJoin('inv.asset', 'asset')
@@ -293,8 +291,6 @@ export class AdminService {
     };
   }
 
-  // --- HELPERS ---
-
   private mapSourceToMarketType(
     source: LedgerSource,
   ): 'PRIMARY' | 'SECONDARY' | 'CASH' {
@@ -304,7 +300,7 @@ export class AdminService {
     return 'CASH';
   }
 
-  async approveKyc(investorProfileId: string) {
+  async approveKyc(investorProfileId: string, adminId: string) {
     const profile = await this.investorRepo.findOne({
       where: { id: investorProfileId },
       relations: ['user'],
@@ -323,10 +319,19 @@ export class AdminService {
       source: LedgerSource.ADMIN_ADJUSTMENT,
       description: 'KYC Approved by Admin',
     });
+
+    // ✅ Audit Logging Integrated
+    await this.auditService.log({
+      adminId,
+      action: AdminAction.KYC_APPROVED,
+      targetId: investorProfileId,
+      reason: 'Manual KYC Approval via Admin Panel',
+    });
+
     return { success: true };
   }
 
-  async toggleAccountFreeze(id: string, reason: string) {
+  async toggleAccountFreeze(id: string, reason: string, adminId: string) {
     const profile = await this.investorRepo.findOne({
       where: { id },
       relations: ['user'],
@@ -344,25 +349,30 @@ export class AdminService {
         ? `ACCOUNT FROZEN: ${reason}`
         : 'ACCOUNT UNFROZEN',
     });
+
+    // ✅ Audit Logging Integrated
+    await this.auditService.log({
+      adminId,
+      action: currentlyActive
+        ? AdminAction.USER_SUSPENDED
+        : AdminAction.APPROVE,
+      targetId: id,
+      reason:
+        reason ||
+        (currentlyActive ? 'Manual Suspension' : 'Manual Reactivation'),
+    });
+
     return {
       success: true,
       newStatus: profile.user.isActive ? 'Active' : 'Frozen',
     };
   }
 
-  async updatePartnerStatus(id: string, status: string) {
+  async updatePartnerStatus(id: string, status: string, adminId: string) {
     const partner = await this.partnerRepo.findOne({ where: { id } });
     if (!partner) throw new NotFoundException('Partner not found');
 
-    // Check what your enum actually contains
-    console.log('Available Enum Values:', Object.values(PartnerStatus));
-
-    // Force the status to match your enum's format
-    // If your enum is lowercase ('verified'), use .toLowerCase()
-    // If your enum is uppercase ('VERIFIED'), use .toUpperCase()
     const formattedStatus = status.toUpperCase();
-
-    // Check if the formatted status exists in your Enum
     const isValid = Object.values(PartnerStatus).includes(
       formattedStatus as any,
     );
@@ -374,16 +384,27 @@ export class AdminService {
     }
 
     partner.status = formattedStatus as any;
-    return await this.partnerRepo.save(partner);
+    const updatedPartner = await this.partnerRepo.save(partner);
+
+    // ✅ Audit Logging Integrated
+    await this.auditService.log({
+      adminId,
+      action:
+        formattedStatus === PartnerStatus.APPROVED
+          ? AdminAction.APPROVE
+          : AdminAction.REJECT,
+      targetId: id,
+      reason: `Partner status manually updated to ${formattedStatus}`,
+    });
+
+    return updatedPartner;
   }
 
   async findAllAssets(): Promise<Asset[]> {
     try {
       return await this.assetRepo.find({
-        relations: ['partner'], // Joins partner info to show in the grid
-        order: {
-          createdAt: 'DESC',
-        },
+        relations: ['partner'],
+        order: { createdAt: 'DESC' },
       });
     } catch (error) {
       console.error('Error fetching assets for directory:', error);
@@ -394,14 +415,14 @@ export class AdminService {
   async findAssetDetail(id: string) {
     return await this.assetRepo.findOne({
       where: { id },
-
-      relations: ['partner', 'token'], // CRITICAL: This must be here
+      relations: ['partner', 'token'],
     });
   }
 
   async updateAssetStatus(
     id: string,
     status: string,
+    adminId: string,
     rejectionReason?: string,
   ): Promise<Asset> {
     const asset = await this.assetRepo.findOne({
@@ -415,14 +436,12 @@ export class AdminService {
       );
     }
 
-    // 1. Business Logic Guardrails
     if (status === AssetStatus.PAID && asset.status !== AssetStatus.APPROVED) {
       throw new BadRequestException(
         'Asset must be APPROVED before it can be marked as PAID.',
       );
     }
 
-    // 2. Handle Rejection State
     if (status === AssetStatus.REJECTED) {
       if (!rejectionReason) {
         throw new BadRequestException(
@@ -431,29 +450,32 @@ export class AdminService {
       }
       asset.rejectionReason = rejectionReason;
     } else {
-      // Clear rejection reason if moving to any other state
       asset.rejectionReason = undefined;
     }
 
-    // 3. Handle Freeze Logic (Optional: Add a timestamp for when it was frozen)
     if (status === AssetStatus.FREEZ) {
-      // You could trigger a notification to the partner here
       console.log(`Asset ${id} has been frozen by Admin.`);
     }
 
-    // Apply the new status
     asset.status = status as AssetStatus;
-
     const updatedAsset = await this.assetRepo.save(asset);
 
-    // 4. Audit Log Integration (Optional)
-    // You could call an AuditService here to log: "Admin [User] changed Asset [ID] to [Status]"
+    // ✅ Audit Logging Integrated
+    let auditAction: AdminAction = AdminAction.APPROVE;
+    if (status === AssetStatus.REJECTED) auditAction = AdminAction.REJECT;
+    if (status === AssetStatus.FREEZ) auditAction = AdminAction.FREEZE;
+
+    await this.auditService.log({
+      adminId,
+      targetId: id,
+      action: auditAction,
+      reason: rejectionReason || `Asset status changed to ${status}`,
+    });
 
     return updatedAsset;
   }
 
   async getAssetActivity(assetId: string) {
-    // 1. Fetch confirmed investments
     const investments = await this.investmentRepo.find({
       where: { asset: { id: assetId }, status: InvestmentStatus.CONFIRMED },
       relations: ['investor', 'investor.user'],
@@ -461,7 +483,6 @@ export class AdminService {
       take: 10,
     });
 
-    // 2. Map them to a unified activity format
     return investments.map((inv) => ({
       type: 'BUY',
       participantId: inv.investor.id,
@@ -472,11 +493,9 @@ export class AdminService {
   }
 
   async getAdminIdentity(userId: string) {
-    // 1. Log the ID to your terminal to verify it's a real ID
     console.log('--- ADMIN IDENTITY SYNC ---');
     console.log('Target User ID from Token:', userId);
 
-    // 2. Fetch directly from the User table
     const user = await this.auditLogRepo.manager.findOne(User, {
       where: { id: userId },
     });
@@ -488,10 +507,9 @@ export class AdminService {
 
     console.log('Found User in DB:', user.name, '| Role:', user.role);
 
-    // 3. Return the exact data from the DB
     return {
       id: user.id,
-      name: user.name, // This will pull exactly what's in the DB
+      name: user.name,
       email: user.email,
       role: user.role,
       twoFactorEnabled: false,
@@ -499,11 +517,10 @@ export class AdminService {
   }
 
   async getMyAdminActivity(adminId: string): Promise<AuditLog[]> {
-    // Direct fetch from the audit_logs table
     return await this.auditLogRepo.find({
       where: { adminId },
       order: { createdAt: 'DESC' },
-      take: 10, // Show the last 10 actions
+      take: 10,
     });
   }
 }
