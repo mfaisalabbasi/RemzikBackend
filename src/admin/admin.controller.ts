@@ -9,6 +9,7 @@ import {
   Patch,
   Query,
   NotFoundException,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { AdminService } from './admin.service';
 import { AdminActionDto } from './dto/admin-action.dto';
@@ -204,5 +205,19 @@ export class AdminController {
   async getAssetActivity(@Param('id') assetId: string) {
     // Call the new service method you just created
     return this.adminService.getAssetActivity(assetId);
+  }
+
+  @Get('me')
+  @Roles(UserRole.ADMIN)
+  async getMe(@Req() req) {
+    // We extract userId because that's what your AuthService puts in the token
+    return this.adminService.getAdminIdentity(req.user.userId);
+  }
+
+  @Get('my-activity')
+  @Roles(UserRole.ADMIN)
+  async getMyActivity(@Req() req) {
+    // req.user.userId comes from your JWT/Auth guard
+    return this.adminService.getMyAdminActivity(req.user.userId);
   }
 }

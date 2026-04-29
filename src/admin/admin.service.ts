@@ -30,6 +30,8 @@ import { PartnerProfile } from 'src/partner/partner.entity';
 import { PartnerStatus } from 'src/partner/enums/partner-status.enum';
 import { Asset } from 'src/asset/asset.entity';
 import { AssetStatus } from 'src/asset/enums/asset-status.enum';
+import { AuditLog } from 'src/audit/audit.entity';
+import { User } from 'src/user/user.entity';
 @Injectable()
 export class AdminService {
   constructor(
@@ -53,6 +55,8 @@ export class AdminService {
     private readonly partnerRepo: Repository<PartnerProfile>,
     @InjectRepository(Asset)
     private readonly assetRepo: Repository<Asset>,
+    @InjectRepository(AuditLog)
+    private readonly auditLogRepo: Repository<AuditLog>,
   ) {}
 
   async getUrgentQueue(): Promise<UrgentTask[]> {
@@ -465,5 +469,41 @@ export class AdminService {
       amount: inv.amount,
       timestamp: inv.createdAt,
     }));
+  }
+
+  async getAdminIdentity(userId: string) {
+    // 1. Log the ID to your terminal to verify it's a real ID
+    console.log('--- ADMIN IDENTITY SYNC ---');
+    console.log('Target User ID from Token:', userId);
+
+    // 2. Fetch directly from the User table
+    const user = await this.auditLogRepo.manager.findOne(User, {
+      where: { id: userId },
+    });
+
+    if (!user) {
+      console.error(`CRITICAL: No user found for ID ${userId}`);
+      throw new NotFoundException('Admin record not found');
+    }
+
+    console.log('Found User in DB:', user.name, '| Role:', user.role);
+
+    // 3. Return the exact data from the DB
+    return {
+      id: user.id,
+      name: user.name, // This will pull exactly what's in the DB
+      email: user.email,
+      role: user.role,
+      twoFactorEnabled: false,
+    };
+  }
+
+  async getMyAdminActivity(adminId: string): Promise<AuditLog[]> {
+    // Direct fetch from the audit_logs table
+    return await this.auditLogRepo.find({
+      where: { adminId },
+      order: { createdAt: 'DESC' },
+      take: 10, // Show the last 10 actions
+    });
   }
 }

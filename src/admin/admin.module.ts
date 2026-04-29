@@ -18,6 +18,7 @@ import { LedgerModule } from 'src/ledger/ledger.module';
 import { KycProfile } from 'src/kyc/kyc.entity';
 import { PartnerProfile } from 'src/partner/partner.entity';
 import { Asset } from 'src/asset/asset.entity';
+import { AuditLog } from 'src/audit/audit.entity';
 
 @Module({
   controllers: [AdminController],
@@ -32,6 +33,7 @@ import { Asset } from 'src/asset/asset.entity';
       KycProfile,
       PartnerProfile,
       Asset,
+      AuditLog,
     ]),
     PartnerModule,
     AssetModule,
