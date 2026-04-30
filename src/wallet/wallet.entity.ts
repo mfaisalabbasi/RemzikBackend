@@ -20,7 +20,10 @@ export class Wallet {
   lockedBalance: number;
 
   @Column('decimal', { precision: 15, scale: 2, default: 0 })
-  totalEarned: number; // For tracking total profit distributions
+  pendingBalance: number; // ✅ Added to track payouts securely
+
+  @Column('decimal', { precision: 15, scale: 2, default: 0 })
+  totalEarned: number;
 
   @UpdateDateColumn()
   updatedAt: Date;

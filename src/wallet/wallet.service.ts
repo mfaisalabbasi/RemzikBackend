@@ -19,75 +19,46 @@ export class WalletService {
     return manager ? manager.getRepository(Wallet) : this.walletRepo;
   }
 
+  /**
+   * ✅ SOURCE OF TRUTH: Direct DB Read
+   * Fast, accurate, and avoids floating point errors from ledger loops.
+   */
   async getWallet(userId: string): Promise<WalletResponseDto> {
-    const entries = await this.ledgerService.findByUser(userId);
-    let available = 0,
-      pending = 0,
-      locked = 0,
-      earned = 0;
+    const wallet = await this.getOrCreateWallet(userId);
 
-    for (const entry of entries) {
-      const amount = Number(entry.amount);
-      switch (entry.source) {
-        case LedgerSource.DISTRIBUTION_ENGINE:
-          available += amount;
-          earned += amount;
-          break;
-        case LedgerSource.PAYOUT_REQUEST:
-          available -= amount;
-          pending += amount;
-          break;
-        case LedgerSource.PAYOUT_COMPLETED:
-          pending -= amount;
-          break;
-        case LedgerSource.PAYOUT_FAILED:
-          available += amount;
-          pending -= amount;
-          break;
-        case LedgerSource.INVESTMENT_CONFIRMATION:
-        case LedgerSource.ADMIN_ADJUSTMENT:
-        case LedgerSource.WALLET_DEPOSIT:
-        case LedgerSource.SECONDARY_MARKET_SELL:
-          available += amount;
-          break;
-        case LedgerSource.ESCROW_LOCK:
-          locked += amount;
-          available -= amount;
-          break;
-        case LedgerSource.ESCROW_RELEASE:
-          locked -= amount;
-          available += amount;
-          break;
-        case LedgerSource.ASSET_INVESTMENT:
-        case LedgerSource.SECONDARY_MARKET_BUY:
-          available -= Math.abs(amount);
-          break;
-      }
-    }
     return {
-      availableBalance: available,
-      lockedBalance: locked,
-      pendingPayout: pending,
-      totalEarned: earned,
-      balance: available + locked,
+      availableBalance: Number(wallet.availableBalance),
+      lockedBalance: Number(wallet.lockedBalance),
+      pendingPayout: Number(wallet.pendingBalance || 0),
+      totalEarned: Number(wallet.totalEarned),
+      balance: Number(wallet.availableBalance) + Number(wallet.lockedBalance),
     };
   }
 
   async getBalance(userId: string): Promise<number> {
-    const wallet = await this.getWallet(userId);
-    return wallet.availableBalance;
+    const wallet = await this.getOrCreateWallet(userId);
+    return Number(wallet.availableBalance);
   }
 
+  /**
+   * ATOMIC TOP-UP: Synchronizes Balance and Ledger
+   */
   async topUpDummy(userId: string, amount: number, manager?: EntityManager) {
-    await this.creditAvailable(userId, amount, manager);
-    return this.ledgerService.createEntry(
-      userId,
-      amount,
-      LedgerType.CREDIT,
-      LedgerSource.WALLET_DEPOSIT,
-      'Demo Funds Top-up',
-      manager,
-    );
+    const work = async (em: EntityManager) => {
+      await this.creditAvailable(userId, amount, em);
+      return this.ledgerService.createEntry(
+        userId,
+        amount,
+        LedgerType.CREDIT,
+        LedgerSource.WALLET_DEPOSIT,
+        'Demo Funds Top-up',
+        em,
+      );
+    };
+
+    return manager
+      ? work(manager)
+      : await this.walletRepo.manager.transaction(work);
   }
 
   private async getOrCreateWallet(
@@ -97,13 +68,21 @@ export class WalletService {
     const repo = this.getRepo(manager);
     let wallet = await repo.findOne({ where: { userId } });
     if (!wallet) {
-      wallet = repo.create({ userId, availableBalance: 0, lockedBalance: 0 });
+      wallet = repo.create({
+        userId,
+        availableBalance: 0,
+        lockedBalance: 0,
+        pendingBalance: 0,
+        totalEarned: 0,
+      });
       await repo.save(wallet);
     }
     return wallet;
   }
 
-  // ✅ FIXED: Using atomic updates to prevent race conditions
+  /**
+   * ✅ ATOMIC INCREMENT: Prevents race conditions during simultaneous deposits.
+   */
   async creditAvailable(
     userId: string,
     amount: number,
@@ -113,7 +92,9 @@ export class WalletService {
     await repo
       .createQueryBuilder()
       .update(Wallet)
-      .set({ availableBalance: () => `availableBalance + ${amount}` })
+      .set({
+        availableBalance: () => `availableBalance + ${amount}`,
+      })
       .where('userId = :userId', { userId })
       .execute();
   }
@@ -125,8 +106,13 @@ export class WalletService {
   ): Promise<void> {
     const repo = this.getRepo(manager);
     const wallet = await this.getOrCreateWallet(userId, manager);
-    if (Number(wallet.availableBalance) < amount)
-      throw new BadRequestException('Insufficient available balance');
+
+    if (Number(wallet.availableBalance) < amount) {
+      throw new BadRequestException(
+        'Insufficient available balance for this transaction',
+      );
+    }
+
     await repo
       .createQueryBuilder()
       .update(Wallet)
@@ -135,17 +121,30 @@ export class WalletService {
       .execute();
   }
 
-  async credit(
+  /**
+   * Handles Yield/Profit tracking for the "Empire" dashboard
+   */
+  async creditEarned(
     userId: string,
     amount: number,
     source: LedgerSource,
     note?: string,
     manager?: EntityManager,
   ) {
-    await this.creditAvailable(userId, amount, manager);
+    const repo = this.getRepo(manager);
+    await repo
+      .createQueryBuilder()
+      .update(Wallet)
+      .set({
+        availableBalance: () => `availableBalance + ${amount}`,
+        totalEarned: () => `totalEarned + ${amount}`,
+      })
+      .where('userId = :userId', { userId })
+      .execute();
+
     return this.ledgerService.createEntry(
       userId,
-      Math.abs(amount),
+      amount,
       LedgerType.CREDIT,
       source,
       note,
@@ -159,16 +158,13 @@ export class WalletService {
     manager?: EntityManager,
   ): Promise<void> {
     const repo = this.getRepo(manager);
-    const wallet = await this.getOrCreateWallet(userId, manager);
-    if (Number(wallet.availableBalance) < amount)
-      throw new BadRequestException('Insufficient available balance');
+    // Reuse debitAvailable to check for sufficient funds first
+    await this.debitAvailable(userId, amount, manager);
+
     await repo
       .createQueryBuilder()
       .update(Wallet)
-      .set({
-        availableBalance: () => `availableBalance - ${amount}`,
-        lockedBalance: () => `lockedBalance + ${amount}`,
-      })
+      .set({ lockedBalance: () => `lockedBalance + ${amount}` })
       .where('userId = :userId', { userId })
       .execute();
   }
@@ -190,25 +186,10 @@ export class WalletService {
       .execute();
   }
 
-  async adjustBalance(
-    userId: string,
-    amount: number,
-    manager?: EntityManager,
-  ): Promise<void> {
-    const repo = this.getRepo(manager);
-    await repo
-      .createQueryBuilder()
-      .update(Wallet)
-      .set({ availableBalance: () => `availableBalance + ${amount}` })
-      .where('userId = :userId', { userId })
-      .execute();
-  }
-
-  async getAvailableBalance(userId: string): Promise<number> {
-    const wallet = await this.getOrCreateWallet(userId);
-    return Number(wallet.availableBalance);
-  }
-
+  /**
+   * ✅ COMPATIBILITY FIX: Required by WithdrawalService
+   * Removes funds from the "Pending/Locked" state when a bank transfer is complete.
+   */
   async debitLocked(
     userId: string,
     amount: number,
@@ -216,13 +197,89 @@ export class WalletService {
   ): Promise<void> {
     const repo = this.getRepo(manager);
     const wallet = await this.getOrCreateWallet(userId, manager);
-    if (Number(wallet.lockedBalance) < amount)
-      throw new BadRequestException('Insufficient locked funds');
+
+    const currentLocked = Number(wallet.pendingBalance || 0);
+
+    if (currentLocked < amount) {
+      throw new BadRequestException(
+        'Insufficient pending/locked funds for this payout',
+      );
+    }
+
     await repo
       .createQueryBuilder()
       .update(Wallet)
-      .set({ lockedBalance: () => `lockedBalance - ${amount}` })
+      .set({ pendingBalance: () => `pendingBalance - ${amount}` })
       .where('userId = :userId', { userId })
       .execute();
+  }
+
+  /**
+   * Payout Lifecycle: Available -> Pending -> (Success/Fail)
+   */
+  async requestPayout(
+    userId: string,
+    amount: number,
+    manager?: EntityManager,
+  ): Promise<void> {
+    const repo = this.getRepo(manager);
+    await this.debitAvailable(userId, amount, manager);
+
+    await repo
+      .createQueryBuilder()
+      .update(Wallet)
+      .set({ pendingBalance: () => `pendingBalance + ${amount}` })
+      .where('userId = :userId', { userId })
+      .execute();
+  }
+
+  async finalizePayout(
+    userId: string,
+    amount: number,
+    success: boolean,
+    manager?: EntityManager,
+  ): Promise<void> {
+    const repo = this.getRepo(manager);
+    if (success) {
+      await repo
+        .createQueryBuilder()
+        .update(Wallet)
+        .set({ pendingBalance: () => `pendingBalance - ${amount}` })
+        .where('userId = :userId', { userId })
+        .execute();
+    } else {
+      await repo
+        .createQueryBuilder()
+        .update(Wallet)
+        .set({
+          pendingBalance: () => `pendingBalance - ${amount}`,
+          availableBalance: () => `availableBalance + ${amount}`,
+        })
+        .where('userId = :userId', { userId })
+        .execute();
+    }
+  }
+
+  async getAvailableBalance(userId: string): Promise<number> {
+    const wallet = await this.getOrCreateWallet(userId);
+    return Number(wallet.availableBalance);
+  }
+
+  async credit(
+    userId: string,
+    amount: number,
+    source: LedgerSource,
+    note?: string,
+    manager?: EntityManager,
+  ) {
+    await this.creditAvailable(userId, amount, manager);
+    return this.ledgerService.createEntry(
+      userId,
+      amount,
+      LedgerType.CREDIT,
+      source,
+      note,
+      manager,
+    );
   }
 }

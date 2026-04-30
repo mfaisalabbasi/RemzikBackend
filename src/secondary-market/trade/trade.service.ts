@@ -72,7 +72,7 @@ export class TradeService {
     const totalPrice = unitsToBuy * Number(listing.pricePerUnit);
 
     // Prevent self-trading
-    if (listing.sellerId === buyer.id || listing.sellerId === buyer.user.id) {
+    if (listing.sellerId === buyer.user.id) {
       throw new BadRequestException('Self-trading is not permitted');
     }
 
@@ -93,30 +93,29 @@ export class TradeService {
     try {
       return await this.tradeRepo.manager.transaction(
         async (manager: EntityManager) => {
-          // --- 1. RESOLVE SELLER CONTEXT ---
-          // This is the CRITICAL fix. We find the InvestorProfile linked to the sellerId.
-          // This ensures we get the real investorId even if the listing stored a userId.
+          // 1. Resolve Seller Context
           const sellerProfile = await this.ownershipService.getInvestorByUserId(
             listing.sellerId,
           );
 
-          // --- 2. FINANCIAL SETTLEMENT ---
+          // 2. Financial Settlement using the Transactional Manager
+          // Debit Buyer Available Balance
           await this.walletService.debitAvailable(
             buyer.user.id,
             totalPrice,
             manager,
           );
 
+          // Credit Seller Available Balance and Record Ledger
           await this.walletService.credit(
             listing.sellerId,
             totalPrice,
             LedgerSource.SECONDARY_MARKET_SELL,
-            `Sale of ${unitsToBuy} units of ${listing.assetId}`,
+            `Sale of ${unitsToBuy} units of asset ${listing.assetId}`,
             manager,
           );
 
-          // --- 3. OWNERSHIP TRANSFER ---
-          // Use sellerProfile.id to guarantee the lookup in the ownerships table works.
+          // 3. Ownership Transfer
           await this.ownershipService.removeUnits(
             sellerProfile.id,
             listing.assetId,
@@ -124,7 +123,6 @@ export class TradeService {
             manager,
           );
 
-          // Buyer gains units. Passing the profile object handles "add or create" logic.
           await this.ownershipService.addUnits(
             buyer,
             listing.assetId,
@@ -132,14 +130,14 @@ export class TradeService {
             manager,
           );
 
-          // --- 4. UPDATE LISTING ---
+          // 4. Update Listing
           listing.status = ListingStatus.SOLD;
           await manager.save(listing);
 
-          // --- 5. RECORD TRADE ---
+          // 5. Record Trade
           const trade = this.tradeRepo.create({
             buyer,
-            seller: sellerProfile, // Now using the full resolved profile
+            seller: sellerProfile,
             asset: { id: listing.assetId } as any,
             units: unitsToBuy,
             pricePerUnit: listing.pricePerUnit,
@@ -150,7 +148,7 @@ export class TradeService {
 
           const savedTrade = await manager.save(trade);
 
-          // --- 6. AUDIT ---
+          // 6. Audit
           await this.auditService.log(
             {
               adminId: buyer.user.id,
@@ -177,6 +175,19 @@ export class TradeService {
   async getTrades() {
     return this.tradeRepo.find({
       relations: ['seller', 'buyer', 'asset'],
+      order: { executedAt: 'DESC' },
+    });
+  }
+
+  // Inside TradeService class
+
+  async getUserTrades(userId: string): Promise<Trade[]> {
+    return this.tradeRepo.find({
+      where: [
+        { buyer: { user: { id: userId } } }, // Trades where user is the buyer
+        { seller: { user: { id: userId } } }, // Trades where user is the seller
+      ],
+      relations: ['seller', 'buyer', 'asset', 'seller.user', 'buyer.user'],
       order: { executedAt: 'DESC' },
     });
   }

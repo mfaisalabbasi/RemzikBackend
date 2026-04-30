@@ -26,5 +26,6 @@ import { User } from 'src/user/user.entity';
   ],
   providers: [TradeService],
   controllers: [TradeController],
+  exports: [TradeService],
 })
 export class TradeModule {}

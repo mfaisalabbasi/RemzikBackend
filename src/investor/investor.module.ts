@@ -7,6 +7,7 @@ import { WalletModule } from 'src/wallet/wallet.module';
 import { InvestmentModule } from 'src/investment/investment.module';
 import { LedgerModule } from 'src/ledger/ledger.module';
 import { Ownership } from 'src/ownership/ownership.entity';
+import { TradeModule } from 'src/secondary-market/trade/trade.module';
 
 @Module({
   imports: [
@@ -14,6 +15,7 @@ import { Ownership } from 'src/ownership/ownership.entity';
     WalletModule,
     InvestmentModule,
     LedgerModule,
+    TradeModule,
   ],
   providers: [InvestorService],
   controllers: [InvestorController],

@@ -8,7 +8,6 @@ import { Repository } from 'typeorm';
 import { Withdrawal, WithdrawalStatus } from './withdrawal.entity';
 import { WalletService } from '../../wallet/wallet.service';
 import { AuditService } from '../../audit/audit.service';
-// 🛡️ IMPORT FROM THE CORRECT AUDIT ENUM LOCATION
 import { AdminAction } from '../../audit/enums/audit-action.enum';
 
 @Injectable()
@@ -22,21 +21,20 @@ export class WithdrawalService {
 
   /**
    * USER: Request a withdrawal
-   * Checks available balance and locks funds immediately.
+   * Checks available balance and moves funds to PendingBalance immediately.
    */
   async request(
     userId: string,
     amount: number,
     bankInfo: { iban: string; bankName: string },
   ) {
-    // 1. Check current available balance
     const available = await this.walletService.getAvailableBalance(userId);
 
     if (available < amount) {
       throw new BadRequestException('Insufficient balance in wallet');
     }
 
-    // 2. Create Withdrawal Record
+    // 1. Create Withdrawal Record
     const withdrawal = this.withdrawalRepo.create({
       userId,
       amount,
@@ -45,13 +43,12 @@ export class WithdrawalService {
     });
     const saved = await this.withdrawalRepo.save(withdrawal);
 
-    // 3. Lock Funds in Wallet
-    // Moves funds from available -> locked to prevent double spending
-    await this.walletService.lockFunds(userId, amount);
+    // 2. Lock Funds in Wallet (Moves funds from Available -> PendingBalance)
+    await this.walletService.requestPayout(userId, amount);
 
-    // 4. Audit Log (Actor is the User requesting)
+    // 3. Audit Log
     await this.auditService.log({
-      adminId: userId, // The person initiating the action
+      adminId: userId,
       targetId: saved.id,
       action: AdminAction.WITHDRAW_REQ,
       reason: `User initiated a withdrawal of ${amount} SAR`,
@@ -62,7 +59,7 @@ export class WithdrawalService {
 
   /**
    * ADMIN: Approve and finalize withdrawal
-   * Clears the locked balance permanently after bank transfer is done.
+   * Permanently clears the Pending balance once the transfer is confirmed.
    */
   async approve(id: string, adminId: string) {
     const withdrawal = await this.withdrawalRepo.findOne({ where: { id } });
@@ -77,20 +74,56 @@ export class WithdrawalService {
       );
     }
 
-    // 1. Update Status to Completed
+    // 1. Finalize Wallet Debit (Permanently removes money from pendingBalance)
+    await this.walletService.finalizePayout(
+      withdrawal.userId,
+      withdrawal.amount,
+      true,
+    );
+
+    // 2. Update Status to Completed
     withdrawal.status = WithdrawalStatus.COMPLETED;
     const updated = await this.withdrawalRepo.save(withdrawal);
 
-    // 2. Finalize Wallet Debit
-    // This permanently removes the money from the user's locked balance
-    await this.walletService.debitLocked(withdrawal.userId, withdrawal.amount);
-
-    // 3. Audit Log (Actor is Faisal/Admin)
+    // 3. Audit Log (Actor is Admin)
     await this.auditService.log({
       adminId: adminId,
       targetId: updated.id,
       action: AdminAction.WITHDRAW_APPROVED,
       reason: 'Admin approved and confirmed bank transfer',
+    });
+
+    return updated;
+  }
+
+  /**
+   * ADMIN: Reject withdrawal
+   * Returns money from PendingBalance back to AvailableBalance.
+   */
+  async reject(id: string, adminId: string, reason: string) {
+    const withdrawal = await this.withdrawalRepo.findOne({ where: { id } });
+
+    if (!withdrawal || withdrawal.status !== WithdrawalStatus.PENDING) {
+      throw new BadRequestException('Invalid withdrawal request');
+    }
+
+    // 1. Return funds back to Available
+    await this.walletService.finalizePayout(
+      withdrawal.userId,
+      withdrawal.amount,
+      false,
+    );
+
+    // 2. Update status
+    withdrawal.status = WithdrawalStatus.REJECTED;
+    const updated = await this.withdrawalRepo.save(withdrawal);
+
+    // 3. Audit Log
+    await this.auditService.log({
+      adminId: adminId,
+      targetId: updated.id,
+      action: AdminAction.WITHDRAW_REJECTED,
+      reason: `Admin rejected withdrawal: ${reason}`,
     });
 
     return updated;

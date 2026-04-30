@@ -12,7 +12,6 @@ import { LedgerService } from 'src/ledger/ledger.service';
 import { LedgerType } from 'src/ledger/enums/ledger-type.enum';
 import { LedgerSource } from 'src/ledger/enums/ledger-source.enum';
 import { AuditService } from 'src/audit/audit.service';
-// 🛡️ Ensure this points to your unified Enum file
 import { AdminAction } from 'src/audit/enums/audit-action.enum';
 
 @Injectable()
@@ -46,13 +45,14 @@ export class EscrowService {
 
     const escrow = this.escrowRepo.create({
       tradeId,
-      buyerId,
-      sellerId,
+      buyerId, // This is userId
+      sellerId, // This is userId
       amount,
       releaseAt,
       status: EscrowStatus.LOCKED,
     });
 
+    // Record the negative entry to show funds leaving availability
     await this.ledgerService.record({
       userId: sellerId,
       amount: -amount,
@@ -64,9 +64,8 @@ export class EscrowService {
 
     const savedEscrow = await this.escrowRepo.save(escrow);
 
-    // ✅ AUDIT: Log Escrow Lock using the Enum
     await this.auditService.log({
-      adminId: buyerId, // The actor who triggered the lock
+      adminId: buyerId,
       targetId: savedEscrow.id,
       action: AdminAction.ESCROW_LOCKED,
       reason: `Funds locked for trade: ${tradeId}`,
@@ -91,6 +90,7 @@ export class EscrowService {
     escrow.status = EscrowStatus.RELEASED;
     await this.escrowRepo.save(escrow);
 
+    // Moves funds from Locked -> Available in the Seller's User Wallet
     await this.walletService.unlockFunds(escrow.sellerId, escrow.amount);
 
     await this.ledgerService.record({
@@ -102,7 +102,6 @@ export class EscrowService {
       description: 'Escrow released to wallet',
     });
 
-    // ✅ AUDIT: Log Escrow Release using the Enum
     await this.auditService.log({
       adminId: escrow.sellerId,
       targetId: escrowId,
@@ -123,9 +122,8 @@ export class EscrowService {
     escrow.status = EscrowStatus.DISPUTED;
     const updated = await this.escrowRepo.save(escrow);
 
-    // ✅ AUDIT: Log Escrow Dispute using the Enum
     await this.auditService.log({
-      adminId: 'SYSTEM', // System-level action
+      adminId: 'SYSTEM',
       targetId: escrowId,
       action: AdminAction.ESCROW_DISPUTED,
       reason: 'Escrow marked as disputed due to trade challenge',

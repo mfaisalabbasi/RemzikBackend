@@ -33,7 +33,9 @@ export class InvestmentService {
     userId: string,
     dto: CreateInvestmentDto,
   ): Promise<Investment> {
-    const availableBalance = await this.walletService.getBalance(userId);
+    // 1. Pre-check balance before opening transaction
+    const availableBalance =
+      await this.walletService.getAvailableBalance(userId);
     if (availableBalance < dto.amount) {
       throw new BadRequestException(
         `Insufficient balance. Required: SAR ${dto.amount.toLocaleString()}. Available: SAR ${availableBalance.toLocaleString()}.`,
@@ -49,7 +51,7 @@ export class InvestmentService {
         if (!investor)
           throw new BadRequestException('Investor profile not found');
 
-        // 1. Fetch token with a write lock to prevent race conditions during supply updates
+        // 2. Fetch token with a write lock to prevent race conditions
         const token = await manager
           .getRepository(AssetToken)
           .createQueryBuilder('token')
@@ -64,26 +66,28 @@ export class InvestmentService {
         });
         if (!asset) throw new BadRequestException('Asset not found');
 
-        const sharesToBuy = dto.amount / Number(token.sharePrice);
+        const sharesToBuy = Number(dto.amount) / Number(token.sharePrice);
 
-        // Use Number() to ensure accurate comparison against decimal/numeric types
         if (sharesToBuy > Number(token.availableShares)) {
           throw new BadRequestException(
             'Not enough shares available for this purchase',
           );
         }
 
-        // 2. Settlement using the transactional manager to ensure atomicity
-        await this.walletService.debitAvailable(userId, dto.amount, manager);
+        /**
+         * ✅ FIX: Single Settlement Call
+         * Passing a negative amount to .credit() handles both the balance
+         * subtraction and the Ledger entry in one atomic operation.
+         */
         await this.walletService.credit(
           userId,
-          -dto.amount,
+          -Math.abs(dto.amount), // Force negative to ensure debit
           LedgerSource.ASSET_INVESTMENT,
           `Investment in ${asset.title} (Primary Market)`,
           manager,
         );
 
-        // 3. Update Available Supply - THE FIX
+        // 3. Update Available Supply
         token.availableShares = Number(token.availableShares) - sharesToBuy;
         await manager.save(token);
 
@@ -92,6 +96,7 @@ export class InvestmentService {
         asset.investors = (asset.investors || 0) + 1;
         await manager.save(asset);
 
+        // 5. Create Investment Record
         const investment = manager.create(Investment, {
           investor,
           asset,
@@ -100,7 +105,7 @@ export class InvestmentService {
         });
         const result = await manager.save(investment);
 
-        // 5. Record Ownership within the same transaction
+        // 6. Record Ownership
         await this.ownershipService.addShares(
           investor,
           asset,
@@ -147,7 +152,6 @@ export class InvestmentService {
 
         const shares = investment.amount / Number(token.sharePrice);
 
-        // Update Supply on confirmation to maintain consistency
         token.availableShares = Number(token.availableShares) - shares;
         await manager.save(token);
 
@@ -184,6 +188,8 @@ export class InvestmentService {
     return confirmedInvestment;
   }
 
+  // --- HELPER METHODS ---
+
   async getMyInvestments(userId: string): Promise<Investment[]> {
     return this.investmentRepo.find({
       where: { investor: { user: { id: userId } } },
@@ -194,7 +200,7 @@ export class InvestmentService {
 
   async getByUser(userId: string): Promise<Investment[]> {
     return this.investmentRepo.find({
-      where: { investor: { id: userId } },
+      where: { investor: { user: { id: userId } } },
       relations: ['investor', 'asset'],
     });
   }
@@ -221,8 +227,7 @@ export class InvestmentService {
       })
       .getRawOne();
 
-    const total = result?.total ? parseFloat(result.total) : 0;
-    return total;
+    return result?.total ? parseFloat(result.total) : 0;
   }
 
   async countUniqueInvestors(): Promise<number> {

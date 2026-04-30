@@ -7,6 +7,7 @@ export enum AdminAction {
   // Finance (The missing pieces)
   WITHDRAW_REQ = 'WITHDRAW_REQ',
   WITHDRAW_APPROVED = 'WITHDRAW_APPROVED',
+  WITHDRAW_REJECTED = 'WITHDRAW_REJECTED',
   DEPOSIT_COMPLETED = 'DEPOSIT_COMPLETED',
 
   // Secondary Market & Escrow

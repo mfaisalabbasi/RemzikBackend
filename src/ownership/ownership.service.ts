@@ -17,6 +17,7 @@ export class OwnershipService {
 
   /**
    * Internal Helper: Switches between global repo and transactional manager.
+   * This is critical for maintaining atomicity during Trades.
    */
   private getRepo(manager?: EntityManager) {
     return manager ? manager.getRepository(Ownership) : this.ownershipRepo;
@@ -39,7 +40,7 @@ export class OwnershipService {
   }
 
   /**
-   * Add shares & units (for initial investment confirmation)
+   * Add shares & units (For Initial Primary Market confirmation)
    */
   async addShares(
     investor: InvestorProfile,
@@ -62,15 +63,15 @@ export class OwnershipService {
         investorId: investor.id,
         asset,
         assetId: asset.id,
-        shares,
-        units: shares,
+        shares: Number(shares),
+        units: Number(shares),
       });
       await repo.save(newOwnership);
     }
   }
 
   /**
-   * ✅ FIXED: Uses manager to prevent "Record not found" during transactions
+   * Remove units (For Secondary Market Sale)
    */
   async removeUnits(
     investorId: string,
@@ -99,7 +100,7 @@ export class OwnershipService {
   }
 
   /**
-   * ✅ FIXED: Uses manager and handles "Fresh Investor" creation
+   * Add units (For Secondary Market Purchase)
    */
   async addUnits(
     investor: InvestorProfile | string,
@@ -119,21 +120,26 @@ export class OwnershipService {
     });
 
     if (ownership) {
+      // Logic for existing owners
       ownership.units = Number(ownership.units) + Number(units);
       await repo.save(ownership);
     } else {
+      // Logic for a fresh owner on the secondary market
       const newOwnership = repo.create({
         investor: investorProfile,
         investorId: investorProfile.id,
         asset: { id: assetId } as Asset,
         assetId,
-        shares: units,
-        units,
+        shares: Number(units), // Initial shares match initial units bought
+        units: Number(units),
       });
       await repo.save(newOwnership);
     }
   }
 
+  /**
+   * Helper for check balance/limits
+   */
   async getUserUnitsForAsset(userId: string, assetId: string): Promise<number> {
     const investor = await this.getInvestorByUserId(userId);
     const ownership = await this.ownershipRepo.findOne({

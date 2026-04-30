@@ -12,6 +12,7 @@ import { WalletService } from 'src/wallet/wallet.service';
 import { InvestmentService } from 'src/investment/investment.service';
 import { InvestmentStatus } from 'src/investment/enums/investment-status.enum';
 import { LedgerService } from 'src/ledger/ledger.service';
+import { TradeService } from 'src/secondary-market/trade/trade.service';
 
 @Injectable()
 export class InvestorService {
@@ -25,6 +26,7 @@ export class InvestorService {
     private readonly walletService: WalletService,
     private readonly investmentService: InvestmentService,
     private readonly ledgerService: LedgerService,
+    private readonly tradeService: TradeService,
   ) {}
 
   // ✅ NEW: Bridging the Ownership table to the Market UI
@@ -109,12 +111,48 @@ export class InvestorService {
     return { message: 'Profile updated' };
   }
 
-  async getDashboard(userId: string) {
+async getDashboard(userId: string) {
     const wallet = await this.walletService.getWallet(userId);
+    
+    // 1. Fetch Primary Market Investments
     const investments = await this.investmentService.getMyInvestments(userId);
+    
+    // 2. Fetch Secondary Market Trades (Both as Buyer and Seller)
+    // We assume you have a method in TradeService to get user trades
+    const trades = await this.tradeService.getUserTrades(userId);
+
     const confirmed = investments.filter(
       (inv) => inv.status === InvestmentStatus.CONFIRMED,
     );
+
+    // 3. Map Primary Investments to Activity Format
+    const investmentActivity = investments.map((inv) => ({
+      title: `Investment: ${inv.asset?.title || 'Asset'}`,
+      date: inv.createdAt,
+      amount: -Number(inv.amount), // Outflow
+      status: inv.status,
+      type: 'PRIMARY'
+    }));
+
+    // 4. Map Secondary Trades to Activity Format
+    const tradeActivity = trades.map((trade) => {
+      const isBuyer = trade.buyer.user.id === userId;
+      return {
+        title: isBuyer 
+          ? `Bought: ${trade.asset?.title || 'Shares'}` 
+          : `Sold: ${trade.asset?.title || 'Shares'}`,
+        date: trade.executedAt || trade.createdAt,
+        amount: isBuyer ? -Number(trade.totalPrice) : Number(trade.totalPrice),
+        status: trade.status,
+        type: 'SECONDARY'
+      };
+    });
+
+    // 5. Merge and Sort by Date (Descending)
+    const allActivity = [...investmentActivity, ...tradeActivity]
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+      .slice(0, 5);
+
     return {
       walletBalance: wallet.availableBalance,
       portfolioValue: confirmed.reduce(
@@ -122,12 +160,7 @@ export class InvestorService {
         0,
       ),
       activeInvestments: confirmed.length,
-      recentActivity: investments.slice(0, 5).map((inv) => ({
-        title: `Investment: ${inv.asset?.title || 'Asset'}`,
-        date: inv.createdAt,
-        amount: -Number(inv.amount),
-        status: inv.status,
-      })),
+      recentActivity: allActivity,
     };
   }
 }
