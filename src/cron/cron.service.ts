@@ -1,40 +1,46 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { PayoutService } from '../payout/payout.service';
-import { PayoutStatus } from '../payout/enums/payout-status.enum';
+import { WithdrawalService } from 'src/finance/withdrawal/withdrawal.service';
+import { WithdrawalStatus } from 'src/finance/withdrawal/withdrawal.entity';
 
 @Injectable()
 export class CronService {
   private readonly logger = new Logger(CronService.name);
-  constructor(private readonly payoutService: PayoutService) {}
+  constructor(private readonly withdrawalService: WithdrawalService) {}
 
   @Cron(CronExpression.EVERY_HOUR) // Process withdrawals every hour
   async autoProcessWithdrawals() {
-    const pending = await this.payoutService.getPendingRequests();
+    const pending = await this.withdrawalService.getPendingRequests();
 
     for (const req of pending) {
       try {
-        // 1. Integration: Here you would call an API like Stripe, PayPal, or a local Saudi Bank API
+        // 1. Integration: Future hook for Saudi Bank API / SARIE
         const isBankTransferSuccess = await this.simulateBankApi(req);
 
         if (isBankTransferSuccess) {
-          await this.payoutService.finalizePayout(req.id, {
-            status: PayoutStatus.COMPLETED,
+          await this.withdrawalService.finalizePayout(req.id, {
+            status: WithdrawalStatus.COMPLETED,
           });
         } else {
-          await this.payoutService.finalizePayout(req.id, {
-            status: PayoutStatus.FAILED,
+          await this.withdrawalService.finalizePayout(req.id, {
+            status: WithdrawalStatus.FAILED,
             reason: 'Bank rejected transfer',
           });
         }
-      } catch (err) {
-        this.logger.error(`Failed to process payout ${req.id}: ${err.message}`);
+      } catch (err: unknown) {
+        // 🚀 TYPE SAFE ERROR HANDLING:
+        // Narrow 'unknown' to 'Error' to safely access .message
+        const errorMessage = err instanceof Error ? err.message : String(err);
+
+        this.logger.error(
+          `Failed to process payout ${req.id}: ${errorMessage}`,
+        );
       }
     }
   }
 
   private async simulateBankApi(payout: any): Promise<boolean> {
-    // In the future, replace this with your real bank gateway
+    // Logic for real-world bank gateway integration
     return true;
   }
 }

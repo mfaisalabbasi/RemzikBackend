@@ -282,4 +282,34 @@ export class WalletService {
       manager,
     );
   }
+
+  /**
+   * Moves funds from Buyer's LOCKED balance to Seller's AVAILABLE balance.
+   * Used for successful Escrow releases.
+   */
+  async transferLockedToAvailable(
+    buyerId: string,
+    sellerId: string,
+    amount: number,
+    manager: EntityManager, // Required for transactional integrity
+  ): Promise<void> {
+    // 1. Deduct from Buyer's LOCKED balance
+    await manager.decrement(
+      Wallet,
+      { userId: buyerId },
+      'lockedBalance',
+      amount,
+    );
+
+    // 2. Increment Seller's AVAILABLE balance
+    await manager.increment(Wallet, { userId: sellerId }, 'balance', amount);
+
+    // 3. Validation check to ensure no negative balances
+    const buyerWallet = await manager.findOne(Wallet, {
+      where: { userId: buyerId },
+    });
+    if (buyerWallet && buyerWallet.lockedBalance < 0) {
+      throw new BadRequestException('Insufficient escrowed funds for transfer');
+    }
+  }
 }

@@ -10,6 +10,7 @@ export enum LedgerSource {
   // Secondary Market & Escrow Sources (Fixes your current errors)
   SECONDARY_MARKET_SELL = 'SECONDARY_MARKET_SELL',
   SECONDARY_MARKET_BUY = 'SECONDARY_MARKET_BUY',
+  SECONDARY_MARKET_TRADE = 'SECONDARY_MARKET_TRADE',
 
   ESCROW = 'ESCROW',
   WITHDRAWAL = 'WITHDRAWAL',

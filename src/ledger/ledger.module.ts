@@ -2,7 +2,7 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { LedgerService } from './ledger.service';
 import { LedgerEntry } from './ledger.entity';
-import { PayoutModule } from 'src/payout/payout.module';
+import { FinanceModule } from 'src/finance/finance.module';
 
 @Module({
   imports: [TypeOrmModule.forFeature([LedgerEntry])],

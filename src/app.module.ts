@@ -22,13 +22,13 @@ import { TokenizationModule } from './tokenization/tokenization.module';
 import { OwnershipModule } from './ownership/ownership.module';
 import { WalletModule } from './wallet/wallet.module';
 import { LedgerModule } from './ledger/ledger.module';
-import { PayoutModule } from './payout/payout.module';
 import { SecondaryMarketModule } from './secondary-market/secondary-market.module';
 import { DistributionModule } from './distribution/distribution.module';
 import { StorageModule } from './storage/storage.module';
 import { AnalyticsModule } from './analytics/analytics.module';
 import { AuditModule } from './audit/audit.module';
 import { BroadcastModule } from './broadcast/broadcast.module';
+import { FinanceModule } from './finance/finance.module';
 
 @Module({
   imports: [
@@ -72,7 +72,7 @@ import { BroadcastModule } from './broadcast/broadcast.module';
     StorageModule,
     AuditModule,
     BroadcastModule,
-    forwardRef(() => PayoutModule),
+    FinanceModule,
   ],
   controllers: [AppController],
   providers: [AppService],

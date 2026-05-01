@@ -2,13 +2,12 @@ import { Injectable } from '@nestjs/common';
 import { AssetService } from 'src/asset/asset.service';
 import { InvestmentService } from 'src/investment/investment.service';
 import { PartnerService } from 'src/partner/partner.service';
-import { PayoutService } from 'src/payout/payout.service';
-
+import { WithdrawalService } from 'src/finance/withdrawal/withdrawal.service';
 @Injectable()
 export class AnalyticsService {
   constructor(
     private readonly investmentService: InvestmentService,
-    private readonly payoutService: PayoutService,
+    private readonly withdrawalService: WithdrawalService,
     private readonly assetService: AssetService,
     private readonly partnerService: PartnerService,
   ) {}
@@ -16,7 +15,7 @@ export class AnalyticsService {
   // Get analytics for a user
   async getUserAnalytics(userId: string) {
     const investments = await this.investmentService.getByUser(userId);
-    const payouts = await this.payoutService.getByUser(userId);
+    const payouts = await this.withdrawalService.getByUser(userId);
 
     return {
       totalInvested: investments.reduce(
@@ -36,7 +35,9 @@ export class AnalyticsService {
 
     for (const asset of assets) {
       totalRaised += await this.investmentService.getTotalByAsset(asset.id);
-      totalDistributed += await this.payoutService.getTotalByAsset(asset.id);
+      totalDistributed += await this.withdrawalService.getTotalByAsset(
+        asset.id,
+      );
     }
 
     return {

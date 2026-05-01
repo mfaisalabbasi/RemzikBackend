@@ -1,7 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ListingModule } from './listing/listing.module';
 import { TradeModule } from './trade/trade.module';
-import { EscrowModule } from './escrow/escrow.module'; // Added
+import { EscrowModule } from '../escrow/escrow.module'; // Added
 import { AuditModule } from 'src/audit/audit.module';
 @Module({
   imports: [

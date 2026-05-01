@@ -7,7 +7,9 @@ import {
 } from 'typeorm';
 import { Asset } from 'src/asset/asset.entity';
 import { InvestorProfile } from 'src/investor/investor.entity';
+import { PayoutStatus } from './enums/payout-status.enum';
 
+// distribution.entity.ts
 @Entity('distributions')
 export class Distribution {
   @PrimaryGeneratedColumn('uuid')
@@ -19,14 +21,17 @@ export class Distribution {
   @ManyToOne(() => InvestorProfile, { nullable: false })
   investor!: InvestorProfile;
 
-  @Column('decimal', { precision: 15, scale: 2 })
+  @Column('decimal', { precision: 18, scale: 2 })
   amount!: number;
 
   @Column()
-  period!: string;
+  period!: string; // e.g., "Q1-2026"
 
-  @Column({ default: false })
-  paid!: boolean;
+  @Column({ type: 'enum', enum: PayoutStatus, default: PayoutStatus.PENDING })
+  status!: PayoutStatus;
+
+  @Column({ nullable: true })
+  batchId!: string; // Groups all payouts for one event (e.g., "RENT-JUNE-2026")
 
   @CreateDateColumn()
   createdAt!: Date;
