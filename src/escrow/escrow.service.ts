@@ -4,7 +4,7 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, EntityManager, DataSource } from 'typeorm'; // Added DataSource
+import { Repository, EntityManager, DataSource } from 'typeorm';
 import { Escrow } from './escrow.entity';
 import { EscrowStatus } from './enums/escrow-status.enum';
 import { WalletService } from 'src/wallet/wallet.service';
@@ -51,10 +51,9 @@ export class EscrowService {
       });
 
       // 2. Lock Wallet Funds (Moves Available -> Locked)
-      // This is the most critical financial step.
       await this.walletService.lockFunds(data.buyerId, data.amount, em);
 
-      // 3. Record Ledger (Showing the lock for transparency)
+      // 3. Record Ledger
       await this.ledgerService.record(
         {
           userId: data.buyerId,
@@ -112,7 +111,7 @@ export class EscrowService {
         em,
       );
 
-      // 3. Ledger Entries (Dual entry for audit compliance)
+      // 3. Ledger Entries
       await this.ledgerService.record(
         {
           userId: escrow.sellerId,
@@ -162,5 +161,116 @@ export class EscrowService {
       .where('escrow.status = :status', { status: EscrowStatus.LOCKED })
       .andWhere('escrow.releaseAt <= :now', { now: new Date() })
       .getMany();
+  }
+
+  /**
+   * RESOLVE FOR SELLER: Release funds to seller by Trade ID.
+   */
+  async releaseEscrowByTradeId(tradeId: string, manager?: EntityManager) {
+    const work = async (em: EntityManager) => {
+      const repo = em.getRepository(Escrow);
+      const escrow = await repo.findOne({ where: { tradeId } });
+
+      if (!escrow)
+        throw new NotFoundException('Escrow record not found for this trade');
+
+      if (
+        ![EscrowStatus.LOCKED, EscrowStatus.DISPUTED].includes(escrow.status)
+      ) {
+        throw new BadRequestException(
+          `Cannot release funds from ${escrow.status} state`,
+        );
+      }
+
+      escrow.status = EscrowStatus.RELEASED;
+      await em.save(escrow);
+
+      await this.walletService.transferLockedToAvailable(
+        escrow.buyerId,
+        escrow.sellerId,
+        escrow.amount,
+        em,
+      );
+
+      await this.ledgerService.record(
+        {
+          userId: escrow.sellerId,
+          amount: escrow.amount,
+          type: LedgerType.ESCROW_RELEASE,
+          reference: tradeId,
+          source: LedgerSource.SECONDARY_MARKET_TRADE,
+          description: `Dispute resolved: Funds released for trade ${tradeId}`,
+        },
+        em,
+      );
+
+      return escrow;
+    };
+
+    return manager ? work(manager) : this.dataSource.transaction(work);
+  }
+
+  /**
+   * RESOLVE FOR BUYER: Refund/Unlock buyer's funds by Trade ID.
+   */
+  async refundEscrowByTradeId(tradeId: string, manager?: EntityManager) {
+    const work = async (em: EntityManager) => {
+      const repo = em.getRepository(Escrow);
+      const escrow = await repo.findOne({ where: { tradeId } });
+
+      if (!escrow) throw new NotFoundException('Escrow record not found');
+
+      // 1. Update Status
+      escrow.status = EscrowStatus.REFUNDED;
+      await em.save(escrow);
+
+      // 2. Financial: Unlock Buyer's Funds (Locked -> Available)
+      await this.walletService.unlockFunds(escrow.buyerId, escrow.amount, em);
+
+      // 3. Record Ledger for Buyer using your existing REFUND type
+      await this.ledgerService.record(
+        {
+          userId: escrow.buyerId,
+          amount: escrow.amount,
+          type: LedgerType.REFUND,
+          reference: tradeId,
+          source: LedgerSource.SECONDARY_MARKET_TRADE,
+          description: `Dispute resolved: Funds refunded for trade ${tradeId}`,
+        },
+        em,
+      );
+
+      return escrow;
+    };
+
+    return manager ? work(manager) : this.dataSource.transaction(work);
+  }
+
+  /**
+   * COMPLIANCE FREEZE: Indefinite lock for legal/AML review.
+   */
+  async freezeEscrow(tradeId: string, manager?: EntityManager) {
+    const work = async (em: EntityManager) => {
+      const repo = em.getRepository(Escrow);
+      const escrow = await repo.findOne({ where: { tradeId } });
+
+      if (!escrow) throw new NotFoundException('Escrow record not found');
+
+      escrow.status = EscrowStatus.FROZEN;
+
+      await this.auditService.log(
+        {
+          adminId: 'SYSTEM_COMPLIANCE',
+          targetId: escrow.id,
+          action: AdminAction.ESCROW_LOCKED,
+          reason: `Regulatory freeze applied to trade ${tradeId}`,
+        },
+        em,
+      );
+
+      return await em.save(escrow);
+    };
+
+    return manager ? work(manager) : this.dataSource.transaction(work);
   }
 }

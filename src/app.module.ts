@@ -29,6 +29,7 @@ import { AnalyticsModule } from './analytics/analytics.module';
 import { AuditModule } from './audit/audit.module';
 import { BroadcastModule } from './broadcast/broadcast.module';
 import { FinanceModule } from './finance/finance.module';
+import { DisputeModule } from './dispute/dispute.module';
 
 @Module({
   imports: [
@@ -73,6 +74,7 @@ import { FinanceModule } from './finance/finance.module';
     AuditModule,
     BroadcastModule,
     FinanceModule,
+    DisputeModule,
   ],
   controllers: [AppController],
   providers: [AppService],

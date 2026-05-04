@@ -20,7 +20,19 @@ export class Escrow {
   @Column()
   sellerId: string;
 
-  @Column('decimal', { precision: 18, scale: 2 })
+  /**
+   * Numeric Transformer:
+   * Prevents "Resolution failed" by ensuring decimal strings from
+   * the DB are converted to numbers before the WalletService processes them.
+   */
+  @Column('decimal', {
+    precision: 18,
+    scale: 2,
+    transformer: {
+      to: (value: number) => value,
+      from: (value: string) => parseFloat(value),
+    },
+  })
   amount: number;
 
   @Column({

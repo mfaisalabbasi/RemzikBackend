@@ -10,6 +10,7 @@ import { OwnershipModule } from '../../ownership/ownership.module';
 import { LedgerModule } from '../../ledger/ledger.module';
 import { TradeLockModule } from './trade-lock.module';
 import { User } from 'src/user/user.entity';
+import { EscrowModule } from 'src/escrow/escrow.module';
 
 @Module({
   imports: [
@@ -23,6 +24,7 @@ import { User } from 'src/user/user.entity';
     OwnershipModule,
     LedgerModule,
     TradeLockModule,
+    EscrowModule,
   ],
   providers: [TradeService],
   controllers: [TradeController],

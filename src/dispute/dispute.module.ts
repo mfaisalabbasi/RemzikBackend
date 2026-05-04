@@ -6,6 +6,7 @@ import { WalletModule } from 'src/wallet/wallet.module';
 import { LedgerModule } from 'src/ledger/ledger.module';
 import { AuditModule } from 'src/audit/audit.module';
 import { EscrowModule } from '../escrow/escrow.module';
+import { DisputeController } from './dispute.controller';
 
 @Module({
   imports: [
@@ -15,6 +16,7 @@ import { EscrowModule } from '../escrow/escrow.module';
     AuditModule,
     EscrowModule,
   ],
+  controllers: [DisputeController],
   providers: [DisputeService],
   exports: [DisputeService, TypeOrmModule],
 })

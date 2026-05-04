@@ -4,67 +4,68 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, DataSource } from 'typeorm'; // 💡 Added DataSource for Transactions
+import { Repository, DataSource, EntityManager } from 'typeorm';
 import { Dispute } from './dispute.entity';
 import { CreateDisputeDto } from './dto/create-dispute.dto';
 import { DisputeStatus, DisputeType } from './dispute.enums';
 import { ResolveDisputeDto } from './dto/resolve-dispute.dto';
-import { WalletService } from 'src/wallet/wallet.service';
-import { LedgerService } from 'src/ledger/ledger.service';
 import { EscrowService } from '../escrow/escrow.service';
 import { AuditService } from 'src/audit/audit.service';
 import { AdminAction } from 'src/audit/enums/audit-action.enum';
+import { Escrow } from '../escrow/escrow.entity';
 
 @Injectable()
 export class DisputeService {
   constructor(
     @InjectRepository(Dispute)
     private readonly disputeRepo: Repository<Dispute>,
-    private readonly walletService: WalletService,
-    private readonly ledgerService: LedgerService,
     private readonly escrowService: EscrowService,
     private readonly auditService: AuditService,
-    private readonly dataSource: DataSource, // 💡 For Fintech-grade Atomic Operations
+    private readonly dataSource: DataSource,
   ) {}
 
-  /**
-   * CREATE DISPUTE
-   * Transactional logic: Ensures Escrow is frozen BEFORE the dispute is finalized.
-   */
   async createDispute(userId: string, dto: CreateDisputeDto) {
     return await this.dataSource.transaction(async (manager) => {
-      // 1️⃣ Create the dispute record within the transaction
+      // ✅ FIX: Block creation if a dispute already exists for this referenceId
+      const existingDispute = await manager.findOne(Dispute, {
+        where: { referenceId: dto.referenceId },
+      });
+
+      if (existingDispute) {
+        throw new BadRequestException(
+          `Arbitration already exists for this transaction (Status: ${existingDispute.status}).`,
+        );
+      }
+
       const dispute = manager.create(Dispute, {
         userId,
-        ...dto,
+        referenceId: dto.referenceId,
+        type: dto.type,
+        reason: dto.reason,
         status: DisputeStatus.OPEN,
       });
 
       const savedDispute = await manager.save(dispute);
 
-      // 2️⃣ 🛡️ SECURITY: Freeze escrow funds if it's a trade
-      // We pass the 'manager' to ensure it's part of the same DB transaction
       if (
         dto.type === DisputeType.TRADE ||
         dto.type === DisputeType.SECONDARY_TRADE
       ) {
         try {
-          // Note: Ensure your EscrowService.disputeEscrow accepts a manager
           await this.escrowService.disputeEscrow(dto.referenceId, manager);
         } catch (e) {
-          // If escrow is missing, we log it, but in a strict fintech environment,
-          // you might want to 'throw e' here to prevent orphan disputes.
-          console.error(`Escrow lock failed for ref: ${dto.referenceId}`, e);
+          throw new BadRequestException(
+            `Financial link failed: Trade ${dto.referenceId} not found in active escrow`,
+          );
         }
       }
 
-      // 3️⃣ 📝 AUDIT: Record that a user has opened a dispute
       await this.auditService.log(
         {
           adminId: userId,
           targetId: savedDispute.id,
           action: AdminAction.DISPUTE_OPENED,
-          reason: `User opened a ${dto.type} dispute for ref: ${dto.referenceId}`,
+          reason: `System-level freeze initiated for ${dto.type} ID: ${dto.referenceId}`,
         },
         manager,
       );
@@ -73,10 +74,19 @@ export class DisputeService {
     });
   }
 
-  /**
-   * RESOLVE DISPUTE
-   * Handled by Admin (Faisal) to finalize the outcome and move funds.
-   */
+  async getAllDisputes() {
+    return this.disputeRepo.find({
+      order: { createdAt: 'DESC' },
+    });
+  }
+
+  async getUserDisputes(userId: string) {
+    return this.disputeRepo.find({
+      where: { userId },
+      order: { createdAt: 'DESC' },
+    });
+  }
+
   async resolveDispute(
     disputeId: string,
     adminId: string,
@@ -87,65 +97,84 @@ export class DisputeService {
         where: { id: disputeId },
       });
 
-      if (!dispute) throw new NotFoundException('Dispute not found');
+      if (!dispute)
+        throw new NotFoundException('Dispute record not found in ledger');
 
-      if (
-        dispute.status !== DisputeStatus.OPEN &&
-        dispute.status !== DisputeStatus.UNDER_REVIEW
-      ) {
-        throw new BadRequestException('Dispute already handled');
+      const terminalStatuses = [
+        DisputeStatus.RESOLVED_FAVOR_BUYER,
+        DisputeStatus.RESOLVED_FAVOR_SELLER,
+        DisputeStatus.REJECTED,
+      ];
+
+      if (terminalStatuses.includes(dispute.status)) {
+        throw new BadRequestException(
+          'Dispute has already reached a terminal state',
+        );
       }
 
-      // 1️⃣ Update resolution details
+      if (
+        dispute.type === DisputeType.TRADE ||
+        dispute.type === DisputeType.SECONDARY_TRADE
+      ) {
+        await this.handleFinancialResolution(
+          dispute.referenceId,
+          dto.status,
+          manager,
+        );
+      }
+
       dispute.status = dto.status;
-      dispute.adminNote = dto.adminNote || dto.reason;
+      dispute.adminNote = dto.adminNote;
       dispute.adminId = adminId;
       dispute.resolvedAt = new Date();
 
-      const result = await manager.save(dispute);
-
-      // 2️⃣ 💸 FINANCIAL SETTLEMENT: Move funds if RESOLVED
-      if (dto.status === DisputeStatus.RESOLVED) {
-        // You would call escrowService.resolveDisputeFunds(refId, action, manager)
-        // This handles the actual 'Refund' or 'Release' logic
-      }
-
-      // 3️⃣ 🛡️ DYNAMIC AUDIT
-      const dynamicActionKey =
-        `DISPUTE_${dto.status}` as keyof typeof AdminAction;
-      const action =
-        AdminAction[dynamicActionKey] || AdminAction.DISPUTE_RESOLVED;
+      const updatedDispute = await manager.save(dispute);
 
       await this.auditService.log(
         {
-          adminId: adminId,
+          adminId,
           targetId: disputeId,
-          action: action,
-          reason: dto.adminNote || 'Dispute status updated by admin',
+          action: AdminAction.DISPUTE_RESOLVED,
+          reason: `Resolution: ${dto.status}. Note: ${dto.adminNote}`,
         },
         manager,
       );
 
-      return result;
+      return updatedDispute;
     });
   }
 
-  // --- Helper Methods ---
-
-  async getUserDisputes(userId: string) {
-    return this.disputeRepo.find({
-      where: { userId },
-      order: { createdAt: 'DESC' },
+  private async handleFinancialResolution(
+    referenceId: string,
+    targetStatus: DisputeStatus,
+    manager: EntityManager,
+  ) {
+    const escrow = await manager.getRepository(Escrow).findOne({
+      where: { tradeId: referenceId },
     });
-  }
 
-  async getAllDisputes() {
-    return this.disputeRepo.find({ order: { createdAt: 'DESC' } });
-  }
+    if (!escrow) {
+      console.warn(
+        `Financial bypass: No active escrow found for Trade ${referenceId}`,
+      );
+      return;
+    }
 
-  async getById(id: string) {
-    const dispute = await this.disputeRepo.findOne({ where: { id } });
-    if (!dispute) throw new NotFoundException('Dispute not found');
-    return dispute;
+    switch (targetStatus) {
+      case DisputeStatus.RESOLVED_FAVOR_SELLER:
+        await this.escrowService.releaseEscrowByTradeId(referenceId, manager);
+        break;
+
+      case DisputeStatus.RESOLVED_FAVOR_BUYER:
+        await this.escrowService.refundEscrowByTradeId(referenceId, manager);
+        break;
+
+      case DisputeStatus.FROZEN:
+        await this.escrowService.freezeEscrow(referenceId, manager);
+        break;
+
+      default:
+        break;
+    }
   }
 }

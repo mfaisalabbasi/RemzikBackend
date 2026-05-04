@@ -64,4 +64,18 @@ export class TradeController {
   async allTrades() {
     return this.tradeService.getTrades();
   }
+
+  @Get('active')
+  async getActiveTrades(@CurrentUser('userId') userId: string) {
+    return this.tradeService.getUserTrades(userId);
+  }
+
+  @Post('settle/:tradeId')
+  async settle(
+    @CurrentUser('userId') userId: string,
+    @Param('tradeId') tradeId: string,
+  ) {
+    if (!userId) throw new BadRequestException('Invalid user session');
+    return await this.tradeService.settleTrade(tradeId, userId);
+  }
 }

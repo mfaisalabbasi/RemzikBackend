@@ -1,56 +1,63 @@
 import {
   Controller,
   Post,
-  Get,
   Body,
-  Param,
+  Get,
   UseGuards,
-  Patch,
+  BadRequestException,
+  Param,
 } from '@nestjs/common';
 import { DisputeService } from './dispute.service';
 import { CreateDisputeDto } from './dto/create-dispute.dto';
-import { ResolveDisputeDto } from './dto/resolve-dispute.dto';
 import { JwtAuthGuard } from 'src/auth/guards/jwt.gaurd';
 import { CurrentUser } from 'src/auth/decorators/current-user.decorator';
+import { ResolveDisputeDto } from './dto/resolve-dispute.dto';
 
 @UseGuards(JwtAuthGuard)
 @Controller('disputes')
 export class DisputeController {
   constructor(private readonly disputeService: DisputeService) {}
 
-  /**
-   * USER: Raise a new concern
-   */
+  // This handles POST /api/disputes
   @Post()
-  create(@CurrentUser('userId') userId: string, @Body() dto: CreateDisputeDto) {
-    return this.disputeService.createDispute(userId, dto);
+  async create(
+    @CurrentUser('userId') userId: string,
+    @Body() dto: CreateDisputeDto,
+  ) {
+    if (!userId) throw new BadRequestException('Invalid user session');
+    return await this.disputeService.createDispute(userId, dto);
   }
 
-  /**
-   * USER: View my history of concerns
-   */
+  // ADD THIS: This handles GET /api/disputes
+  @Get()
+  async findAll(@CurrentUser('userId') userId: string) {
+    // You can decide if this returns ALL disputes (for admins)
+    // or just the user's disputes.
+    return await this.disputeService.getUserDisputes(userId);
+  }
+
+  // This handles GET /api/disputes/my-disputes
   @Get('my-disputes')
-  getMy(@CurrentUser('userId') userId: string) {
-    return this.disputeService.getUserDisputes(userId);
+  async getUserDisputes(@CurrentUser('userId') userId: string) {
+    return await this.disputeService.getUserDisputes(userId);
   }
 
-  /**
-   * ADMIN: View all active issues across Remzic
-   */
+  // Add these to DisputeController
+
+  // GET /api/disputes/admin/all
   @Get('admin/all')
-  getAll() {
-    return this.disputeService.getAllDisputes();
+  // Ensure you have an AdminGuard or check roles here
+  async getAllDisputes() {
+    return await this.disputeService.getAllDisputes();
   }
 
-  /**
-   * ADMIN: Resolve a dispute
-   */
-  @Patch('admin/resolve/:id')
-  resolve(
+  // POST /api/disputes/:id/resolve
+  @Post(':id/resolve')
+  async resolve(
     @Param('id') id: string,
     @CurrentUser('userId') adminId: string,
     @Body() dto: ResolveDisputeDto,
   ) {
-    return this.disputeService.resolveDispute(id, adminId, dto);
+    return await this.disputeService.resolveDispute(id, adminId, dto);
   }
 }
