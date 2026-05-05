@@ -1,26 +1,30 @@
-import { Body, Controller, Post, UseGuards } from '@nestjs/common';
-import { JwtAuthGuard } from 'src/auth/guards/jwt.gaurd';
-import { RolesGuard } from 'src/auth/guards/roles.guard';
+// src/distribution/distribution.controller.ts
+import {
+  Controller,
+  Post,
+  Body,
+  Param,
+  UseGuards,
+  Request,
+} from '@nestjs/common';
 import { DistributionService } from './distribution.service';
-
-// distribution.controller.ts
-@UseGuards(JwtAuthGuard, RolesGuard) // Faisal: Ensure only Admins can drop money!
-@Controller('finance/distributions')
+import { JwtAuthGuard } from 'src/auth/guards/jwt.gaurd';
+@Controller('partner/assets')
 export class DistributionController {
   constructor(private readonly distributionService: DistributionService) {}
 
-  @Post('execute')
-  async executeDistribution(
-    @Body() dto: { assetId: string; totalAmount: number; period: string },
+  @UseGuards(JwtAuthGuard)
+  @Post(':id/distribute')
+  async distribute(
+    @Param('id') assetId: string,
+    @Body('amount') amount: number,
+    @Request() req,
   ) {
-    // 🏦 REAL WORLD FLOW:
-    // 1. Faisal receives rent from property manager in corporate bank account.
-    // 2. Faisal enters the amount here.
-    // 3. System splits it perfectly among 1,000s of owners instantly.
-    return this.distributionService.distributeIncome(
-      dto.assetId,
-      dto.totalAmount,
-      dto.period,
+    // req.user.id is the Partner's User ID from the JWT
+    return await this.distributionService.triggerYieldDistribution(
+      req.user.id,
+      assetId,
+      amount,
     );
   }
 }

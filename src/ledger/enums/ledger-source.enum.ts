@@ -15,6 +15,7 @@ export enum LedgerSource {
   ESCROW = 'ESCROW',
   WITHDRAWAL = 'WITHDRAWAL',
   DIVIDEND_PAYOUT = 'DIVIDEND_PAYOUT',
+  DISTRIBUTION = 'DISTRIBUTION',
 
   // New Wallet & Investment Logic
   WALLET_DEPOSIT = 'WALLET_DEPOSIT',

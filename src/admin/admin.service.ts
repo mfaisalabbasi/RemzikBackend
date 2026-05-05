@@ -16,7 +16,7 @@ import { ComplianceStatus } from './interfaces/compliance-status.interface';
 import { LiquidityStats } from './interfaces/liquidity-stats.interface';
 import { InjectRepository } from '@nestjs/typeorm';
 import { InvestorProfile } from 'src/investor/investor.entity';
-import { Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { Investment } from 'src/investment/investment.entity';
 import { InvestmentStatus } from 'src/investment/enums/investment-status.enum';
 import { Trade } from 'src/secondary-market/trade/trade.entity';
@@ -58,6 +58,7 @@ export class AdminService {
     private readonly assetRepo: Repository<Asset>,
     @InjectRepository(AuditLog)
     private readonly auditLogRepo: Repository<AuditLog>,
+    private readonly dataSource: DataSource,
   ) {}
 
   async getUrgentQueue(): Promise<UrgentTask[]> {
@@ -522,5 +523,23 @@ export class AdminService {
       order: { createdAt: 'DESC' },
       take: 10,
     });
+  }
+  // src/admin/admin.service.ts
+  async getAssetDistributions(assetId: string) {
+    return await this.dataSource.query(
+      `
+    SELECT 
+      "batchId", 
+      "period", 
+      "status", 
+      SUM(amount) as "totalAmount", 
+      MIN("createdAt") as "date"
+    FROM distributions
+    WHERE "assetId" = $1
+    GROUP BY "batchId", "period", "status"
+    ORDER BY "date" DESC
+  `,
+      [assetId],
+    );
   }
 }

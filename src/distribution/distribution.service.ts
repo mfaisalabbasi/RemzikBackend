@@ -1,6 +1,10 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  BadRequestException,
+  NotFoundException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, EntityManager } from 'typeorm';
+import { Repository, EntityManager, DataSource } from 'typeorm';
 import { Distribution } from './distribution.entity';
 import { Ownership } from '../ownership/ownership.entity';
 import { Asset } from '../asset/asset.entity';
@@ -8,87 +12,123 @@ import { AssetToken } from 'src/tokenization/entities/asset-token.entity';
 import { WalletService } from 'src/wallet/wallet.service';
 import { LedgerSource } from 'src/ledger/enums/ledger-source.enum';
 import { PayoutStatus } from './enums/payout-status.enum';
+import { Investment } from 'src/investment/investment.entity';
+import { LedgerService } from 'src/ledger/ledger.service';
+import { InvestmentStatus } from 'src/investment/enums/investment-status.enum';
+// src/distribution/distribution.service.ts
 
-// distribution.service.ts
 @Injectable()
 export class DistributionService {
   constructor(
-    @InjectRepository(Distribution)
-    private readonly distributionRepo: Repository<Distribution>,
-    @InjectRepository(Ownership)
-    private readonly ownershipRepo: Repository<Ownership>,
-    @InjectRepository(AssetToken)
-    private readonly assetTokenRepo: Repository<AssetToken>,
+    @InjectRepository(Investment)
+    private readonly investmentRepo: Repository<Investment>,
     private readonly walletService: WalletService,
+    private readonly ledgerService: LedgerService,
+    private readonly dataSource: DataSource, // For atomic transactions
+    @InjectRepository(Distribution) // Ensure this is injected
+    private readonly distributionRepo: Repository<Distribution>,
   ) {}
 
-  /**
-   * CORE: Distribute Income
-   * Handles the fractional math and triggers the Wallet Ledger updates.
-   */
-  async distributeIncome(assetId: string, totalIncome: number, period: string) {
-    if (totalIncome <= 0)
-      throw new BadRequestException('Income must be positive');
-
-    const batchId = `DIST-${assetId.substring(0, 4)}-${Date.now()}`;
-
-    return await this.distributionRepo.manager.transaction(async (manager) => {
-      // 1. Fetch metadata with a lock to ensure share counts don't change during math
-      const token = await manager.findOne(AssetToken, {
-        where: { asset: { id: assetId } },
-        relations: ['asset'],
-      });
-      if (!token) throw new BadRequestException('Asset not tokenized');
-
-      // 2. Fetch all current owners
-      const ownerships = await manager.find(Ownership, {
-        where: { asset: { id: assetId } },
-        relations: ['investor', 'investor.user'],
+  async triggerYieldDistribution(
+    partnerUserId: string,
+    assetId: string,
+    totalAmount: number,
+  ) {
+    return await this.dataSource.transaction(async (manager) => {
+      const investments = await manager.find(Investment, {
+        where: {
+          asset: { id: assetId, partner: { user: { id: partnerUserId } } },
+          status: InvestmentStatus.CONFIRMED,
+        },
+        relations: ['asset', 'investor', 'investor.user'],
       });
 
-      let distributedSoFar = 0;
+      if (investments.length === 0)
+        throw new BadRequestException('No eligible investors found.');
 
-      for (const ownership of ownerships) {
-        // Calculation: (User Shares / Total Shares) * Total Income
-        const shareRatio = Number(ownership.shares) / Number(token.totalShares);
-        const payoutAmount = Math.floor(totalIncome * shareRatio * 100) / 100; // Round down to avoid over-payout
+      const totalAssetValue = Number(investments[0].asset.totalValue);
+      const batchId = `BATCH-${Date.now()}`;
 
-        if (payoutAmount < 0.01) continue; // Skip dusting
+      const distributionPromises = investments.map(async (inv) => {
+        const userYield = totalAmount * (Number(inv.amount) / totalAssetValue);
 
-        distributedSoFar += payoutAmount;
-
-        // 3. Create Distribution Record (The Receipt)
-        const record = manager.create(Distribution, {
-          asset: token.asset,
-          investor: ownership.investor,
-          amount: payoutAmount,
-          period,
-          batchId,
-          status: PayoutStatus.PAID,
+        // ✅ LOGIC CHANGE: Save as PENDING. Do NOT credit the wallet yet.
+        const entry = manager.create(Distribution, {
+          asset: inv.asset,
+          investor: inv.investor,
+          amount: userYield,
+          period: new Date().toISOString(),
+          status: PayoutStatus.PENDING, // PayoutStatus from your Enum
+          batchId: batchId,
         });
-        await manager.save(record);
+        return manager.save(entry);
+      });
 
-        // 4. TRIGGER WALLET (The Actual Money Flow)
-        // This hits the Ledger system we built last night.
-        await this.walletService.credit(
-          ownership.investor.user.id,
-          payoutAmount,
-          LedgerSource.DIVIDEND_PAYOUT,
-          `Dividend: ${token.asset.title} - ${period}`,
-          manager, // ATOMIC: If one fails, the whole batch rolls back
+      await Promise.all(distributionPromises);
+      return { success: true, batchId, status: 'PENDING_APPROVAL' };
+    });
+  }
+
+  async approveDistributionBatch(batchId: string) {
+    return await this.dataSource.transaction(async (manager) => {
+      // 1. Fetch all pending payouts for this batch
+      const pendingPayouts = await manager.find(Distribution, {
+        where: { batchId, status: PayoutStatus.PENDING },
+        relations: ['investor', 'investor.user', 'asset'],
+      });
+
+      if (pendingPayouts.length === 0)
+        throw new NotFoundException('No pending payouts found for this batch.');
+
+      // 2. Execute the actual money movement
+      const payoutPromises = pendingPayouts.map(async (payout) => {
+        // ✅ ACTUAL CREDIT HAPPENS HERE
+        await this.walletService.creditEarned(
+          payout.investor.user.id,
+          payout.amount,
+          LedgerSource.DISTRIBUTION,
+          `Yield Approved: ${payout.asset.title}`,
+          manager,
         );
-      }
 
-      /**
-       * 🚀 PLUG-IN READY: RECONCILIATION
-       * In production, you would check: if (distributedSoFar < totalIncome)
-       * The leftover "cents" due to rounding move to a 'Company Revenue' account.
-       */
-      return {
-        batchId,
-        totalDistributed: distributedSoFar,
-        count: ownerships.length,
-      };
+        // 3. Update status to APPROVED
+        payout.status = PayoutStatus.PAID;
+        return manager.save(payout);
+      });
+
+      await Promise.all(payoutPromises);
+      return { success: true, message: 'Batch processed successfully' };
+    });
+  }
+
+  /**
+   * Groups pending distributions by batchId so the Admin sees "Events" rather than 1000s of rows
+   */
+  async getGlobalPendingBatches() {
+    return this.dataSource.query(`
+    SELECT 
+      "batchId", 
+      "assetId", 
+      "period",
+      COUNT(id) as "investorCount", 
+      SUM(amount) as "totalAmount",
+      MIN("createdAt") as "requestedAt"
+    FROM distributions
+    WHERE status = 'PENDING'
+    GROUP BY "batchId", "assetId", "period"
+    ORDER BY "requestedAt" ASC
+  `);
+  }
+
+  /**
+   * Deletes or marks a batch as REJECTED so the Partner can try again
+   */
+  async rejectDistributionBatch(batchId: string, reason: string) {
+    // You can either delete them or update status to 'REJECTED'
+    // Deleting is often cleaner for "Draft" corrections
+    return await this.distributionRepo.delete({
+      batchId,
+      status: PayoutStatus.PENDING,
     });
   }
 }

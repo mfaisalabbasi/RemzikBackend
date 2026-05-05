@@ -19,6 +19,7 @@ import { KycProfile } from 'src/kyc/kyc.entity';
 import { PartnerProfile } from 'src/partner/partner.entity';
 import { Asset } from 'src/asset/asset.entity';
 import { AuditLog } from 'src/audit/audit.entity';
+import { DistributionModule } from 'src/distribution/distribution.module';
 
 @Module({
   controllers: [AdminController],
@@ -44,6 +45,7 @@ import { AuditLog } from 'src/audit/audit.entity';
     InvestorModule,
     InvestmentModule,
     LedgerModule,
+    DistributionModule,
   ],
 })
 export class AdminModule {}

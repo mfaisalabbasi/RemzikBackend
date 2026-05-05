@@ -22,6 +22,7 @@ import { ComplianceStatus } from './interfaces/compliance-status.interface';
 import { LiquidityStats } from './interfaces/liquidity-stats.interface';
 import { BroadcastService } from '../broadcast/broadcast.service';
 import { CreateBroadcastDto } from '../broadcast/dto/create-broadcast.dto';
+import { DistributionService } from 'src/distribution/distribution.service';
 
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('admin')
@@ -29,6 +30,7 @@ export class AdminController {
   constructor(
     private readonly adminService: AdminService,
     private readonly broadcastService: BroadcastService,
+    private readonly distributionService: DistributionService,
   ) {}
 
   @Get('notifications')
@@ -229,5 +231,55 @@ export class AdminController {
   @Roles(UserRole.ADMIN)
   async getMyActivity(@Req() req) {
     return this.adminService.getMyAdminActivity(req.user.userId);
+  }
+  // --- Yield Distribution Management ---
+
+  /**
+   * Fetches all unique pending distribution batches for Faisal's review
+   */
+  @Get('distributions/pending')
+  @Roles(UserRole.ADMIN)
+  async getPendingBatches() {
+    // You'll need to implement this helper in your DistributionService
+    return this.distributionService.getGlobalPendingBatches();
+  }
+
+  /**
+   * Approves a batch, credits investor wallets, and marks records as PAID
+   */
+  @Post('distributions/approve/:batchId')
+  @Roles(UserRole.ADMIN)
+  async approveDistribution(@Param('batchId') batchId: string, @Req() req) {
+    const result =
+      await this.distributionService.approveDistributionBatch(batchId);
+
+    // Optional: Send a broadcast to the partner that their distribution was processed
+    // Inside AdminController.approveDistribution
+    await this.broadcastService.sendTargeted(
+      req.user.userId, // Or the partner's ID
+      'Yield Distribution Processed',
+      `Batch ${batchId} has been successfully approved and paid out.`,
+      'DIRECTIVE', // Use an existing enum value from your system
+    );
+
+    return result;
+  }
+
+  /**
+   * Rejects a batch if the partner made a mistake
+   */
+  @Post('distributions/reject/:batchId')
+  @Roles(UserRole.ADMIN)
+  async rejectDistribution(
+    @Param('batchId') batchId: string,
+    @Body('reason') reason: string,
+  ) {
+    return this.distributionService.rejectDistributionBatch(batchId, reason);
+  }
+
+  @Get('assets/:id/distributions')
+  @Roles(UserRole.ADMIN)
+  async getAssetDistributions(@Param('id') id: string) {
+    return this.adminService.getAssetDistributions(id);
   }
 }
