@@ -9,6 +9,7 @@ import { PartnerProfile } from '../partner/partner.entity';
 import { KycProfile } from '../kyc/kyc.entity';
 import { StorageModule } from '../../src/storage/storage.module';
 import { Investment } from 'src/investment/investment.entity';
+import { User } from 'src/user/user.entity';
 
 @Module({
   imports: [
@@ -17,6 +18,7 @@ import { Investment } from 'src/investment/investment.entity';
       PartnerProfile,
       KycProfile, // ⭐ ADD THIS
       Investment,
+      User,
     ]),
     StorageModule,
   ],

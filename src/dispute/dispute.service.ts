@@ -13,6 +13,8 @@ import { EscrowService } from '../escrow/escrow.service';
 import { AuditService } from 'src/audit/audit.service';
 import { AdminAction } from 'src/audit/enums/audit-action.enum';
 import { Escrow } from '../escrow/escrow.entity';
+import { OwnershipService } from '../ownership/ownership.service';
+import { Trade } from '../secondary-market/trade/trade.entity';
 
 @Injectable()
 export class DisputeService {
@@ -22,11 +24,11 @@ export class DisputeService {
     private readonly escrowService: EscrowService,
     private readonly auditService: AuditService,
     private readonly dataSource: DataSource,
+    private readonly ownershipService: OwnershipService,
   ) {}
 
   async createDispute(userId: string, dto: CreateDisputeDto) {
     return await this.dataSource.transaction(async (manager) => {
-      // ✅ FIX: Block creation if a dispute already exists for this referenceId
       const existingDispute = await manager.findOne(Dispute, {
         where: { referenceId: dto.referenceId },
       });
@@ -52,10 +54,18 @@ export class DisputeService {
         dto.type === DisputeType.SECONDARY_TRADE
       ) {
         try {
+          // 1. Handle Escrow Logic (Money Freeze)
           await this.escrowService.disputeEscrow(dto.referenceId, manager);
-        } catch (e) {
+
+          // 2. Update Trade Status to DISPUTED to sync with Frontend
+          // Ensure your 'trades_status_enum' in DB has 'DISPUTED'
+          await manager.update(Trade, dto.referenceId, {
+            status: 'DISPUTED' as any,
+          });
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : 'Unknown error';
           throw new BadRequestException(
-            `Financial link failed: Trade ${dto.referenceId} not found in active escrow`,
+            `Financial link failed: Trade ${dto.referenceId} update error: ${msg}`,
           );
         }
       }
@@ -97,8 +107,7 @@ export class DisputeService {
         where: { id: disputeId },
       });
 
-      if (!dispute)
-        throw new NotFoundException('Dispute record not found in ledger');
+      if (!dispute) throw new NotFoundException('Dispute record not found');
 
       const terminalStatuses = [
         DisputeStatus.RESOLVED_FAVOR_BUYER,
@@ -130,6 +139,17 @@ export class DisputeService {
 
       const updatedDispute = await manager.save(dispute);
 
+      // --- CRITICAL FIX FOR DB ENUM ERROR ---
+      // We use 'COMPLETED' instead of 'SETTLED' to align with your Postgres trades_status_enum
+      if (
+        dto.status === DisputeStatus.RESOLVED_FAVOR_SELLER ||
+        dto.status === DisputeStatus.RESOLVED_FAVOR_BUYER
+      ) {
+        await manager.update(Trade, dispute.referenceId, {
+          status: 'COMPLETED' as any,
+        });
+      }
+
       await this.auditService.log(
         {
           adminId,
@@ -154,27 +174,54 @@ export class DisputeService {
     });
 
     if (!escrow) {
-      console.warn(
-        `Financial bypass: No active escrow found for Trade ${referenceId}`,
+      throw new BadRequestException(
+        `Ledger Error: No active escrow record found for trade ${referenceId}`,
       );
-      return;
     }
 
-    switch (targetStatus) {
-      case DisputeStatus.RESOLVED_FAVOR_SELLER:
-        await this.escrowService.releaseEscrowByTradeId(referenceId, manager);
-        break;
+    try {
+      switch (targetStatus) {
+        case DisputeStatus.RESOLVED_FAVOR_SELLER:
+          await this.escrowService.releaseEscrowByTradeId(referenceId, manager);
+          break;
 
-      case DisputeStatus.RESOLVED_FAVOR_BUYER:
-        await this.escrowService.refundEscrowByTradeId(referenceId, manager);
-        break;
+        case DisputeStatus.RESOLVED_FAVOR_BUYER:
+          await this.escrowService.refundEscrowByTradeId(referenceId, manager);
 
-      case DisputeStatus.FROZEN:
-        await this.escrowService.freezeEscrow(referenceId, manager);
-        break;
+          const trade = await manager.getRepository(Trade).findOne({
+            where: { id: referenceId },
+            relations: ['buyer', 'seller', 'asset'],
+          });
 
-      default:
-        break;
+          if (!trade || !trade.buyer || !trade.seller || !trade.asset) {
+            throw new BadRequestException(
+              'Rollback failed: Trade relations missing.',
+            );
+          }
+
+          await this.ownershipService.removeUnits(
+            trade.buyer.id,
+            trade.asset.id,
+            trade.units,
+            manager,
+          );
+          await this.ownershipService.addUnits(
+            trade.seller,
+            trade.asset.id,
+            trade.units,
+            manager,
+          );
+          break;
+
+        case DisputeStatus.FROZEN:
+          await this.escrowService.freezeEscrow(referenceId, manager);
+          break;
+
+        default:
+          break;
+      }
+    } catch (error: any) {
+      throw new BadRequestException(`Settlement failed: ${error.message}`);
     }
   }
 }

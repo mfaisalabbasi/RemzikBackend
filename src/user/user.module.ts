@@ -9,6 +9,7 @@ import { UserController } from './user.controller';
 
 import { PartnerModule } from '../partner/partner.module';
 import { InvestorModule } from '../investor/investor.module';
+import { StorageModule } from '../storage/storage.module';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { InvestorModule } from '../investor/investor.module';
 
     PartnerModule,
     InvestorModule,
+    StorageModule,
 
     JwtModule.registerAsync({
       imports: [ConfigModule],

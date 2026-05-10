@@ -273,7 +273,7 @@ export class AdminService {
   async getPartnerDetail(id: string): Promise<any> {
     const partner = await this.partnerRepo.findOne({
       where: { id },
-      relations: ['user', 'assets'],
+      relations: ['user', 'user.kyc', 'assets'],
     });
 
     if (!partner) throw new NotFoundException('Partner not found');

@@ -4,8 +4,10 @@ import {
   Column,
   CreateDateColumn,
   UpdateDateColumn,
+  OneToOne, // Import this
 } from 'typeorm';
 import { UserRole } from './enums/user-role.enum';
+import { KycProfile } from '../kyc/kyc.entity'; // Adjust path as needed
 
 @Entity('users')
 export class User {
@@ -14,19 +16,26 @@ export class User {
 
   @Column({ unique: true })
   email: string;
-  @Column()
-  name: string; // MANDATORY (business rule)
-  @Column()
-  phone: string; // MANDATORY (business rule)
 
   @Column()
-  password: string; // hashed
+  name: string;
+
+  @Column()
+  phone: string;
+
+  @Column()
+  password: string;
 
   @Column({
     type: 'enum',
     enum: UserRole,
   })
   role: UserRole;
+
+  // ✅ ADD THIS RELATION
+  // This allows TypeORM to find the KYC record via the User
+  @OneToOne(() => KycProfile, (kyc) => kyc.user)
+  kyc: KycProfile;
 
   @Column({ default: false })
   isVerified: boolean;

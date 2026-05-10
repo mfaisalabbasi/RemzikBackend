@@ -19,7 +19,8 @@ import { CreatePartnerProfileDto } from './dto/create-partner-profile.dto';
 import { UpdatePartnerCompanyDto } from './dto/update-partner-only.dto';
 import { UpdatePartnerStatusDto } from './dto/update-admin-only.dto';
 import { FileInterceptor } from '@nestjs/platform-express';
-
+import { FileFieldsInterceptor } from '@nestjs/platform-express';
+import { UploadedFiles } from '@nestjs/common';
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('partners')
 export class PartnerController {
@@ -74,5 +75,37 @@ export class PartnerController {
   @UseInterceptors(FileInterceptor('file'))
   uploadAvatar(@Req() req, @UploadedFile() file: Express.Multer.File) {
     return this.partnerService.uploadAvatar(req.user.userId, file);
+  }
+
+  @Post('verify-business')
+  @Roles(UserRole.PARTNER)
+  @UseInterceptors(
+    FileFieldsInterceptor([
+      { name: 'crDocument', maxCount: 1 },
+      { name: 'taxDocument', maxCount: 1 },
+    ]),
+  )
+  async verifyBusiness(
+    @Req() req,
+    @UploadedFiles()
+    files: {
+      crDocument?: Express.Multer.File[];
+      taxDocument?: Express.Multer.File[];
+    },
+  ) {
+    return this.partnerService.uploadBusinessDocs(req.user.userId, files);
+  }
+
+  // ✅ NEW: Get verification status for the frontend component
+  @Get('business-profile')
+  @Roles(UserRole.PARTNER)
+  async getBusinessProfile(@Req() req) {
+    const profile = await this.partnerService.getMyProfile(req.user.userId);
+    return {
+      status: profile.status,
+      companyName: profile.companyName,
+      hasCr: !!profile.commercialRegistration,
+      hasTax: !!profile.amlPolicy, // mapping tax/aml policy as per your entity
+    };
   }
 }

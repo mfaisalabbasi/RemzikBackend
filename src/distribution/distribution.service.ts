@@ -4,18 +4,15 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, EntityManager, DataSource } from 'typeorm';
+import { Repository, EntityManager, DataSource, MoreThan } from 'typeorm';
 import { Distribution } from './distribution.entity';
 import { Ownership } from '../ownership/ownership.entity';
 import { Asset } from '../asset/asset.entity';
-import { AssetToken } from 'src/tokenization/entities/asset-token.entity';
 import { WalletService } from 'src/wallet/wallet.service';
 import { LedgerSource } from 'src/ledger/enums/ledger-source.enum';
 import { PayoutStatus } from './enums/payout-status.enum';
 import { Investment } from 'src/investment/investment.entity';
 import { LedgerService } from 'src/ledger/ledger.service';
-import { InvestmentStatus } from 'src/investment/enums/investment-status.enum';
-// src/distribution/distribution.service.ts
 
 @Injectable()
 export class DistributionService {
@@ -24,8 +21,8 @@ export class DistributionService {
     private readonly investmentRepo: Repository<Investment>,
     private readonly walletService: WalletService,
     private readonly ledgerService: LedgerService,
-    private readonly dataSource: DataSource, // For atomic transactions
-    @InjectRepository(Distribution) // Ensure this is injected
+    private readonly dataSource: DataSource,
+    @InjectRepository(Distribution)
     private readonly distributionRepo: Repository<Distribution>,
   ) {}
 
@@ -35,43 +32,67 @@ export class DistributionService {
     totalAmount: number,
   ) {
     return await this.dataSource.transaction(async (manager) => {
-      const investments = await manager.find(Investment, {
+      // 1. Fetch current owners of the asset, NOT initial investors
+      // This ensures that people who sold their tokens don't get paid.
+      const currentHolders = await manager.find(Ownership, {
         where: {
-          asset: { id: assetId, partner: { user: { id: partnerUserId } } },
-          status: InvestmentStatus.CONFIRMED,
+          assetId: assetId,
+          units: MoreThan(0), // Only those currently holding units
+          asset: { partner: { user: { id: partnerUserId } } },
         },
         relations: ['asset', 'investor', 'investor.user'],
       });
 
-      if (investments.length === 0)
-        throw new BadRequestException('No eligible investors found.');
+      if (currentHolders.length === 0) {
+        throw new BadRequestException(
+          'No current asset holders found for distribution.',
+        );
+      }
 
-      const totalAssetValue = Number(investments[0].asset.totalValue);
+      // 2. Calculate Total Units in circulation for this asset
+      // We calculate yield per unit based on the total supply currently held.
+      const totalUnitsCirculating = currentHolders.reduce(
+        (sum, holder) => sum + Number(holder.units),
+        0,
+      );
+
+      if (totalUnitsCirculating <= 0) {
+        throw new BadRequestException(
+          'Total circulating units must be greater than zero.',
+        );
+      }
+
       const batchId = `BATCH-${Date.now()}`;
 
-      const distributionPromises = investments.map(async (inv) => {
-        const userYield = totalAmount * (Number(inv.amount) / totalAssetValue);
+      // 3. Map distribution based on beneficial ownership
+      const distributionPromises = currentHolders.map(async (holder) => {
+        // Yield = (Total Yield / Total Units) * Units Owned by this Holder
+        const userYield =
+          totalAmount * (Number(holder.units) / totalUnitsCirculating);
 
-        // ✅ LOGIC CHANGE: Save as PENDING. Do NOT credit the wallet yet.
         const entry = manager.create(Distribution, {
-          asset: inv.asset,
-          investor: inv.investor,
+          asset: holder.asset,
+          investor: holder.investor,
           amount: userYield,
           period: new Date().toISOString(),
-          status: PayoutStatus.PENDING, // PayoutStatus from your Enum
+          status: PayoutStatus.PENDING,
           batchId: batchId,
         });
         return manager.save(entry);
       });
 
       await Promise.all(distributionPromises);
-      return { success: true, batchId, status: 'PENDING_APPROVAL' };
+      return {
+        success: true,
+        batchId,
+        status: 'PENDING_APPROVAL',
+        recipients: currentHolders.length,
+      };
     });
   }
 
   async approveDistributionBatch(batchId: string) {
     return await this.dataSource.transaction(async (manager) => {
-      // 1. Fetch all pending payouts for this batch
       const pendingPayouts = await manager.find(Distribution, {
         where: { batchId, status: PayoutStatus.PENDING },
         relations: ['investor', 'investor.user', 'asset'],
@@ -80,9 +101,7 @@ export class DistributionService {
       if (pendingPayouts.length === 0)
         throw new NotFoundException('No pending payouts found for this batch.');
 
-      // 2. Execute the actual money movement
       const payoutPromises = pendingPayouts.map(async (payout) => {
-        // ✅ ACTUAL CREDIT HAPPENS HERE
         await this.walletService.creditEarned(
           payout.investor.user.id,
           payout.amount,
@@ -91,7 +110,6 @@ export class DistributionService {
           manager,
         );
 
-        // 3. Update status to APPROVED
         payout.status = PayoutStatus.PAID;
         return manager.save(payout);
       });
@@ -101,9 +119,6 @@ export class DistributionService {
     });
   }
 
-  /**
-   * Groups pending distributions by batchId so the Admin sees "Events" rather than 1000s of rows
-   */
   async getGlobalPendingBatches() {
     return this.dataSource.query(`
     SELECT 
@@ -120,12 +135,7 @@ export class DistributionService {
   `);
   }
 
-  /**
-   * Deletes or marks a batch as REJECTED so the Partner can try again
-   */
   async rejectDistributionBatch(batchId: string, reason: string) {
-    // You can either delete them or update status to 'REJECTED'
-    // Deleting is often cleaner for "Draft" corrections
     return await this.distributionRepo.delete({
       batchId,
       status: PayoutStatus.PENDING,

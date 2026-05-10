@@ -23,7 +23,11 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   }
 
   async validate(payload: any) {
-    // Reverted: Keeping your structure so other functions aren't broken
-    return { userId: payload.sub, role: payload.role };
+    // We include isActive so the KycGuard can check the global kill-switch
+    return {
+      userId: payload.sub,
+      role: payload.role,
+      isActive: payload.isActive,
+    };
   }
 }

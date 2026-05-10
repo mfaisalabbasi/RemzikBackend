@@ -291,7 +291,7 @@ export class WalletService {
     buyerId: string,
     sellerId: string,
     amount: number,
-    manager: EntityManager, // Required for transactional integrity
+    manager: EntityManager,
   ): Promise<void> {
     // 1. Deduct from Buyer's LOCKED balance
     await manager.decrement(
@@ -302,13 +302,19 @@ export class WalletService {
     );
 
     // 2. Increment Seller's AVAILABLE balance
-    await manager.increment(Wallet, { userId: sellerId }, 'balance', amount);
+    // FIXED: Changed 'balance' to 'availableBalance' to match your entity property
+    await manager.increment(
+      Wallet,
+      { userId: sellerId },
+      'availableBalance',
+      amount,
+    );
 
     // 3. Validation check to ensure no negative balances
     const buyerWallet = await manager.findOne(Wallet, {
       where: { userId: buyerId },
     });
-    if (buyerWallet && buyerWallet.lockedBalance < 0) {
+    if (buyerWallet && Number(buyerWallet.lockedBalance) < 0) {
       throw new BadRequestException('Insufficient escrowed funds for transfer');
     }
   }

@@ -4,7 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, EntityManager } from 'typeorm';
 import { PartnerProfile } from './partner.entity';
 import { CreatePartnerProfileDto } from './dto/create-partner-profile.dto';
 import { UpdatePartnerCompanyDto } from './dto/update-partner-only.dto';
@@ -25,11 +25,17 @@ export class PartnerService {
     private readonly storageService: StorageService,
   ) {}
 
+  // ✅ UPDATED: Added manager for transaction support
   async createProfile(
     userId: string,
     dto: CreatePartnerProfileDto,
+    manager?: EntityManager,
   ): Promise<PartnerProfile> {
-    const existing = await this.partnerRepo.findOne({
+    const repo = manager
+      ? manager.getRepository(PartnerProfile)
+      : this.partnerRepo;
+
+    const existing = await repo.findOne({
       where: { user: { id: userId } },
       relations: ['user'],
     });
@@ -38,13 +44,13 @@ export class PartnerService {
       throw new BadRequestException('Partner profile already exists');
     }
 
-    const profile = this.partnerRepo.create({
+    const profile = repo.create({
       companyName: dto.companyName,
       status: PartnerStatus.PENDING,
       user: { id: userId },
     });
 
-    return this.partnerRepo.save(profile);
+    return repo.save(profile);
   }
 
   async getMyProfile(userId: string): Promise<PartnerProfile> {
@@ -106,7 +112,6 @@ export class PartnerService {
     await this.partnerRepo.save(partner);
   }
 
-  // ✅ GET PROFILE: Returns only existing fields
   async getProfile(userId: string) {
     const profile = await this.partnerRepo.findOne({
       where: { user: { id: userId } },
@@ -129,7 +134,6 @@ export class PartnerService {
     };
   }
 
-  // ✅ UPDATE PROFILE: Fixed to avoid non-existent fields
   async updateProfile(userId: string, body: any) {
     const profile = await this.partnerRepo.findOne({
       where: { user: { id: userId } },
@@ -140,16 +144,12 @@ export class PartnerService {
       throw new NotFoundException('Profile not found');
     }
 
-    // Update partner-specific fields
     if (body.address) profile.address = body.address;
     if (body.avatar) profile.avatar = body.avatar;
-
-    // Update user-specific fields
     if (body.name) profile.user.name = body.name;
 
     await this.partnerRepo.save(profile);
 
-    // Save the user separately to ensure name change is persisted
     if (body.name) {
       await this.partnerRepo.manager.save(profile.user);
     }
@@ -157,7 +157,6 @@ export class PartnerService {
     return { message: 'Profile updated successfully' };
   }
 
-  // ✅ STATS: Clean logic for Total Assets and Funding
   async getProfileStats(userId: string) {
     const profile = await this.partnerRepo.findOne({
       where: { user: { id: userId } },
@@ -177,7 +176,6 @@ export class PartnerService {
       0,
     );
 
-    // Placeholder for investor logic
     const totalInvestors =
       totalFunding > 0 ? Math.floor(totalFunding / 10000) : 0;
 
@@ -188,7 +186,6 @@ export class PartnerService {
     };
   }
 
-  // ✅ AVATAR UPLOAD: Returns key 'url' for frontend integration
   async uploadAvatar(userId: string, file: Express.Multer.File) {
     const profile = await this.partnerRepo.findOne({
       where: { user: { id: userId } },
@@ -230,9 +227,52 @@ export class PartnerService {
   async findAllPending() {
     return this.partnerRepo.find({
       where: {
-        // 2. Use the Enum reference
         status: PartnerStatus.PENDING,
       },
     });
+  }
+
+  async uploadBusinessDocs(userId: string, files: any) {
+    const profile = await this.partnerRepo.findOne({
+      where: { user: { id: userId } },
+    });
+
+    if (!profile) throw new NotFoundException('Partner profile not found');
+
+    // Prevent re-upload if already approved
+    if (profile.status === PartnerStatus.APPROVED) {
+      throw new BadRequestException('Profile already approved');
+    }
+
+    let crUrl = profile.commercialRegistration;
+    let taxUrl = profile.amlPolicy;
+
+    try {
+      if (files?.crDocument?.[0]) {
+        crUrl = await this.storageService.uploadFile(
+          files.crDocument[0],
+          'partners/cr',
+        );
+      }
+      if (files?.taxDocument?.[0]) {
+        taxUrl = await this.storageService.uploadFile(
+          files.taxDocument[0],
+          'partners/tax',
+        );
+      }
+    } catch (error) {
+      throw new BadRequestException('Failed to upload documents to S3');
+    }
+
+    profile.commercialRegistration = crUrl;
+    profile.amlPolicy = taxUrl;
+    profile.status = PartnerStatus.PENDING; // Reset to pending for admin review
+
+    await this.partnerRepo.save(profile);
+
+    return {
+      message: 'Business documents uploaded successfully',
+      status: profile.status,
+    };
   }
 }

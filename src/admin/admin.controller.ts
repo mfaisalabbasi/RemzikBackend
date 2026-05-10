@@ -23,6 +23,7 @@ import { LiquidityStats } from './interfaces/liquidity-stats.interface';
 import { BroadcastService } from '../broadcast/broadcast.service';
 import { CreateBroadcastDto } from '../broadcast/dto/create-broadcast.dto';
 import { DistributionService } from 'src/distribution/distribution.service';
+import { AdminAction } from 'src/audit/enums/audit-action.enum';
 
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('admin')
@@ -281,5 +282,28 @@ export class AdminController {
   @Roles(UserRole.ADMIN)
   async getAssetDistributions(@Param('id') id: string) {
     return this.adminService.getAssetDistributions(id);
+  }
+
+  @Patch('kyc/:id/status')
+  @Roles(UserRole.ADMIN)
+  async updateKycStatus(
+    @Param('id') id: string,
+    @Body('status') status: string,
+    @Body('reason') reason: string,
+    @Req() req,
+  ) {
+    // Map frontend string "APPROVED" to your enum "APPROVE" if they differ
+    // If your Enum already matches, you can pass status directly.
+    const action =
+      status === 'APPROVED' ? AdminAction.APPROVE : AdminAction.REJECT;
+
+    return await this.adminService.handleKycAction(
+      {
+        targetId: id,
+        action: action,
+        reason: reason || '',
+      },
+      req.user.userId,
+    );
   }
 }

@@ -4,7 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, EntityManager } from 'typeorm';
 import { InvestorProfile } from './investor.entity';
 import { User } from '../user/user.entity';
 import { Ownership } from '../ownership/ownership.entity';
@@ -29,7 +29,6 @@ export class InvestorService {
     private readonly tradeService: TradeService,
   ) {}
 
-  // ✅ NEW: Bridging the Ownership table to the Market UI
   async getSecondaryMarketPositions(userId: string) {
     const profile = await this.investorRepo.findOne({
       where: { user: { id: userId } },
@@ -50,19 +49,29 @@ export class InvestorService {
         (h.asset as any).image ||
         (h.asset as any).imageUrl ||
         '/slider/real-estate.jpg',
-      quantity: Number(h.units), // Maps to your 'units' column in ownership.entity
+      quantity: Number(h.units),
       avgPrice: 0,
       pnl: 0,
     }));
   }
 
-  async createProfile(userId: string): Promise<InvestorProfile> {
-    const existing = await this.investorRepo.findOne({
+  // ✅ UPDATED: Added manager for transaction support
+  async createProfile(
+    userId: string,
+    manager?: EntityManager,
+  ): Promise<InvestorProfile> {
+    const repo = manager
+      ? manager.getRepository(InvestorProfile)
+      : this.investorRepo;
+
+    const existing = await repo.findOne({
       where: { user: { id: userId } },
     });
+
     if (existing) throw new BadRequestException('Profile exists');
-    const profile = this.investorRepo.create({ user: { id: userId } as User });
-    return this.investorRepo.save(profile);
+
+    const profile = repo.create({ user: { id: userId } as User });
+    return repo.save(profile);
   }
 
   async getMyProfile(userId: string): Promise<InvestorProfile> {
@@ -111,44 +120,36 @@ export class InvestorService {
     return { message: 'Profile updated' };
   }
 
-async getDashboard(userId: string) {
+  async getDashboard(userId: string) {
     const wallet = await this.walletService.getWallet(userId);
-    
-    // 1. Fetch Primary Market Investments
     const investments = await this.investmentService.getMyInvestments(userId);
-    
-    // 2. Fetch Secondary Market Trades (Both as Buyer and Seller)
-    // We assume you have a method in TradeService to get user trades
     const trades = await this.tradeService.getUserTrades(userId);
 
     const confirmed = investments.filter(
       (inv) => inv.status === InvestmentStatus.CONFIRMED,
     );
 
-    // 3. Map Primary Investments to Activity Format
     const investmentActivity = investments.map((inv) => ({
       title: `Investment: ${inv.asset?.title || 'Asset'}`,
       date: inv.createdAt,
-      amount: -Number(inv.amount), // Outflow
+      amount: -Number(inv.amount),
       status: inv.status,
-      type: 'PRIMARY'
+      type: 'PRIMARY',
     }));
 
-    // 4. Map Secondary Trades to Activity Format
     const tradeActivity = trades.map((trade) => {
       const isBuyer = trade.buyer.user.id === userId;
       return {
-        title: isBuyer 
-          ? `Bought: ${trade.asset?.title || 'Shares'}` 
+        title: isBuyer
+          ? `Bought: ${trade.asset?.title || 'Shares'}`
           : `Sold: ${trade.asset?.title || 'Shares'}`,
         date: trade.executedAt || trade.createdAt,
         amount: isBuyer ? -Number(trade.totalPrice) : Number(trade.totalPrice),
         status: trade.status,
-        type: 'SECONDARY'
+        type: 'SECONDARY',
       };
     });
 
-    // 5. Merge and Sort by Date (Descending)
     const allActivity = [...investmentActivity, ...tradeActivity]
       .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
       .slice(0, 5);
