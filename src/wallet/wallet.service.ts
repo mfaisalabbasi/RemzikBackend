@@ -19,10 +19,6 @@ export class WalletService {
     return manager ? manager.getRepository(Wallet) : this.walletRepo;
   }
 
-  /**
-   * ✅ SOURCE OF TRUTH: Direct DB Read
-   * Fast, accurate, and avoids floating point errors from ledger loops.
-   */
   async getWallet(userId: string): Promise<WalletResponseDto> {
     const wallet = await this.getOrCreateWallet(userId);
 
@@ -40,9 +36,6 @@ export class WalletService {
     return Number(wallet.availableBalance);
   }
 
-  /**
-   * ATOMIC TOP-UP: Synchronizes Balance and Ledger
-   */
   async topUpDummy(userId: string, amount: number, manager?: EntityManager) {
     const work = async (em: EntityManager) => {
       await this.creditAvailable(userId, amount, em);
@@ -80,9 +73,6 @@ export class WalletService {
     return wallet;
   }
 
-  /**
-   * ✅ ATOMIC INCREMENT: Prevents race conditions during simultaneous deposits.
-   */
   async creditAvailable(
     userId: string,
     amount: number,
@@ -121,9 +111,6 @@ export class WalletService {
       .execute();
   }
 
-  /**
-   * Handles Yield/Profit tracking for the "Empire" dashboard
-   */
   async creditEarned(
     userId: string,
     amount: number,
@@ -158,7 +145,6 @@ export class WalletService {
     manager?: EntityManager,
   ): Promise<void> {
     const repo = this.getRepo(manager);
-    // Reuse debitAvailable to check for sufficient funds first
     await this.debitAvailable(userId, amount, manager);
 
     await repo
@@ -186,10 +172,6 @@ export class WalletService {
       .execute();
   }
 
-  /**
-   * ✅ COMPATIBILITY FIX: Required by WithdrawalService
-   * Removes funds from the "Pending/Locked" state when a bank transfer is complete.
-   */
   async debitLocked(
     userId: string,
     amount: number,
@@ -197,7 +179,6 @@ export class WalletService {
   ): Promise<void> {
     const repo = this.getRepo(manager);
     const wallet = await this.getOrCreateWallet(userId, manager);
-
     const currentLocked = Number(wallet.pendingBalance || 0);
 
     if (currentLocked < amount) {
@@ -214,9 +195,6 @@ export class WalletService {
       .execute();
   }
 
-  /**
-   * Payout Lifecycle: Available -> Pending -> (Success/Fail)
-   */
   async requestPayout(
     userId: string,
     amount: number,
@@ -284,16 +262,46 @@ export class WalletService {
   }
 
   /**
-   * Moves funds from Buyer's LOCKED balance to Seller's AVAILABLE balance.
-   * Used for successful Escrow releases.
+   * ✅ NEW: SYSTEM-WIDE ATOMIC TRANSFER
+   * Moves money from one user to another and creates two ledger entries.
    */
+  async transfer(
+    fromUserId: string,
+    toUserId: string,
+    amount: number,
+    source: LedgerSource,
+    note: string,
+    manager: EntityManager,
+  ): Promise<void> {
+    // 1. Debit Source
+    await this.debitAvailable(fromUserId, amount, manager);
+    await this.ledgerService.createEntry(
+      fromUserId,
+      amount,
+      LedgerType.DEBIT,
+      source,
+      note,
+      manager,
+    );
+
+    // 2. Credit Destination
+    await this.creditAvailable(toUserId, amount, manager);
+    await this.ledgerService.createEntry(
+      toUserId,
+      amount,
+      LedgerType.CREDIT,
+      source,
+      note,
+      manager,
+    );
+  }
+
   async transferLockedToAvailable(
     buyerId: string,
     sellerId: string,
     amount: number,
     manager: EntityManager,
   ): Promise<void> {
-    // 1. Deduct from Buyer's LOCKED balance
     await manager.decrement(
       Wallet,
       { userId: buyerId },
@@ -301,8 +309,6 @@ export class WalletService {
       amount,
     );
 
-    // 2. Increment Seller's AVAILABLE balance
-    // FIXED: Changed 'balance' to 'availableBalance' to match your entity property
     await manager.increment(
       Wallet,
       { userId: sellerId },
@@ -310,7 +316,6 @@ export class WalletService {
       amount,
     );
 
-    // 3. Validation check to ensure no negative balances
     const buyerWallet = await manager.findOne(Wallet, {
       where: { userId: buyerId },
     });

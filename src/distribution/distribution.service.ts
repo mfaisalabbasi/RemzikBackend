@@ -7,135 +7,273 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, EntityManager, DataSource, MoreThan } from 'typeorm';
 import { Distribution } from './distribution.entity';
 import { Ownership } from '../ownership/ownership.entity';
-import { Asset } from '../asset/asset.entity';
 import { WalletService } from 'src/wallet/wallet.service';
 import { LedgerSource } from 'src/ledger/enums/ledger-source.enum';
 import { PayoutStatus } from './enums/payout-status.enum';
 import { Investment } from 'src/investment/investment.entity';
-import { LedgerService } from 'src/ledger/ledger.service';
+import { AssetIncome } from 'src/asset/asset-income.entity';
 
 @Injectable()
 export class DistributionService {
+  /**
+   * CONFIG: Remzik Platform Fee (1%)
+   * In a trillion-dollar empire, every transaction fuels the ecosystem.
+   */
+  private readonly PLATFORM_FEE_PERCENT = 0.01;
+
+  /**
+   * CONFIG: The central treasury account where platform fees are collected.
+   */
+  private readonly ADMIN_WALLET_USER_ID = 'SYSTEM_REVENUE_ACCOUNT';
+
   constructor(
     @InjectRepository(Investment)
     private readonly investmentRepo: Repository<Investment>,
-    private readonly walletService: WalletService,
-    private readonly ledgerService: LedgerService,
-    private readonly dataSource: DataSource,
     @InjectRepository(Distribution)
     private readonly distributionRepo: Repository<Distribution>,
+    private readonly walletService: WalletService,
+    private readonly dataSource: DataSource,
   ) {}
 
+  /**
+   * ✅ THE FINTECH ENTRY POINT
+   * Partners trigger payouts by referencing a specific Income Report.
+   * This ensures every payout is backed by real-world asset performance.
+   */
+  async triggerDistributionFromIncome(incomeId: string, partnerUserId: string) {
+    return await this.dataSource.transaction(async (manager) => {
+      // 1. Fetch and validate the specific income record
+      const income = await manager.findOne(AssetIncome, {
+        where: {
+          id: incomeId,
+          asset: { partner: { user: { id: partnerUserId } } },
+        },
+        relations: ['asset', 'asset.partner', 'asset.partner.user'],
+      });
+
+      if (!income) {
+        throw new NotFoundException(
+          'Income record not found or unauthorized access.',
+        );
+      }
+
+      if (income.isDistributed) {
+        throw new BadRequestException(
+          'This revenue has already been distributed to investors.',
+        );
+      }
+
+      // 2. Lock the income record to prevent double-spending/double-payouts
+      income.isDistributed = true;
+      await manager.save(income);
+
+      // 3. Chain to the yield distribution logic
+      // We pass the manager to ensure this all happens in ONE atomic transaction
+      return this.triggerYieldDistribution(
+        partnerUserId,
+        income.asset.id,
+        Number(income.netAmount),
+        manager,
+      );
+    });
+  }
+
+  /**
+   * CORE DISTRIBUTION LOGIC
+   * Calculates pro-rata shares for all beneficial owners.
+   */
   async triggerYieldDistribution(
     partnerUserId: string,
     assetId: string,
     totalAmount: number,
+    existingManager?: EntityManager,
   ) {
-    return await this.dataSource.transaction(async (manager) => {
-      // 1. Fetch current owners of the asset, NOT initial investors
-      // This ensures that people who sold their tokens don't get paid.
+    const work = async (manager: EntityManager) => {
+      // 1. SOLVENCY GUARD: Verify Partner has the cash available in their wallet
+      const partnerBalance =
+        await this.walletService.getAvailableBalance(partnerUserId);
+      if (partnerBalance < totalAmount) {
+        throw new BadRequestException(
+          `Insufficient wallet balance. Needed: SAR ${totalAmount}, Available: SAR ${partnerBalance}.`,
+        );
+      }
+
+      // 2. SNAPSHOT OWNERSHIP: Find everyone holding units at this exact moment
       const currentHolders = await manager.find(Ownership, {
         where: {
           assetId: assetId,
-          units: MoreThan(0), // Only those currently holding units
-          asset: { partner: { user: { id: partnerUserId } } },
+          units: MoreThan(0),
         },
         relations: ['asset', 'investor', 'investor.user'],
       });
 
       if (currentHolders.length === 0) {
         throw new BadRequestException(
-          'No current asset holders found for distribution.',
+          'No eligible investors found for this asset.',
         );
       }
 
-      // 2. Calculate Total Units in circulation for this asset
-      // We calculate yield per unit based on the total supply currently held.
       const totalUnitsCirculating = currentHolders.reduce(
-        (sum, holder) => sum + Number(holder.units),
+        (sum, h) => sum + Number(h.units),
         0,
       );
 
-      if (totalUnitsCirculating <= 0) {
-        throw new BadRequestException(
-          'Total circulating units must be greater than zero.',
-        );
-      }
+      const batchId = `BATCH-${Date.now()}-${assetId.substring(0, 4)}`;
 
-      const batchId = `BATCH-${Date.now()}`;
-
-      // 3. Map distribution based on beneficial ownership
+      // 3. CREATE PENDING DISTRIBUTION RECORDS
+      // These will stay PENDING until the Admin approves the batch
       const distributionPromises = currentHolders.map(async (holder) => {
-        // Yield = (Total Yield / Total Units) * Units Owned by this Holder
-        const userYield =
-          totalAmount * (Number(holder.units) / totalUnitsCirculating);
+        const userShareOfUnits = Number(holder.units) / totalUnitsCirculating;
+        const grossUserYield = totalAmount * userShareOfUnits;
 
-        const entry = manager.create(Distribution, {
-          asset: holder.asset,
-          investor: holder.investor,
-          amount: userYield,
-          period: new Date().toISOString(),
-          status: PayoutStatus.PENDING,
-          batchId: batchId,
-        });
-        return manager.save(entry);
+        return manager.save(
+          manager.create(Distribution, {
+            asset: holder.asset,
+            investor: holder.investor,
+            amount: grossUserYield, // Gross amount before fees
+            period: new Date().toISOString(),
+            status: PayoutStatus.PENDING,
+            batchId: batchId,
+          }),
+        );
       });
 
       await Promise.all(distributionPromises);
+
       return {
         success: true,
         batchId,
-        status: 'PENDING_APPROVAL',
-        recipients: currentHolders.length,
+        status: 'PENDING_ADMIN_APPROVAL',
+        totalGrossAmount: totalAmount,
+        investorCount: currentHolders.length,
       };
-    });
+    };
+
+    return existingManager
+      ? work(existingManager)
+      : await this.dataSource.transaction(work);
   }
 
+  /**
+   * THE SETTLEMENT ENGINE
+   * Once Admin approves, money moves across the ecosystem.
+   */
   async approveDistributionBatch(batchId: string) {
     return await this.dataSource.transaction(async (manager) => {
       const pendingPayouts = await manager.find(Distribution, {
         where: { batchId, status: PayoutStatus.PENDING },
-        relations: ['investor', 'investor.user', 'asset'],
+        relations: [
+          'investor',
+          'investor.user',
+          'asset',
+          'asset.partner',
+          'asset.partner.user',
+        ],
       });
 
-      if (pendingPayouts.length === 0)
-        throw new NotFoundException('No pending payouts found for this batch.');
+      if (pendingPayouts.length === 0) {
+        throw new NotFoundException('Batch not found or already processed.');
+      }
 
+      const partnerUserId = pendingPayouts[0].asset.partner.user.id;
+      const assetTitle = pendingPayouts[0].asset.title;
+
+      // 1. CALCULATE TOTALS & FEES
+      const totalGrossAmount = pendingPayouts.reduce(
+        (sum, p) => sum + Number(p.amount),
+        0,
+      );
+      const platformFee = totalGrossAmount * this.PLATFORM_FEE_PERCENT;
+      const totalNetToInvestors = totalGrossAmount - platformFee;
+
+      // 2. DEBIT THE PARTNER (Source of Funds)
+      await this.walletService.debitAvailable(
+        partnerUserId,
+        totalGrossAmount,
+        manager,
+      );
+
+      // Log the debit in the ledger
+      await this.walletService.credit(
+        partnerUserId,
+        0, // Transaction record
+        LedgerSource.DISTRIBUTION,
+        `DEBIT: Yield Payout for ${assetTitle}`,
+        manager,
+      );
+
+      // 3. CREDIT THE REMZIK TREASURY (Platform Revenue)
+      if (platformFee > 0) {
+        await this.walletService.credit(
+          this.ADMIN_WALLET_USER_ID,
+          platformFee,
+          LedgerSource.DISTRIBUTION,
+          `REVENUE: 1% Fee from ${assetTitle} Distribution`,
+          manager,
+        );
+      }
+
+      // 4. CREDIT INVESTORS (Net Payouts)
       const payoutPromises = pendingPayouts.map(async (payout) => {
+        const individualNetYield =
+          Number(payout.amount) * (1 - this.PLATFORM_FEE_PERCENT);
+
         await this.walletService.creditEarned(
           payout.investor.user.id,
-          payout.amount,
+          individualNetYield,
           LedgerSource.DISTRIBUTION,
-          `Yield Approved: ${payout.asset.title}`,
+          `CREDIT: Yield from ${assetTitle} (Net of Platform Fee)`,
           manager,
         );
 
+        // Update record to final state
         payout.status = PayoutStatus.PAID;
+        payout.amount = individualNetYield;
         return manager.save(payout);
       });
 
       await Promise.all(payoutPromises);
-      return { success: true, message: 'Batch processed successfully' };
+
+      return {
+        success: true,
+        summary: {
+          totalGross: totalGrossAmount,
+          remzikRevenue: platformFee,
+          netInvestorPayout: totalNetToInvestors,
+          batchId: batchId,
+        },
+      };
     });
   }
 
+  /**
+   * ADMIN DASHBOARD QUERY
+   * Fetches all batches waiting for manual verification.
+   */
   async getGlobalPendingBatches() {
     return this.dataSource.query(`
-    SELECT 
-      "batchId", 
-      "assetId", 
-      "period",
-      COUNT(id) as "investorCount", 
-      SUM(amount) as "totalAmount",
-      MIN("createdAt") as "requestedAt"
-    FROM distributions
-    WHERE status = 'PENDING'
-    GROUP BY "batchId", "assetId", "period"
-    ORDER BY "requestedAt" ASC
-  `);
+      SELECT 
+        d."batchId", 
+        a."title" as "assetName",
+        d."period",
+        COUNT(d.id) as "investorCount", 
+        SUM(d.amount) as "totalGrossAmount",
+        MIN(d."createdAt") as "requestedAt"
+      FROM distributions d
+      JOIN assets a ON d."assetId" = a.id
+      WHERE d.status = 'PENDING'
+      GROUP BY d."batchId", a."title", d."period"
+      ORDER BY "requestedAt" ASC
+    `);
   }
 
+  /**
+   * REJECTION LOGIC
+   * If the Admin sees an error, they can wipe the batch and let the partner try again.
+   */
   async rejectDistributionBatch(batchId: string, reason: string) {
+    // Note: In a production 'Empire', you'd likely update the status to 'REJECTED'
+    // and log the 'reason' instead of deleting.
     return await this.distributionRepo.delete({
       batchId,
       status: PayoutStatus.PENDING,

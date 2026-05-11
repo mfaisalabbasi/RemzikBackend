@@ -1,4 +1,3 @@
-// src/distribution/distribution.controller.ts
 import {
   Controller,
   Post,
@@ -9,18 +8,35 @@ import {
 } from '@nestjs/common';
 import { DistributionService } from './distribution.service';
 import { JwtAuthGuard } from 'src/auth/guards/jwt.gaurd';
-@Controller('partner/assets')
+@Controller('distributions')
 export class DistributionController {
   constructor(private readonly distributionService: DistributionService) {}
 
+  /**
+   * ✅ NEW ENDPOINT: Triggered from Income Report
+   * Frontend: poster(`/distributions/trigger-from-income`, { incomeId })
+   */
   @UseGuards(JwtAuthGuard)
-  @Post(':id/distribute')
+  @Post('trigger-from-income')
+  async triggerFromIncome(@Body('incomeId') incomeId: string, @Request() req) {
+    const partnerUserId = req.user.id;
+    return await this.distributionService.triggerDistributionFromIncome(
+      incomeId,
+      partnerUserId,
+    );
+  }
+
+  /**
+   * LEGACY/MANUAL ENDPOINT
+   * Frontend: poster(`/partner/assets/${assetId}/distribute`, { amount })
+   */
+  @UseGuards(JwtAuthGuard)
+  @Post('partner/assets/:id/distribute')
   async distribute(
     @Param('id') assetId: string,
     @Body('amount') amount: number,
     @Request() req,
   ) {
-    // req.user.id is the Partner's User ID from the JWT
     return await this.distributionService.triggerYieldDistribution(
       req.user.id,
       assetId,

@@ -6,12 +6,14 @@ import {
   CreateDateColumn,
   UpdateDateColumn,
   OneToOne,
+  OneToMany,
 } from 'typeorm';
 
 import { PartnerProfile } from 'src/partner/partner.entity';
 import { AssetType } from './enums/asset-type.enum';
 import { AssetStatus } from './enums/asset-status.enum';
 import { AssetToken } from 'src/tokenization/entities/asset-token.entity';
+import { AssetIncome } from './asset-income.entity';
 
 @Entity('assets')
 export class Asset {
@@ -133,9 +135,9 @@ export class Asset {
   /**
    * Token supply for fractionalization
    */
-
   @OneToOne(() => AssetToken, (token) => token.asset)
   token?: AssetToken;
+
   @Column('bigint', { nullable: true })
   tokenSupply!: number | null;
 
@@ -153,4 +155,11 @@ export class Asset {
 
   @UpdateDateColumn()
   updatedAt!: Date;
+
+  /**
+   * ✅ NEW: Relationship to Asset Performance Reports
+   * This enables partner revenue reporting and automated distribution history.
+   */
+  @OneToMany(() => AssetIncome, (income) => income.asset)
+  incomes!: AssetIncome[];
 }

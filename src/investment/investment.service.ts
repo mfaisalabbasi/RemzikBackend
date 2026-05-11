@@ -33,7 +33,6 @@ export class InvestmentService {
     userId: string,
     dto: CreateInvestmentDto,
   ): Promise<Investment> {
-    // 1. Pre-check balance before opening transaction
     const availableBalance =
       await this.walletService.getAvailableBalance(userId);
     if (availableBalance < dto.amount) {
@@ -51,7 +50,6 @@ export class InvestmentService {
         if (!investor)
           throw new BadRequestException('Investor profile not found');
 
-        // 2. Fetch token with a write lock to prevent race conditions
         const token = await manager
           .getRepository(AssetToken)
           .createQueryBuilder('token')
@@ -61,10 +59,16 @@ export class InvestmentService {
 
         if (!token) throw new BadRequestException('Asset is not tokenized');
 
+        // Load Asset with Partner relation to identify the beneficiary
         const asset = await manager.findOne(Asset, {
           where: { id: dto.assetId },
+          relations: ['partner', 'partner.user'],
         });
         if (!asset) throw new BadRequestException('Asset not found');
+        if (!asset.partner?.user?.id)
+          throw new BadRequestException(
+            'Asset partner beneficiary not defined',
+          );
 
         const sharesToBuy = Number(dto.amount) / Number(token.sharePrice);
 
@@ -75,28 +79,25 @@ export class InvestmentService {
         }
 
         /**
-         * ✅ FIX: Single Settlement Call
-         * Passing a negative amount to .credit() handles both the balance
-         * subtraction and the Ledger entry in one atomic operation.
+         * ✅ FIX: DYNAMIC CAPITAL FLOW
+         * Moves money from the Investor's Available balance to the Partner's Available balance.
          */
-        await this.walletService.credit(
+        await this.walletService.transfer(
           userId,
-          -Math.abs(dto.amount), // Force negative to ensure debit
+          asset.partner.user.id,
+          dto.amount,
           LedgerSource.ASSET_INVESTMENT,
-          `Investment in ${asset.title} (Primary Market)`,
+          `Investment from ${investor.user.id} for asset ${asset.title}`,
           manager,
         );
 
-        // 3. Update Available Supply
         token.availableShares = Number(token.availableShares) - sharesToBuy;
         await manager.save(token);
 
-        // 4. Update Asset Aggregates
         asset.funded = Number(asset.funded) + Number(dto.amount);
         asset.investors = (asset.investors || 0) + 1;
         await manager.save(asset);
 
-        // 5. Create Investment Record
         const investment = manager.create(Investment, {
           investor,
           asset,
@@ -105,7 +106,6 @@ export class InvestmentService {
         });
         const result = await manager.save(investment);
 
-        // 6. Record Ownership
         await this.ownershipService.addShares(
           investor,
           asset,
@@ -117,7 +117,6 @@ export class InvestmentService {
       },
     );
 
-    // Trigger Notification (Post-transaction)
     await this.notificationOrchestrator.buildAndSave(
       userId,
       'investment.created',
@@ -133,7 +132,13 @@ export class InvestmentService {
   async confirmInvestment(id: string): Promise<Investment> {
     const investment = await this.investmentRepo.findOne({
       where: { id },
-      relations: ['investor', 'investor.user', 'asset'],
+      relations: [
+        'investor',
+        'investor.user',
+        'asset',
+        'asset.partner',
+        'asset.partner.user',
+      ],
     });
 
     if (!investment) throw new NotFoundException('Investment record not found');
@@ -151,6 +156,16 @@ export class InvestmentService {
           throw new BadRequestException('Token metadata missing for asset');
 
         const shares = investment.amount / Number(token.sharePrice);
+
+        // ✅ DYNAMIC FLOW: Release capital to Partner
+        await this.walletService.transfer(
+          investment.investor.user.id,
+          investment.asset.partner.user.id,
+          investment.amount,
+          LedgerSource.ASSET_INVESTMENT,
+          `Funding Released: ${investment.asset.title}`,
+          manager,
+        );
 
         token.availableShares = Number(token.availableShares) - shares;
         await manager.save(token);
@@ -187,8 +202,6 @@ export class InvestmentService {
 
     return confirmedInvestment;
   }
-
-  // --- HELPER METHODS ---
 
   async getMyInvestments(userId: string): Promise<Investment[]> {
     return this.investmentRepo.find({

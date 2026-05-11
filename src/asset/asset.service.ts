@@ -764,4 +764,11 @@ export class AssetService {
       awaitingTokenization,
     };
   }
+
+  async findPartnerAssetsForDistribution(userId: string) {
+    return this.assetRepo.find({
+      where: { partner: { user: { id: userId } } },
+      relations: ['investments', 'partner'], // Ensure relations match what the UI needs
+    });
+  }
 }
