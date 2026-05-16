@@ -7,6 +7,7 @@ import {
   UpdateDateColumn,
   OneToOne,
   OneToMany,
+  JoinColumn,
 } from 'typeorm';
 
 import { PartnerProfile } from 'src/partner/partner.entity';
@@ -22,7 +23,6 @@ export class Asset {
 
   /**
    * Partner who submitted the asset
-   * Merged: Added (partner) => partner.assets to enable TypeORM joins
    */
   @ManyToOne(() => PartnerProfile, (partner) => partner.assets, {
     nullable: false,
@@ -51,10 +51,31 @@ export class Asset {
   description!: string;
 
   /**
-   * Asset valuation
+   * Asset valuation (Currency: Scale 2)
    */
-  @Column('decimal', { precision: 15, scale: 2 })
+  @Column('decimal', {
+    precision: 15,
+    scale: 2,
+    transformer: {
+      to: (v: number) => v,
+      from: (v: string) => parseFloat(v),
+    },
+  })
   totalValue!: number;
+
+  /**
+   * ✅ NEW: Fixed price per individual token (Currency: Scale 2)
+   */
+  @Column('decimal', {
+    precision: 15,
+    scale: 2,
+    default: 0,
+    transformer: {
+      to: (v: number) => v,
+      from: (v: string) => parseFloat(v),
+    },
+  })
+  unitPrice!: number;
 
   /**
    * Property gallery images
@@ -109,6 +130,10 @@ export class Asset {
     precision: 5,
     scale: 2,
     nullable: true,
+    transformer: {
+      to: (v: number) => v,
+      from: (v: string) => parseFloat(v),
+    },
   })
   expectedYield!: number | null;
 
@@ -119,6 +144,10 @@ export class Asset {
     precision: 15,
     scale: 2,
     nullable: true,
+    transformer: {
+      to: (v: number) => v,
+      from: (v: string) => parseFloat(v),
+    },
   })
   rentalIncome!: number | null;
 
@@ -129,6 +158,10 @@ export class Asset {
     precision: 10,
     scale: 2,
     nullable: true,
+    transformer: {
+      to: (v: number) => v,
+      from: (v: string) => parseFloat(v),
+    },
   })
   assetSize!: number | null;
 
@@ -138,10 +171,34 @@ export class Asset {
   @OneToOne(() => AssetToken, (token) => token.asset)
   token?: AssetToken;
 
-  @Column('bigint', { nullable: true })
+  /**
+   * ✅ FIX: Precision Update
+   * Changed from bigint to decimal(20,4) to allow fractional share math
+   * and avoid JavaScript integer overflow on multi-billion dollar supplies.
+   */
+  @Column('decimal', {
+    precision: 20,
+    scale: 4,
+    nullable: true,
+    transformer: {
+      to: (v: number) => v,
+      from: (v: string) => (v ? parseFloat(v) : null),
+    },
+  })
   tokenSupply!: number | null;
 
-  @Column('decimal', { precision: 15, scale: 2, default: 0 })
+  /**
+   * Total money raised (Currency: Scale 2)
+   */
+  @Column('decimal', {
+    precision: 15,
+    scale: 2,
+    default: 0,
+    transformer: {
+      to: (v: number) => v,
+      from: (v: string) => parseFloat(v),
+    },
+  })
   funded!: number;
 
   /**
@@ -157,8 +214,7 @@ export class Asset {
   updatedAt!: Date;
 
   /**
-   * ✅ NEW: Relationship to Asset Performance Reports
-   * This enables partner revenue reporting and automated distribution history.
+   * Relationship to Asset Performance Reports
    */
   @OneToMany(() => AssetIncome, (income) => income.asset)
   incomes!: AssetIncome[];

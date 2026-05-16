@@ -13,7 +13,6 @@ export class AuthService {
     const user = await this.userService.validateUser(email, password);
     if (!user) throw new UnauthorizedException('Invalid credentials');
 
-    // ✅ FIX: Explicitly include userId in payload to match Guard/Controller expectations
     const payload = {
       userId: user.id,
       sub: user.id,
@@ -29,6 +28,7 @@ export class AuthService {
         email: user.email,
         phone: user.phone,
         role: user.role,
+        kyc: user.kyc, // <--- ADD THIS LINE
       },
     };
   }

@@ -2,6 +2,7 @@ import {
   Injectable,
   BadRequestException,
   InternalServerErrorException,
+  NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, EntityManager } from 'typeorm';
@@ -10,7 +11,6 @@ import { TradeStatus } from './enums/trade-status.enum';
 import { TradeLockService } from './trade-lock.service';
 import { OwnershipService } from 'src/ownership/ownership.service';
 import { WalletService } from 'src/wallet/wallet.service';
-import { ListingService } from '../listing/listing.service';
 import { ListingStatus } from '../listing/enums/listing-status.enum';
 import { InvestorProfile } from 'src/investor/investor.entity';
 import { Asset } from 'src/asset/asset.entity';
@@ -19,6 +19,7 @@ import { AdminAction } from 'src/audit/enums/audit-action.enum';
 import { CreateTradeDto } from './dto/create-trade.dto';
 import { EscrowService } from 'src/escrow/escrow.service';
 import { Escrow } from 'src/escrow/escrow.entity';
+import { SecondaryMarketListing } from '../listing/listing.entity';
 
 @Injectable()
 export class TradeService {
@@ -28,7 +29,6 @@ export class TradeService {
     private readonly ownershipService: OwnershipService,
     private readonly walletService: WalletService,
     private readonly tradeLockService: TradeLockService,
-    private readonly listingService: ListingService,
     private readonly auditService: AuditService,
     private readonly escrowService: EscrowService,
   ) {}
@@ -48,12 +48,16 @@ export class TradeService {
       );
     }
 
+    // 🛡️ PREVENT FLOAT POINT TRUNCATION ON TOTAL PRICE MULTIPLICATION
+    const calculatedTotal = Number(dto.units) * Number(dto.pricePerUnit);
+    const preciseTotalPrice = Math.round(calculatedTotal * 100) / 100;
+
     const trade = this.tradeRepo.create({
       seller,
       asset: { id: dto.assetId } as Asset,
       units: dto.units,
       pricePerUnit: dto.pricePerUnit,
-      totalPrice: Number(dto.units) * Number(dto.pricePerUnit),
+      totalPrice: preciseTotalPrice,
       status: TradeStatus.PENDING,
     });
 
@@ -64,29 +68,6 @@ export class TradeService {
     listingId: string,
     buyer: InvestorProfile,
   ): Promise<Trade> {
-    const listing = await this.listingService.getListingById(listingId);
-
-    if (!listing || listing.status !== ListingStatus.ACTIVE) {
-      throw new BadRequestException('Listing is no longer active');
-    }
-
-    const unitsToBuy = Number(listing.unitsForSale);
-    const totalPrice = unitsToBuy * Number(listing.pricePerUnit);
-
-    if (listing.sellerId === buyer.user.id) {
-      throw new BadRequestException('Self-trading is not permitted');
-    }
-
-    const buyerBalance = await this.walletService.getAvailableBalance(
-      buyer.user.id,
-    );
-
-    if (Number(buyerBalance) < totalPrice) {
-      throw new BadRequestException(
-        `Insufficient balance. Have: ${buyerBalance} SAR, Need: ${totalPrice} SAR`,
-      );
-    }
-
     if (!this.tradeLockService.lock(listingId)) {
       throw new BadRequestException('Transaction in progress...');
     }
@@ -94,12 +75,42 @@ export class TradeService {
     try {
       return await this.tradeRepo.manager.transaction(
         async (manager: EntityManager) => {
+          // 🛡️ FETCH INSIDE TRANSACTION WITH PESSIMISTIC ROW-LEVEL DB LOCK
+          const listing = await manager
+            .getRepository(SecondaryMarketListing)
+            .createQueryBuilder('listing')
+            .setLock('pessimistic_write')
+            .where('listing.id = :listingId', { listingId })
+            .getOne();
+
+          if (!listing || listing.status !== ListingStatus.ACTIVE) {
+            throw new BadRequestException('Listing is no longer active');
+          }
+
+          if (listing.sellerId === buyer.user.id) {
+            throw new BadRequestException('Self-trading is not permitted');
+          }
+
+          const unitsToBuy = Number(listing.unitsForSale);
+          const rawTotalPrice = unitsToBuy * Number(listing.pricePerUnit);
+          const totalPrice = Math.round(rawTotalPrice * 100) / 100;
+
+          const buyerBalance = await this.walletService.getAvailableBalance(
+            buyer.user.id,
+          );
+
+          if (Number(buyerBalance) < totalPrice) {
+            throw new BadRequestException(
+              `Insufficient balance. Have: ${buyerBalance} SAR, Need: ${totalPrice} SAR`,
+            );
+          }
+
           const sellerProfile = await this.ownershipService.getInvestorByUserId(
             listing.sellerId,
           );
 
-          // 1. Create Trade Record First (to get ID for Escrow)
-          const trade = this.tradeRepo.create({
+          // 1. Create Trade Record First (within transaction manager context)
+          const trade = manager.create(Trade, {
             buyer,
             seller: sellerProfile,
             asset: { id: listing.assetId } as any,
@@ -112,8 +123,7 @@ export class TradeService {
 
           const savedTrade = await manager.save(trade);
 
-          // 2. USE ESCROW SERVICE
-          // This deducts from Available, adds to Locked, and creates Escrow record
+          // 2. USE ESCROW SERVICE WITH INJECTED MANAGER
           await this.escrowService.createEscrow(
             {
               tradeId: savedTrade.id,
@@ -187,13 +197,10 @@ export class TradeService {
           );
         }
 
-        // 1. Release via Escrow Service
-        // FIX: Use the Escrow entity class instead of a string to ensure type safety
         const escrow = await manager.findOne(Escrow, { where: { tradeId } });
         if (escrow) {
           await this.escrowService.releaseEscrow(escrow.id, manager);
         } else {
-          // Fallback if record was missing
           await this.walletService.creditAvailable(
             trade.seller.user.id,
             trade.totalPrice,
@@ -219,6 +226,7 @@ export class TradeService {
     );
   }
 
+  // Keep helper queries intact...
   async getTrades() {
     return this.tradeRepo.find({
       relations: ['seller', 'buyer', 'asset'],
@@ -243,17 +251,14 @@ export class TradeService {
       relations: ['buyer', 'seller', 'buyer.user', 'seller.user'],
     });
 
-    if (!trade) {
+    if (!trade)
       throw new BadRequestException(
         'Trade record not found in the Remzik ledger',
       );
-    }
-
-    if (trade.status !== TradeStatus.LOCKED) {
+    if (trade.status !== TradeStatus.LOCKED)
       throw new BadRequestException(
         `Dispute denied: Trade status is ${trade.status}. Only LOCKED trades can be disputed.`,
       );
-    }
 
     return trade;
   }

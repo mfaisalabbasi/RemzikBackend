@@ -5,7 +5,7 @@ import {
   InternalServerErrorException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, DataSource } from 'typeorm';
+import { Repository, DataSource, EntityManager } from 'typeorm';
 import { JwtService } from '@nestjs/jwt';
 import { Response } from 'express';
 import * as bcrypt from 'bcrypt';
@@ -38,13 +38,23 @@ export class UserService {
     res: Response,
   ): Promise<any> {
     const email = dto.email.trim().toLowerCase();
+    const phone = dto.phone.trim();
 
-    const existing = await this.userRepo.findOne({ where: { email } });
-    if (existing) throw new BadRequestException('Email already exists');
+    // 1. ROLE SECURITY GUARD
+    if (dto.role === UserRole.ADMIN) {
+      throw new BadRequestException('Unauthorized role selection.');
+    }
 
-    // 1. Upload files to S3 first to get URLs
-    let idDocumentUrl = 'pending';
-    let addressProofUrl = 'pending';
+    const existing = await this.userRepo.findOne({
+      where: [{ email }, { phone }],
+    });
+    if (existing) {
+      throw new BadRequestException('Email or Phone number already exists');
+    }
+
+    // 2. ATOMIC FILE UPLOAD
+    let idDocumentUrl: string | null = null;
+    let addressProofUrl: string | null = null;
 
     try {
       if (files?.idDocument?.[0]) {
@@ -66,72 +76,92 @@ export class UserService {
 
     const hashedPassword = await bcrypt.hash(dto.password, 10);
 
-    return await this.dataSource.transaction(async (manager) => {
-      try {
-        // 2. Create User
-        const user = manager.create(User, {
-          email,
-          name: dto.name,
-          phone: dto.phone,
-          password: hashedPassword,
-          role: dto.role ?? UserRole.INVESTOR,
-        });
-        const savedUser = await manager.save(user);
+    // 3. DATABASE TRANSACTION
+    try {
+      return await this.dataSource.transaction(
+        async (manager: EntityManager) => {
+          // Create User
+          const user = manager.create(User, {
+            email,
+            name: dto.name,
+            phone: phone,
+            password: hashedPassword,
+            role: (dto.role as UserRole) ?? UserRole.INVESTOR,
+          });
+          const savedUser = await manager.save(user);
 
-        // 3. Create Role Profile
-        if (savedUser.role === UserRole.PARTNER) {
-          await this.partnerService.createProfile(
-            savedUser.id,
-            { companyName: 'Remzik Partner' },
-            manager,
-          );
-        } else if (savedUser.role === UserRole.INVESTOR) {
-          await this.investorService.createProfile(savedUser.id, manager);
-        }
+          // Create Role Profile
+          if (savedUser.role === UserRole.PARTNER) {
+            await this.partnerService.createProfile(
+              savedUser.id,
+              { companyName: 'Remzik Partner' },
+              manager,
+            );
+          } else if (savedUser.role === UserRole.INVESTOR) {
+            await this.investorService.createProfile(savedUser.id, manager);
+          }
 
-        // 4. Create KYC Record with S3 URLs
-        const kyc = manager.create(KycProfile, {
-          user: savedUser,
-          fullName: dto.fullName,
-          dob: dto.dob,
-          idDocumentUrl: idDocumentUrl,
-          addressProofUrl: addressProofUrl,
-          status: KycStatus.PENDING,
-        });
-        await manager.save(kyc);
+          // Create KYC Record (Direct Instantiation to solve Overload Error)
+          const kyc = new KycProfile();
+          kyc.fullName = dto.fullName;
+          kyc.dob = dto.dob;
+          kyc.idDocumentUrl = idDocumentUrl!;
+          kyc.addressProofUrl = addressProofUrl!;
+          kyc.status = KycStatus.PENDING;
+          kyc.user = savedUser;
 
-        // 5. Token & Cookie
-        const payload = { sub: savedUser.id, role: savedUser.role };
-        const token = this.jwtService.sign(payload);
+          await manager.save(kyc);
 
-        res.cookie('accessToken', token, {
-          httpOnly: true,
-          sameSite: 'lax',
-          secure: process.env.NODE_ENV === 'production',
-        });
+          // Token & Cookie
+          const payload = { sub: savedUser.id, role: savedUser.role };
+          const token = this.jwtService.sign(payload);
 
-        return {
-          message: 'Account and KYC submitted successfully',
-          user: {
-            id: savedUser.id,
-            email: savedUser.email,
-            role: savedUser.role,
-          },
-        };
-      } catch (error) {
-        console.error('Transaction Failed:', error);
-        throw new InternalServerErrorException(
-          'Registration failed. Everything rolled back.',
-        );
-      }
-    });
+          res.cookie('accessToken', token, {
+            httpOnly: true,
+            sameSite: 'lax',
+            secure: process.env.NODE_ENV === 'production',
+          });
+
+          return {
+            message: 'Account and KYC submitted successfully',
+            user: {
+              id: savedUser.id,
+              email: savedUser.email,
+              role: savedUser.role,
+            },
+          };
+        },
+      );
+    } catch (error) {
+      // 4. CRITICAL S3 CLEANUP ON DB FAILURE
+      console.error('Transaction Failed, cleaning up storage...');
+
+      const cleanupTasks: Promise<void>[] = [];
+      if (idDocumentUrl)
+        cleanupTasks.push(this.storageService.deleteFile(idDocumentUrl));
+      if (addressProofUrl)
+        cleanupTasks.push(this.storageService.deleteFile(addressProofUrl));
+
+      await Promise.all(cleanupTasks);
+
+      if (error instanceof BadRequestException) throw error;
+      throw new InternalServerErrorException(
+        'Registration failed. Storage cleaned up.',
+      );
+    }
   }
 
   async validateUser(email: string, password: string): Promise<User> {
-    const user = await this.userRepo.findOne({ where: { email } });
+    // Add relations here to fetch the KYC data
+    const user = await this.userRepo.findOne({
+      where: { email },
+      relations: ['kyc'], // <--- CRITICAL FIX
+    });
+
     if (!user) throw new UnauthorizedException('Invalid credentials');
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) throw new UnauthorizedException('Invalid credentials');
+
     return user;
   }
 
@@ -139,6 +169,7 @@ export class UserService {
     const email = dto.email.trim().toLowerCase();
     const existing = await this.userRepo.findOne({ where: { email } });
     if (existing) throw new BadRequestException('Email already exists');
+
     const hashedPassword = await bcrypt.hash(dto.password, 10);
     const user = this.userRepo.create({
       ...dto,
@@ -146,12 +177,26 @@ export class UserService {
       password: hashedPassword,
     });
     const savedUser = await this.userRepo.save(user);
+
     const payload = { sub: savedUser.id, role: savedUser.role };
     const token = this.jwtService.sign(payload);
-    res.cookie('accessToken', token, { httpOnly: true, sameSite: 'lax' });
+
+    res.cookie('accessToken', token, {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: process.env.NODE_ENV === 'production',
+    });
+
     return {
       message: 'User created successfully',
       user: { id: savedUser.id, email: savedUser.email, role: savedUser.role },
     };
+  }
+
+  async getMe(userId: string) {
+    return await this.userRepo.findOne({
+      where: { id: userId },
+      relations: ['kyc'],
+    });
   }
 }

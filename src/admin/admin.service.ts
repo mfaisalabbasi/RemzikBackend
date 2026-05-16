@@ -16,7 +16,7 @@ import { ComplianceStatus } from './interfaces/compliance-status.interface';
 import { LiquidityStats } from './interfaces/liquidity-stats.interface';
 import { InjectRepository } from '@nestjs/typeorm';
 import { InvestorProfile } from 'src/investor/investor.entity';
-import { DataSource, Repository } from 'typeorm';
+import { DataSource, Repository, EntityManager } from 'typeorm';
 import { Investment } from 'src/investment/investment.entity';
 import { InvestmentStatus } from 'src/investment/enums/investment-status.enum';
 import { Trade } from 'src/secondary-market/trade/trade.entity';
@@ -61,6 +61,7 @@ export class AdminService {
     private readonly dataSource: DataSource,
   ) {}
 
+  // ... (getUrgentQueue remains unchanged) ...
   async getUrgentQueue(): Promise<UrgentTask[]> {
     const [pendingKyc, pendingPartners, pendingAssets] = await Promise.all([
       this.kycService.findAllPending(),
@@ -98,6 +99,172 @@ export class AdminService {
     return queue.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
   }
 
+  /**
+   * Refined KYC Action:
+   * Rejection keeps the account ACTIVE so the user can re-upload.
+   */
+  async handleKycAction(dto: AdminActionDto, adminId: string) {
+    const kyc = await this.kycRepo.findOne({
+      where: { id: dto.targetId },
+      relations: ['user'],
+    });
+
+    if (!kyc) throw new NotFoundException('KYC record not found');
+
+    if (dto.action === AdminAction.APPROVE) {
+      await this.kycService.approve(dto.targetId);
+      // FLIP THE SWITCH
+      if (kyc.user) {
+        kyc.user.isVerified = true;
+        await this.dataSource.manager.save(User, kyc.user);
+      }
+    } else if (dto.action === AdminAction.REJECT) {
+      if (!dto.reason) throw new BadRequestException('Reason required');
+      await this.kycService.reject(dto.targetId, dto.reason);
+      // FLIP THE SWITCH
+      if (kyc.user) {
+        kyc.user.isVerified = false;
+        await this.dataSource.manager.save(User, kyc.user);
+      }
+    }
+
+    await this.auditService.log({
+      adminId,
+      action: dto.action,
+      targetId: dto.targetId,
+      reason: dto.reason,
+    });
+  }
+
+  /**
+   * Directly approves an investor profile and flips isVerified.
+   */
+  async approveKyc(investorProfileId: string, adminId: string) {
+    return await this.dataSource.transaction(async (manager: EntityManager) => {
+      const profile = await manager.findOne(InvestorProfile, {
+        where: { id: investorProfileId },
+        relations: ['user'],
+      });
+
+      if (!profile || !profile.user)
+        throw new BadRequestException('Profile or User not found');
+
+      // 1. Update User verification status
+      profile.user.isVerified = true;
+      await manager.save(User, profile.user);
+
+      // 2. Update KYC status via relationship
+      await manager.update(
+        KycProfile,
+        { user: { id: profile.user.id } }, // Targeting the User relation
+        { status: KycStatus.APPROVED },
+      );
+
+      // 3. Ledger Record
+      await this.ledgerService.record(
+        {
+          userId: profile.user.id,
+          amount: 0,
+          type: LedgerType.ADJUSTMENT,
+          source: LedgerSource.ADMIN_ADJUSTMENT,
+          description: 'KYC Approved by Admin',
+        },
+        manager,
+      );
+
+      // 4. Audit Log
+      await this.auditService.log({
+        adminId,
+        action: AdminAction.KYC_APPROVED,
+        targetId: investorProfileId,
+        reason: 'Manual KYC Approval via Admin Panel',
+      });
+
+      return { success: true };
+    });
+  }
+
+  /**
+   * Freeze/Unfreeze: The ultimate safety switch.
+   */
+  async toggleAccountFreeze(id: string, reason: string, adminId: string) {
+    const profile = await this.investorRepo.findOne({
+      where: { id },
+      relations: ['user'],
+    });
+    if (!profile) throw new BadRequestException('Profile not found');
+
+    const currentlyActive = profile.user.isActive;
+    profile.user.isActive = !currentlyActive;
+
+    await this.investorRepo.manager.save(profile.user);
+
+    await this.ledgerService.record({
+      userId: profile.user.id,
+      amount: 0,
+      type: LedgerType.ADJUSTMENT,
+      source: LedgerSource.ADMIN_ADJUSTMENT,
+      description: currentlyActive
+        ? `ACCOUNT FROZEN: ${reason}`
+        : 'ACCOUNT UNFROZEN',
+    });
+
+    await this.auditService.log({
+      adminId,
+      action: currentlyActive
+        ? AdminAction.USER_SUSPENDED
+        : AdminAction.APPROVE,
+      targetId: id,
+      reason:
+        reason ||
+        (currentlyActive ? 'Manual Suspension' : 'Manual Reactivation'),
+    });
+
+    return {
+      success: true,
+      newStatus: profile.user.isActive ? 'Active' : 'Frozen',
+    };
+  }
+
+  async rejectKyc(investorProfileId: string, reason: string, adminId: string) {
+    return await this.dataSource.transaction(async (manager: EntityManager) => {
+      const profile = await manager.findOne(InvestorProfile, {
+        where: { id: investorProfileId },
+        relations: ['user'],
+      });
+
+      if (!profile || !profile.user)
+        throw new BadRequestException('Profile or User not found');
+
+      // 1. Ensure isVerified is false
+      profile.user.isVerified = false;
+      await manager.save(User, profile.user);
+
+      // 2. Update KYC status and store the rejection reason
+      // This allows the user to see WHY they were rejected on their dashboard
+      await manager.update(
+        KycProfile,
+        { user: { id: profile.user.id } },
+        {
+          status: KycStatus.REJECTED,
+          rejectionReason: reason, // Make sure this column exists in your KycProfile entity
+        },
+      );
+
+      // 3. Audit Logging
+      await this.auditService.log({
+        adminId,
+        action: AdminAction.REJECT, // Use your REJECT enum
+        targetId: investorProfileId,
+        reason: `KYC Rejected: ${reason}`,
+      });
+
+      return { success: true };
+    });
+  }
+
+  // ... (getInvestorDetail, handlePartnerAction, etc. merged below) ...
+
   async handlePartnerAction(dto: AdminActionDto, adminId: string) {
     if (dto.action === AdminAction.APPROVE)
       await this.partnerService.approve(dto.targetId);
@@ -119,22 +286,6 @@ export class AdminService {
       await this.assetService.approve(dto.targetId);
     if (dto.action === AdminAction.FREEZE)
       await this.assetService.freeze(dto.targetId);
-    await this.auditService.log({
-      adminId,
-      action: dto.action,
-      targetId: dto.targetId,
-      reason: dto.reason,
-    });
-  }
-
-  async handleKycAction(dto: AdminActionDto, adminId: string) {
-    if (dto.action === AdminAction.APPROVE)
-      await this.kycService.approve(dto.targetId);
-    if (dto.action === AdminAction.REJECT) {
-      if (!dto.reason)
-        throw new BadRequestException('Rejection reason is required');
-      await this.kycService.reject(dto.targetId, dto.reason);
-    }
     await this.auditService.log({
       adminId,
       action: dto.action,
@@ -201,13 +352,14 @@ export class AdminService {
       throw new BadRequestException(
         'Investor profile or linked user not found',
       );
+
     const mainUserId = investorProfile.user.id;
 
     const [wallet, history, kyc] = await Promise.all([
       this.walletRepo.findOne({ where: { userId: mainUserId } }),
       this.ledgerService.findByUser(mainUserId),
       this.kycRepo.findOne({
-        where: { userId: mainUserId },
+        where: { user: { id: mainUserId } }, // Corrected relation lookup
         order: { createdAt: 'DESC' },
       }),
     ]);
@@ -224,6 +376,7 @@ export class AdminService {
           LedgerSource.SECONDARY_MARKET_BUY,
           LedgerSource.ESCROW_LOCK,
         ].includes(entry.source as any);
+
       return {
         id: entry.id,
         date: entry.createdAt,
@@ -301,74 +454,6 @@ export class AdminService {
     return 'CASH';
   }
 
-  async approveKyc(investorProfileId: string, adminId: string) {
-    const profile = await this.investorRepo.findOne({
-      where: { id: investorProfileId },
-      relations: ['user'],
-    });
-    if (!profile) throw new BadRequestException('Profile not found');
-    profile.user.isVerified = true;
-    await this.investorRepo.manager.save(profile.user);
-    await this.kycRepo.update(
-      { userId: profile.user.id },
-      { status: KycStatus.APPROVED },
-    );
-    await this.ledgerService.record({
-      userId: profile.user.id,
-      amount: 0,
-      type: LedgerType.ADJUSTMENT,
-      source: LedgerSource.ADMIN_ADJUSTMENT,
-      description: 'KYC Approved by Admin',
-    });
-
-    // ✅ Audit Logging Integrated
-    await this.auditService.log({
-      adminId,
-      action: AdminAction.KYC_APPROVED,
-      targetId: investorProfileId,
-      reason: 'Manual KYC Approval via Admin Panel',
-    });
-
-    return { success: true };
-  }
-
-  async toggleAccountFreeze(id: string, reason: string, adminId: string) {
-    const profile = await this.investorRepo.findOne({
-      where: { id },
-      relations: ['user'],
-    });
-    if (!profile) throw new BadRequestException('Profile not found');
-    const currentlyActive = profile.user.isActive;
-    profile.user.isActive = !currentlyActive;
-    await this.investorRepo.manager.save(profile.user);
-    await this.ledgerService.record({
-      userId: profile.user.id,
-      amount: 0,
-      type: LedgerType.ADJUSTMENT,
-      source: LedgerSource.ADMIN_ADJUSTMENT,
-      description: currentlyActive
-        ? `ACCOUNT FROZEN: ${reason}`
-        : 'ACCOUNT UNFROZEN',
-    });
-
-    // ✅ Audit Logging Integrated
-    await this.auditService.log({
-      adminId,
-      action: currentlyActive
-        ? AdminAction.USER_SUSPENDED
-        : AdminAction.APPROVE,
-      targetId: id,
-      reason:
-        reason ||
-        (currentlyActive ? 'Manual Suspension' : 'Manual Reactivation'),
-    });
-
-    return {
-      success: true,
-      newStatus: profile.user.isActive ? 'Active' : 'Frozen',
-    };
-  }
-
   async updatePartnerStatus(id: string, status: string, adminId: string) {
     const partner = await this.partnerRepo.findOne({ where: { id } });
     if (!partner) throw new NotFoundException('Partner not found');
@@ -379,15 +464,12 @@ export class AdminService {
     );
 
     if (!isValid) {
-      throw new BadRequestException(
-        `Invalid status: ${status}. Expected one of: ${Object.values(PartnerStatus).join(', ')}`,
-      );
+      throw new BadRequestException(`Invalid status: ${status}`);
     }
 
     partner.status = formattedStatus as any;
     const updatedPartner = await this.partnerRepo.save(partner);
 
-    // ✅ Audit Logging Integrated
     await this.auditService.log({
       adminId,
       action:
@@ -402,15 +484,10 @@ export class AdminService {
   }
 
   async findAllAssets(): Promise<Asset[]> {
-    try {
-      return await this.assetRepo.find({
-        relations: ['partner'],
-        order: { createdAt: 'DESC' },
-      });
-    } catch (error) {
-      console.error('Error fetching assets for directory:', error);
-      throw new Error('Could not retrieve asset directory.');
-    }
+    return await this.assetRepo.find({
+      relations: ['partner'],
+      order: { createdAt: 'DESC' },
+    });
   }
 
   async findAssetDetail(id: string) {
@@ -431,37 +508,17 @@ export class AdminService {
       relations: ['partner'],
     });
 
-    if (!asset) {
-      throw new NotFoundException(
-        `Asset record ${id} not found in secure ledger.`,
-      );
-    }
-
-    if (status === AssetStatus.PAID && asset.status !== AssetStatus.APPROVED) {
-      throw new BadRequestException(
-        'Asset must be APPROVED before it can be marked as PAID.',
-      );
-    }
+    if (!asset) throw new NotFoundException(`Asset record ${id} not found.`);
 
     if (status === AssetStatus.REJECTED) {
-      if (!rejectionReason) {
-        throw new BadRequestException(
-          'A rejection reason is mandatory for auditing purposes.',
-        );
-      }
+      if (!rejectionReason)
+        throw new BadRequestException('Rejection reason mandatory.');
       asset.rejectionReason = rejectionReason;
-    } else {
-      asset.rejectionReason = undefined;
-    }
-
-    if (status === AssetStatus.FREEZ) {
-      console.log(`Asset ${id} has been frozen by Admin.`);
     }
 
     asset.status = status as AssetStatus;
     const updatedAsset = await this.assetRepo.save(asset);
 
-    // ✅ Audit Logging Integrated
     let auditAction: AdminAction = AdminAction.APPROVE;
     if (status === AssetStatus.REJECTED) auditAction = AdminAction.REJECT;
     if (status === AssetStatus.FREEZ) auditAction = AdminAction.FREEZE;
@@ -494,20 +551,10 @@ export class AdminService {
   }
 
   async getAdminIdentity(userId: string) {
-    console.log('--- ADMIN IDENTITY SYNC ---');
-    console.log('Target User ID from Token:', userId);
-
-    const user = await this.auditLogRepo.manager.findOne(User, {
+    const user = await this.dataSource.manager.findOne(User, {
       where: { id: userId },
     });
-
-    if (!user) {
-      console.error(`CRITICAL: No user found for ID ${userId}`);
-      throw new NotFoundException('Admin record not found');
-    }
-
-    console.log('Found User in DB:', user.name, '| Role:', user.role);
-
+    if (!user) throw new NotFoundException('Admin record not found');
     return {
       id: user.id,
       name: user.name,
@@ -524,22 +571,48 @@ export class AdminService {
       take: 10,
     });
   }
-  // src/admin/admin.service.ts
+
   async getAssetDistributions(assetId: string) {
     return await this.dataSource.query(
-      `
-    SELECT 
-      "batchId", 
-      "period", 
-      "status", 
-      SUM(amount) as "totalAmount", 
-      MIN("createdAt") as "date"
-    FROM distributions
-    WHERE "assetId" = $1
-    GROUP BY "batchId", "period", "status"
-    ORDER BY "date" DESC
-  `,
+      `SELECT "batchId", "period", "status", SUM(amount) as "totalAmount", MIN("createdAt") as "date"
+       FROM distributions WHERE "assetId" = $1 GROUP BY "batchId", "period", "status" ORDER BY "date" DESC`,
       [assetId],
     );
+  }
+
+  async togglePartnerFreeze(
+    partnerId: string,
+    reason: string,
+    adminId: string,
+  ) {
+    const partner = await this.partnerRepo.findOne({
+      where: { id: partnerId },
+      relations: ['user'],
+    });
+
+    if (!partner || !partner.user)
+      throw new NotFoundException('Partner User not found');
+
+    const currentlyActive = partner.user.isActive;
+    partner.user.isActive = !currentlyActive;
+
+    await this.dataSource.manager.save(User, partner.user);
+
+    // Log to Audit and Ledger
+    await this.auditService.log({
+      adminId,
+      action: currentlyActive
+        ? AdminAction.USER_SUSPENDED
+        : AdminAction.APPROVE,
+      targetId: partnerId,
+      reason:
+        reason ||
+        (currentlyActive ? 'Manual Suspension' : 'Manual Reactivation'),
+    });
+
+    return {
+      success: true,
+      isActive: partner.user.isActive,
+    };
   }
 }

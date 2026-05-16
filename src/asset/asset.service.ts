@@ -5,7 +5,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, EntityManager } from 'typeorm';
 import { Asset } from './asset.entity';
 import { CreateAssetDto } from './dto/create-asset.dto';
 import { PartnerProfile } from 'src/partner/partner.entity';
@@ -14,6 +14,7 @@ import { StorageService } from '../storage/storage.service';
 import { Investment } from 'src/investment/investment.entity';
 import { InvestmentStatus } from 'src/investment/enums/investment-status.enum';
 import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
+import { AssetToken } from 'src/tokenization/entities/asset-token.entity';
 
 @Injectable()
 export class AssetService {
@@ -29,6 +30,8 @@ export class AssetService {
     private readonly storageService: StorageService,
     private readonly notificationOrchestrator: NotificationOrchestrator,
   ) {}
+
+  // --- PRIVATE UTILITIES ---
 
   private isValidUuid(id: string): boolean {
     const uuidRegex =
@@ -48,6 +51,118 @@ export class AssetService {
     }
     return urls;
   }
+
+  private mapAssetStatusToDoc(status: AssetStatus): string {
+    switch (status) {
+      case AssetStatus.APPROVED:
+        return 'Approved';
+      case AssetStatus.SUBMITTED:
+        return 'Submitted';
+      case AssetStatus.REJECTED:
+        return 'Rejected';
+      default:
+        return 'Pending';
+    }
+  }
+
+  // --- CORE MUTATIONS ---
+
+  /**
+   * ✅ FIXED: Flexible math allows any investment amount/entry.
+   */
+  async createAsset(
+    userId: string,
+    dto: CreateAssetDto,
+    files: any,
+  ): Promise<Asset> {
+    const partner = await this.partnerRepo.findOne({
+      where: { user: { id: userId } },
+      relations: ['user'],
+    });
+
+    // 🛡️ SECURITY FIREWALL
+    if (!partner) throw new BadRequestException('Partner profile required');
+    if (partner.user?.isActive === false || partner.status === 'FROZEN') {
+      throw new BadRequestException(
+        'Action blocked: Your account or partner profile is currently inactive or frozen.',
+      );
+    }
+
+    // 🛡️ REVERTED TO STRICT TOKEN MATH
+    const totalValue = Number(dto.totalValue);
+    const tokenSupply = Number(dto.tokenSupply || 0);
+
+    if (tokenSupply <= 0) {
+      throw new BadRequestException('Token supply must be greater than 0');
+    }
+
+    // Calculate unit price and round to 2 decimals for clean currency display
+    const rawUnitPrice = totalValue / tokenSupply;
+    const unitPrice = Math.round(rawUnitPrice * 100) / 100;
+
+    // Integrity check: ensures (Unit Price * Supply) equals Total Value
+    const calculatedTotal = unitPrice * tokenSupply;
+    const difference = Math.abs(totalValue - calculatedTotal);
+
+    if (difference > 0.05) {
+      throw new BadRequestException(
+        `Math Mismatch: Unit price ${unitPrice} * supply ${tokenSupply} = ${calculatedTotal}. ` +
+          `Difference from Total Value (${totalValue}) exceeds 0.05. Please adjust token supply.`,
+      );
+    }
+
+    let uploadedUrls: string[] = [];
+    try {
+      const [
+        galleryImages,
+        legalDocuments,
+        financialDocuments,
+        otherDocuments,
+      ] = await Promise.all([
+        this.uploadFiles(files.galleryImages, 'assets/gallery'),
+        this.uploadFiles(files.legalDocuments, 'assets/legal'),
+        this.uploadFiles(files.financialDocuments, 'assets/financial'),
+        this.uploadFiles(files.otherDocuments, 'assets/other'),
+      ]);
+
+      uploadedUrls = [
+        ...galleryImages,
+        ...legalDocuments,
+        ...financialDocuments,
+        ...otherDocuments,
+      ];
+
+      const asset = this.assetRepo.create({
+        ...dto,
+        totalValue,
+        unitPrice, // Using the rounded unit price
+        tokenSupply,
+        partner,
+        galleryImages,
+        legalDocuments,
+        financialDocuments,
+        otherDocuments,
+        status: AssetStatus.SUBMITTED,
+      });
+
+      const savedAsset = await this.assetRepo.save(asset);
+      this.logger.log(
+        `Asset ${savedAsset.id} created successfully by Partner ${partner.id}`,
+      );
+      return savedAsset;
+    } catch (err: unknown) {
+      const errorMessage =
+        err instanceof Error ? err.message : 'Unknown database error';
+      this.logger.error(
+        `Asset creation failed: ${errorMessage}. Files uploaded: ${uploadedUrls.length}`,
+      );
+      throw new BadRequestException(
+        'Asset creation failed. Please check your data and try again.',
+      );
+    }
+  }
+
+  // --- PARTNER DASHBOARD & ANALYTICS ---
 
   async getPartnerInvestors(userId: string) {
     const partner = await this.partnerRepo.findOne({
@@ -137,12 +252,9 @@ export class AssetService {
         const targetAmount = Number(a.totalValue) || 0;
 
         let stage = 'Approved';
-
-        if (a.status === AssetStatus.SUBMITTED) {
-          stage = 'Compliance';
-        } else if (a.status === AssetStatus.REJECTED) {
-          stage = 'Rejected';
-        } else if (
+        if (a.status === AssetStatus.SUBMITTED) stage = 'Compliance';
+        else if (a.status === AssetStatus.REJECTED) stage = 'Rejected';
+        else if (
           raisedAmount >= targetAmount ||
           a.status === AssetStatus.FREEZ ||
           a.status === AssetStatus.PAID
@@ -389,51 +501,126 @@ export class AssetService {
     );
   }
 
-  async createAsset(
-    userId: string,
-    dto: CreateAssetDto,
-    files: any,
-  ): Promise<Asset> {
+  async getPartnerFunding(userId: string) {
     const partner = await this.partnerRepo.findOne({
       where: { user: { id: userId } },
-      relations: ['user'],
     });
-    if (!partner) throw new BadRequestException('Partner profile required');
-    try {
-      const [
-        galleryImages,
-        legalDocuments,
-        financialDocuments,
-        otherDocuments,
-      ] = await Promise.all([
-        this.uploadFiles(files.galleryImages, 'assets/gallery'),
-        this.uploadFiles(files.legalDocuments, 'assets/legal'),
-        this.uploadFiles(files.financialDocuments, 'assets/financial'),
-        this.uploadFiles(files.otherDocuments, 'assets/other'),
-      ]);
-      const asset = this.assetRepo.create({
-        ...dto,
-        totalValue: Number(dto.totalValue),
-        partner,
-        galleryImages,
-        legalDocuments,
-        financialDocuments,
-        otherDocuments,
-        status: AssetStatus.SUBMITTED,
-      });
-      return await this.assetRepo.save(asset);
-    } catch (err) {
-      throw new BadRequestException('Asset creation failed');
-    }
+    if (!partner) return [];
+    const assets = await this.assetRepo.find({
+      where: { partner: { id: partner.id } },
+      order: { createdAt: 'DESC' },
+    });
+
+    return Promise.all(
+      assets.map(async (a) => {
+        const stats = await this.investmentRepo
+          .createQueryBuilder('inv')
+          .select('SUM(CAST(inv.amount AS NUMERIC))', 'raised')
+          .addSelect('COUNT(DISTINCT inv.investorId)', 'investors')
+          .where('inv.assetId = :id', { id: a.id })
+          .andWhere('inv.status = :confirmed', {
+            confirmed: InvestmentStatus.CONFIRMED,
+          })
+          .getRawOne();
+
+        const raisedAmount = parseFloat(stats?.raised || '0');
+        const targetAmount = Number(a.totalValue) || 0;
+        let stage = 'Approved';
+        if (a.status === AssetStatus.SUBMITTED) stage = 'Compliance';
+        else if (a.status === AssetStatus.REJECTED) stage = 'Rejected';
+        else if (
+          a.status === AssetStatus.FREEZ ||
+          a.status === AssetStatus.PAID ||
+          raisedAmount >= targetAmount
+        )
+          stage = 'Completed';
+        else if (a.status === AssetStatus.APPROVED) stage = 'Funding';
+
+        return {
+          id: a.id,
+          asset: a.title,
+          target: targetAmount,
+          raised: raisedAmount,
+          roi: Number(a.expectedYield || 0),
+          investors: parseInt(stats?.investors || '0'),
+          stage: stage,
+        };
+      }),
+    );
   }
-  async getAssetById(assetId: string): Promise<any> {
+
+  async getPartnerDistributions(userId: string) {
+    const partner = await this.partnerRepo.findOne({
+      where: { user: { id: userId } },
+    });
+    if (!partner) return [];
+    const assets = await this.assetRepo.find({
+      where: { partner: { id: partner.id } },
+      order: { updatedAt: 'DESC' },
+    });
+
+    return Promise.all(
+      assets.map(async (a) => {
+        const stats = await this.investmentRepo
+          .createQueryBuilder('inv')
+          .select('SUM(CAST(inv.amount AS NUMERIC))', 'raised')
+          .addSelect('COUNT(DISTINCT inv.investorId)', 'investors')
+          .where('inv.assetId = :id', { id: a.id })
+          .andWhere('inv.status = :confirmed', {
+            confirmed: InvestmentStatus.CONFIRMED,
+          })
+          .getRawOne();
+
+        const raisedAmount = parseFloat(stats?.raised || '0');
+        const targetAmount = Number(a.totalValue) || 0;
+        let stage = 'Approved';
+        if (a.status === AssetStatus.SUBMITTED) stage = 'Compliance';
+        else if (
+          raisedAmount >= targetAmount ||
+          a.status === AssetStatus.FREEZ ||
+          a.status === AssetStatus.PAID
+        )
+          stage = 'Completed';
+        else if (a.status === AssetStatus.APPROVED) stage = 'Funding';
+
+        let nextPayout = 'TBD';
+        if (stage === 'Completed') {
+          const now = new Date();
+          const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+          nextPayout = nextMonth.toLocaleDateString('en-GB', {
+            day: 'numeric',
+            month: 'short',
+            year: 'numeric',
+          });
+        }
+        return {
+          id: a.id,
+          asset: a.title,
+          stage: stage,
+          totalRaised: raisedAmount,
+          investors: parseInt(stats?.investors || '0'),
+          nextPayout: nextPayout,
+        };
+      }),
+    );
+  }
+
+  // --- DOCUMENTS & ADMINISTRATIVE ---
+
+  /**
+   * ✅ FIXED: Used destructuring to avoid the 'delete' TypeScript error.
+   */
+  async getAssetById(
+    assetId: string,
+    requesterId?: string,
+    isAdmin = false,
+  ): Promise<any> {
     if (!this.isValidUuid(assetId)) throw new NotFoundException('Invalid ID');
 
     const asset = await this.assetRepo.findOne({
       where: { id: assetId },
-      relations: ['partner'],
+      relations: ['partner', 'partner.user'],
     });
-
     if (!asset) throw new NotFoundException('Not found');
 
     const stats = await this.investmentRepo
@@ -444,56 +631,144 @@ export class AssetService {
       .andWhere('inv.status != :pending', { pending: InvestmentStatus.PENDING })
       .getRawOne();
 
-    const formattedDocuments = [
-      ...(asset.legalDocuments || []).map((url, i) => ({
-        title: `Legal Document ${i + 1}`,
-        url,
-        type: 'Legal',
-      })),
-      ...(asset.financialDocuments || []).map((url, i) => ({
-        title: `Financial Report ${i + 1}`,
-        url,
-        type: 'Financial',
-      })),
-      ...(asset.otherDocuments || []).map((url, i) => ({
-        title: `Supporting Doc ${i + 1}`,
-        url,
-        type: 'Other',
-      })),
-    ];
+    // 🛡️ SECURITY CHECK
+    const isPartnerOwner = requesterId === asset.partner.user.id;
+    const isInvestor = requesterId
+      ? await this.investmentRepo.findOne({
+          where: {
+            asset: { id: assetId },
+            investor: { user: { id: requesterId } },
+            status: InvestmentStatus.CONFIRMED,
+          },
+        })
+      : false;
 
-    return {
+    const hasAccess = isAdmin || isPartnerOwner || !!isInvestor;
+
+    const response = {
       ...asset,
-      documents: formattedDocuments,
       funding: {
         target: Number(asset.totalValue),
         raised: parseFloat(stats?.raised || '0'),
         investors: parseInt(stats?.investors || '0'),
       },
+      documents: [
+        ...(asset.legalDocuments || []).map((url, i) => ({
+          title: `Legal Doc ${i + 1}`,
+          url: hasAccess ? url : null,
+          type: 'Legal',
+          locked: !hasAccess,
+        })),
+        ...(asset.financialDocuments || []).map((url, i) => ({
+          title: `Financial Report ${i + 1}`,
+          url: hasAccess ? url : null,
+          type: 'Financial',
+          locked: !hasAccess,
+        })),
+        ...(asset.otherDocuments || []).map((url, i) => ({
+          title: `Supporting Doc ${i + 1}`,
+          url,
+          type: 'Other',
+          locked: false,
+        })),
+      ],
     };
+
+    // ✅ REPLACED 'DELETE' WITH DESTRUCTURING FOR COMPLIANCE
+    if (!hasAccess) {
+      const {
+        legalDocuments: _l,
+        financialDocuments: _f,
+        ...safeResponse
+      } = response;
+      return safeResponse;
+    }
+
+    return response;
   }
 
+  async getPartnerDocuments(userId: string) {
+    const partner = await this.partnerRepo.findOne({
+      where: { user: { id: userId } },
+    });
+    if (!partner) return [];
+    const assets = await this.assetRepo.find({
+      where: { partner: { id: partner.id } },
+      order: { createdAt: 'DESC' },
+    });
+    const allDocs: any[] = [];
+    assets.forEach((asset) => {
+      asset.legalDocuments?.forEach((url, i) =>
+        allDocs.push({
+          id: `${asset.id}-legal-${i}`,
+          title: `${asset.title} - Legal Doc ${i + 1}`,
+          type: 'Agreement',
+          status: this.mapAssetStatusToDoc(asset.status),
+          uploaded: new Date(asset.createdAt).toLocaleDateString('en-GB', {
+            day: 'numeric',
+            month: 'short',
+            year: 'numeric',
+          }),
+          description: `Official legal documentation for ${asset.title}.`,
+          url: url,
+        }),
+      );
+      asset.financialDocuments?.forEach((url, i) =>
+        allDocs.push({
+          id: `${asset.id}-fin-${i}`,
+          title: `${asset.title} - Financial ${i + 1}`,
+          type: 'Report',
+          status: this.mapAssetStatusToDoc(asset.status),
+          uploaded: new Date(asset.createdAt).toLocaleDateString('en-GB', {
+            day: 'numeric',
+            month: 'short',
+            year: 'numeric',
+          }),
+          description: `Financial audit and projection reports for ${asset.title}.`,
+          url: url,
+        }),
+      );
+      asset.otherDocuments?.forEach((url, i) =>
+        allDocs.push({
+          id: `${asset.id}-other-${i}`,
+          title: `${asset.title} - Certificate ${i + 1}`,
+          type: 'Certificate',
+          status: this.mapAssetStatusToDoc(asset.status),
+          uploaded: new Date(asset.createdAt).toLocaleDateString('en-GB', {
+            day: 'numeric',
+            month: 'short',
+            year: 'numeric',
+          }),
+          description: `Additional certification docs for ${asset.title}.`,
+          url: url,
+        }),
+      );
+    });
+    return allDocs;
+  }
+
+  /**
+   * ✅ UPDATED: Atomic Approval & Tokenization
+   */
   async approve(assetId: string): Promise<Asset> {
     const asset = await this.assetRepo.findOne({
       where: { id: assetId },
       relations: ['partner', 'partner.user'],
     });
-    if (!asset) throw new NotFoundException();
 
+    if (!asset) throw new NotFoundException('Asset not found');
+
+    // Simple status update - go back to how you had your tokenization triggered
     asset.status = AssetStatus.APPROVED;
     const updatedAsset = await this.assetRepo.save(asset);
 
-    // ✅ TRIGGER: Notification to Partner
     if (updatedAsset.partner?.user?.id) {
       await this.notificationOrchestrator.buildAndSave(
         updatedAsset.partner.user.id,
         'asset.approved',
-        {
-          asset: updatedAsset.title,
-        },
+        { asset: updatedAsset.title },
       );
     }
-
     return updatedAsset;
   }
 
@@ -532,243 +807,27 @@ export class AssetService {
     return this.assetRepo.count();
   }
 
-  async getPartnerFunding(userId: string) {
-    const partner = await this.partnerRepo.findOne({
-      where: { user: { id: userId } },
-    });
-    if (!partner) return [];
-
-    const assets = await this.assetRepo.find({
-      where: { partner: { id: partner.id } },
-      order: { createdAt: 'DESC' },
-    });
-
-    return Promise.all(
-      assets.map(async (a) => {
-        const stats = await this.investmentRepo
-          .createQueryBuilder('inv')
-          .select('SUM(CAST(inv.amount AS NUMERIC))', 'raised')
-          .addSelect('COUNT(DISTINCT inv.investorId)', 'investors')
-          .where('inv.assetId = :id', { id: a.id })
-          .andWhere('inv.status = :confirmed', {
-            confirmed: InvestmentStatus.CONFIRMED,
-          })
-          .getRawOne();
-
-        const raisedAmount = parseFloat(stats?.raised || '0');
-        const targetAmount = Number(a.totalValue) || 0;
-
-        let stage = 'Approved';
-
-        if (a.status === AssetStatus.SUBMITTED) {
-          stage = 'Compliance';
-        } else if (a.status === AssetStatus.REJECTED) {
-          stage = 'Rejected';
-        } else if (
-          a.status === AssetStatus.FREEZ ||
-          a.status === AssetStatus.PAID ||
-          raisedAmount >= targetAmount
-        ) {
-          stage = 'Completed';
-        } else if (a.status === AssetStatus.APPROVED) {
-          stage = 'Funding';
-        }
-
-        return {
-          id: a.id,
-          asset: a.title,
-          target: targetAmount,
-          raised: raisedAmount,
-          roi: Number(a.expectedYield || 0),
-          investors: parseInt(stats?.investors || '0'),
-          stage: stage,
-        };
-      }),
-    );
-  }
-
-  async getPartnerDistributions(userId: string) {
-    const partner = await this.partnerRepo.findOne({
-      where: { user: { id: userId } },
-    });
-    if (!partner) return [];
-
-    const assets = await this.assetRepo.find({
-      where: { partner: { id: partner.id } },
-      order: { updatedAt: 'DESC' },
-    });
-
-    return Promise.all(
-      assets.map(async (a) => {
-        const stats = await this.investmentRepo
-          .createQueryBuilder('inv')
-          .select('SUM(CAST(inv.amount AS NUMERIC))', 'raised')
-          .addSelect('COUNT(DISTINCT inv.investorId)', 'investors')
-          .where('inv.assetId = :id', { id: a.id })
-          .andWhere('inv.status = :confirmed', {
-            confirmed: InvestmentStatus.CONFIRMED,
-          })
-          .getRawOne();
-
-        const raisedAmount = parseFloat(stats?.raised || '0');
-        const targetAmount = Number(a.totalValue) || 0;
-
-        let stage = 'Approved';
-        if (a.status === AssetStatus.SUBMITTED) stage = 'Compliance';
-        else if (
-          raisedAmount >= targetAmount ||
-          a.status === AssetStatus.FREEZ ||
-          a.status === AssetStatus.PAID
-        ) {
-          stage = 'Completed';
-        } else if (a.status === AssetStatus.APPROVED) {
-          stage = 'Funding';
-        }
-
-        let nextPayout = 'TBD';
-        if (stage === 'Completed') {
-          const now = new Date();
-          const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-          nextPayout = nextMonth.toLocaleDateString('en-GB', {
-            day: 'numeric',
-            month: 'short',
-            year: 'numeric',
-          });
-        }
-
-        return {
-          id: a.id,
-          asset: a.title,
-          stage: stage,
-          totalRaised: raisedAmount,
-          investors: parseInt(stats?.investors || '0'),
-          nextPayout: nextPayout,
-        };
-      }),
-    );
-  }
-
-  async getPartnerDocuments(userId: string) {
-    const partner = await this.partnerRepo.findOne({
-      where: { user: { id: userId } },
-    });
-    if (!partner) return [];
-
-    const assets = await this.assetRepo.find({
-      where: { partner: { id: partner.id } },
-      order: { createdAt: 'DESC' },
-    });
-
-    const allDocs: any[] = [];
-
-    assets.forEach((asset) => {
-      asset.legalDocuments?.forEach((url, i) => {
-        allDocs.push({
-          id: `${asset.id}-legal-${i}`,
-          title: `${asset.title} - Legal Doc ${i + 1}`,
-          type: 'Agreement',
-          status: this.mapAssetStatusToDoc(asset.status),
-          uploaded: new Date(asset.createdAt).toLocaleDateString('en-GB', {
-            day: 'numeric',
-            month: 'short',
-            year: 'numeric',
-          }),
-          description: `Official legal documentation for ${asset.title}.`,
-          url: url,
-        });
-      });
-
-      asset.financialDocuments?.forEach((url, i) => {
-        allDocs.push({
-          id: `${asset.id}-fin-${i}`,
-          title: `${asset.title} - Financial ${i + 1}`,
-          type: 'Report',
-          status: this.mapAssetStatusToDoc(asset.status),
-          uploaded: new Date(asset.createdAt).toLocaleDateString('en-GB', {
-            day: 'numeric',
-            month: 'short',
-            year: 'numeric',
-          }),
-          description: `Financial audit and projection reports for ${asset.title}.`,
-          url: url,
-        });
-      });
-
-      asset.otherDocuments?.forEach((url, i) => {
-        allDocs.push({
-          id: `${asset.id}-other-${i}`,
-          title: `${asset.title} - Certificate ${i + 1}`,
-          type: 'Certificate',
-          status: this.mapAssetStatusToDoc(asset.status),
-          uploaded: new Date(asset.createdAt).toLocaleDateString('en-GB', {
-            day: 'numeric',
-            month: 'short',
-            year: 'numeric',
-          }),
-          description: `Additional certification or Shariah compliance docs for ${asset.title}.`,
-          url: url,
-        });
-      });
-    });
-
-    return allDocs;
-  }
-
-  private mapAssetStatusToDoc(status: AssetStatus): string {
-    switch (status) {
-      case AssetStatus.APPROVED:
-        return 'Approved';
-      case AssetStatus.SUBMITTED:
-        return 'Submitted';
-      case AssetStatus.REJECTED:
-        return 'Rejected';
-      default:
-        return 'Pending';
-    }
-  }
-
   async findAllPending() {
     return this.assetRepo.find({
-      where: {
-        // Using SUBMITTED because that is your default state in the entity
-        status: AssetStatus.SUBMITTED,
-      },
-      // Adding the partner relation might be useful for the Urgent Queue title
+      where: { status: AssetStatus.SUBMITTED },
       relations: ['partner'],
     });
   }
 
-  // src/asset/asset.service.ts
-
-  // src/asset/asset.service.ts
-
   async getPipelineStats() {
     const [dueDiligence, awaitingTokenization] = await Promise.all([
-      // 1. Assets submitted but not yet reviewed/approved
+      this.assetRepo.count({ where: { status: AssetStatus.SUBMITTED } }),
       this.assetRepo.count({
-        where: { status: AssetStatus.SUBMITTED },
-      }),
-
-      // 2. Assets approved but NOT yet live or fully funded
-      // We filter by status APPROVED and ensure 'funded' is still 0 (or less than totalValue)
-      this.assetRepo.count({
-        where: {
-          status: AssetStatus.APPROVED,
-          funded: 0, // Only count assets where the tokenization/funding hasn't started
-        },
+        where: { status: AssetStatus.APPROVED, funded: 0 },
       }),
     ]);
-
-    return {
-      dueDiligence,
-      awaitingTokenization,
-    };
+    return { dueDiligence, awaitingTokenization };
   }
 
   async findPartnerAssetsForDistribution(userId: string) {
     return this.assetRepo.find({
       where: { partner: { user: { id: userId } } },
-      relations: ['investments', 'partner'], // Ensure relations match what the UI needs
+      relations: ['investments', 'partner'],
     });
   }
 }

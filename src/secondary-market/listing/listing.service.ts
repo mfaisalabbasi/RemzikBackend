@@ -4,7 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, EntityManager } from 'typeorm';
 import { SecondaryMarketListing } from './listing.entity';
 import { CreateListingDto } from './dto/create-listing.dto';
 import { OwnershipService } from '../../ownership/ownership.service';
@@ -25,38 +25,63 @@ export class ListingService {
     sellerId: string,
     dto: CreateListingDto,
   ): Promise<SecondaryMarketListing> {
-    const ownedUnits = await this.ownershipService.getUserUnitsForAsset(
-      sellerId,
-      dto.assetId,
+    // 🛡️ RUN INSIDE TRANSACTION TO PREVENT DOUBLE-LISTING RACE CONDITION
+    return await this.listingRepo.manager.transaction(
+      async (manager: EntityManager) => {
+        const ownedUnits = await this.ownershipService.getUserUnitsForAsset(
+          sellerId,
+          dto.assetId,
+        );
+
+        // 🔍 Find all currently active listings by this user for this asset
+        const activeListings = await manager.find(SecondaryMarketListing, {
+          where: {
+            sellerId,
+            assetId: dto.assetId,
+            status: ListingStatus.ACTIVE,
+          },
+        });
+
+        const totalCurrentlyListed = activeListings.reduce(
+          (sum, item) => sum + Number(item.unitsForSale),
+          0,
+        );
+
+        const availableLiquidUnits = Number(ownedUnits) - totalCurrentlyListed;
+
+        if (availableLiquidUnits < Number(dto.unitsForSale)) {
+          throw new BadRequestException(
+            `Insufficient units. You own ${ownedUnits} units, but ${totalCurrentlyListed} are already locked in active listings. Available: ${availableLiquidUnits}`,
+          );
+        }
+
+        const listing = manager.create(SecondaryMarketListing, {
+          sellerId,
+          assetId: dto.assetId,
+          unitsForSale: dto.unitsForSale,
+          pricePerUnit: dto.pricePerUnit,
+          expiresAt: dto.expiresAt ? new Date(dto.expiresAt) : null,
+          status: ListingStatus.ACTIVE,
+        });
+
+        const savedListing = await manager.save(listing);
+
+        await this.auditService.log(
+          {
+            adminId: sellerId,
+            targetId: savedListing.id,
+            action: AdminAction.LISTING_CREATED,
+            reason: `Created listing for ${dto.unitsForSale} units of asset ${dto.assetId}`,
+          },
+          manager,
+        );
+
+        return savedListing;
+      },
     );
-
-    if (ownedUnits < dto.unitsForSale) {
-      throw new BadRequestException(
-        `Insufficient units. You own ${ownedUnits} but tried to list ${dto.unitsForSale}.`,
-      );
-    }
-
-    const listing = this.listingRepo.create({
-      sellerId,
-      assetId: dto.assetId,
-      unitsForSale: dto.unitsForSale,
-      pricePerUnit: dto.pricePerUnit,
-      expiresAt: dto.expiresAt ? new Date(dto.expiresAt) : null,
-      status: ListingStatus.ACTIVE,
-    });
-
-    const savedListing = await this.listingRepo.save(listing);
-
-    await this.auditService.log({
-      adminId: sellerId,
-      targetId: savedListing.id,
-      action: AdminAction.LISTING_CREATED,
-      reason: `Created listing for ${dto.unitsForSale} units of asset ${dto.assetId}`,
-    });
-
-    return savedListing;
   }
 
+  // Keep read methods unchanged...
   async getActiveListingsByAsset(
     assetId: string,
   ): Promise<SecondaryMarketListing[]> {

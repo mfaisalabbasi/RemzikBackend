@@ -120,9 +120,14 @@ export class AssetController {
     return this.assetService.getApprovedAssets();
   }
 
+  /**
+   * ✅ UPDATED: Passing security context
+   */
   @Get(':id')
-  getAsset(@Param('id') id: string) {
-    return this.assetService.getAssetById(id);
+  getAsset(@Req() req, @Param('id') id: string) {
+    const userId = req.user?.userId || req.user?.id;
+    const isAdmin = req.user?.role === UserRole.ADMIN;
+    return this.assetService.getAssetById(id, userId, isAdmin);
   }
 
   @Get('partner/funding')

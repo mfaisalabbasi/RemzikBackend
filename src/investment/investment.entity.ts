@@ -27,22 +27,43 @@ export class Investment {
   asset: Asset;
 
   /**
-   * Amount invested
+   * Amount invested in currency (e.g., SAR)
    */
-  // src/investment/investment.entity.ts
-
   @Column({
     type: 'decimal',
     precision: 15,
     scale: 2,
     transformer: {
-      // When saving to DB, keep it as is
       to: (value: number) => value,
-      // When reading from DB, turn the string into a number
       from: (value: string) => parseFloat(value),
     },
   })
   amount: number;
+
+  /**
+   * ✅ NEW: Quantity of tokens/units purchased
+   */
+  @Column({
+    type: 'int',
+    default: 0,
+  })
+  units: number;
+
+  /**
+   * ✅ NEW: Snapshot of the unit price at the time of purchase
+   * Essential for historical audits and ROI calculations.
+   */
+  @Column({
+    type: 'decimal',
+    precision: 15,
+    scale: 2,
+    nullable: true,
+    transformer: {
+      to: (value: number) => value,
+      from: (value: string) => (value ? parseFloat(value) : null),
+    },
+  })
+  unitPriceAtPurchase: number;
 
   /**
    * Payment lifecycle

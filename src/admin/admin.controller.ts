@@ -112,8 +112,26 @@ export class AdminController {
   @Patch('investors/:id/approve-kyc')
   @Roles(UserRole.ADMIN)
   async approveKyc(@Param('id') id: string, @Req() req) {
-    // FIXED: Passing req.user.userId
     return this.adminService.approveKyc(id, req.user.userId);
+  }
+
+  /**
+   * FIXED: Standardized to req.user.userId to ensure Audit Logs get the Admin ID
+   */
+  @Patch('investors/:id/reject-kyc')
+  @Roles(UserRole.ADMIN)
+  async reject(
+    @Param('id') id: string,
+    @Body() body: { reason: string },
+    @Req() req: any,
+  ) {
+    const adminId = req.user?.userId;
+
+    if (!adminId) {
+      throw new UnauthorizedException('Admin ID not found in token');
+    }
+
+    return await this.adminService.rejectKyc(id, body.reason, adminId);
   }
 
   @Patch('investors/:id/toggle-freeze')
@@ -123,7 +141,6 @@ export class AdminController {
     @Body('reason') reason: string,
     @Req() req,
   ) {
-    // FIXED: Passing req.user.userId
     return this.adminService.toggleAccountFreeze(id, reason, req.user.userId);
   }
 
@@ -178,7 +195,6 @@ export class AdminController {
     @Body('status') status: string,
     @Req() req,
   ) {
-    // FIXED: Passing req.user.userId
     return await this.adminService.updatePartnerStatus(
       id,
       status,
@@ -207,7 +223,6 @@ export class AdminController {
     @Body() body: { status: string; rejectionReason?: string },
     @Req() req,
   ) {
-    // FIXED: Passing req.user.userId and fallback for reason
     return await this.adminService.updateAssetStatus(
       id,
       body.status,
@@ -233,42 +248,29 @@ export class AdminController {
   async getMyActivity(@Req() req) {
     return this.adminService.getMyAdminActivity(req.user.userId);
   }
-  // --- Yield Distribution Management ---
 
-  /**
-   * Fetches all unique pending distribution batches for Faisal's review
-   */
   @Get('distributions/pending')
   @Roles(UserRole.ADMIN)
   async getPendingBatches() {
-    // You'll need to implement this helper in your DistributionService
     return this.distributionService.getGlobalPendingBatches();
   }
 
-  /**
-   * Approves a batch, credits investor wallets, and marks records as PAID
-   */
   @Post('distributions/approve/:batchId')
   @Roles(UserRole.ADMIN)
   async approveDistribution(@Param('batchId') batchId: string, @Req() req) {
     const result =
       await this.distributionService.approveDistributionBatch(batchId);
 
-    // Optional: Send a broadcast to the partner that their distribution was processed
-    // Inside AdminController.approveDistribution
     await this.broadcastService.sendTargeted(
-      req.user.userId, // Or the partner's ID
+      req.user.userId,
       'Yield Distribution Processed',
       `Batch ${batchId} has been successfully approved and paid out.`,
-      'DIRECTIVE', // Use an existing enum value from your system
+      'DIRECTIVE',
     );
 
     return result;
   }
 
-  /**
-   * Rejects a batch if the partner made a mistake
-   */
   @Post('distributions/reject/:batchId')
   @Roles(UserRole.ADMIN)
   async rejectDistribution(
@@ -292,8 +294,6 @@ export class AdminController {
     @Body('reason') reason: string,
     @Req() req,
   ) {
-    // Map frontend string "APPROVED" to your enum "APPROVE" if they differ
-    // If your Enum already matches, you can pass status directly.
     const action =
       status === 'APPROVED' ? AdminAction.APPROVE : AdminAction.REJECT;
 
@@ -305,5 +305,14 @@ export class AdminController {
       },
       req.user.userId,
     );
+  }
+  @Patch('partners/:id/toggle-freeze')
+  @Roles(UserRole.ADMIN)
+  async togglePartnerFreeze(
+    @Param('id') id: string, // partnerProfileId
+    @Body('reason') reason: string,
+    @Req() req,
+  ) {
+    return this.adminService.togglePartnerFreeze(id, reason, req.user.userId);
   }
 }

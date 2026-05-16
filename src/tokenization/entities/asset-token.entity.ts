@@ -17,26 +17,33 @@ export class AssetToken {
   /**
    * Which asset is tokenized
    */
-  @OneToOne(() => Asset)
+  @OneToOne(() => Asset, (asset) => asset.token)
   @JoinColumn()
   asset: Asset;
 
   /**
-   * Total number of shares
+   * ✅ PRECISION UPDATE: Total number of shares
    */
-  @Column({ type: 'decimal', precision: 18, scale: 6, default: 0 })
+  @Column({ type: 'decimal', precision: 20, scale: 4, default: 0 })
   totalShares: number;
 
   /**
-   * Price of one share
+   * Price of one share (Currency: Scale 2)
    */
-  @Column('decimal', { precision: 15, scale: 2 })
+  @Column('decimal', {
+    precision: 15,
+    scale: 2,
+    transformer: {
+      to: (v: number) => v,
+      from: (v: string) => parseFloat(v),
+    },
+  })
   sharePrice: number;
 
   /**
-   * Shares still available
+   * ✅ PRECISION UPDATE: Shares still available
    */
-  @Column({ type: 'decimal', precision: 18, scale: 6, default: 0 })
+  @Column({ type: 'decimal', precision: 20, scale: 4, default: 0 })
   availableShares: number;
 
   @CreateDateColumn()

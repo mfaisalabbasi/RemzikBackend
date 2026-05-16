@@ -4,10 +4,10 @@ import {
   IsNumber,
   IsString,
   IsOptional,
+  Min,
 } from 'class-validator';
 
 import { Type } from 'class-transformer';
-
 import { AssetType } from '../enums/asset-type.enum';
 
 export class CreateAssetDto {
@@ -15,15 +15,16 @@ export class CreateAssetDto {
   type: AssetType;
 
   @IsString()
-  @IsNotEmpty()
+  @IsNotEmpty({ message: 'Title cannot be empty or blank spaces' })
   title: string;
 
   @IsString()
-  @IsNotEmpty()
+  @IsNotEmpty({ message: 'Description cannot be empty or blank spaces' })
   description: string;
 
   @Type(() => Number)
-  @IsNumber()
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(1, { message: 'Total value must be at least 1' })
   totalValue: number;
 
   @IsOptional()
@@ -33,20 +34,24 @@ export class CreateAssetDto {
   @IsOptional()
   @Type(() => Number)
   @IsNumber()
+  @Min(0, { message: 'Expected yield cannot be negative' })
   expectedYield?: number;
 
   @IsOptional()
   @Type(() => Number)
   @IsNumber()
+  @Min(0, { message: 'Rental income cannot be negative' })
   rentalIncome?: number;
 
   @IsOptional()
   @Type(() => Number)
   @IsNumber()
+  @Min(0.01, { message: 'Asset size must be greater than 0' })
   assetSize?: number;
 
-  @IsOptional()
+  // ✅ MADE REQUIRED: Strict math guard needs this validated immediately
   @Type(() => Number)
-  @IsNumber()
-  tokenSupply?: number;
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(1, { message: 'Token supply must be at least 1' })
+  tokenSupply: number;
 }

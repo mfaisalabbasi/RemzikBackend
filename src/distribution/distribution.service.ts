@@ -17,12 +17,11 @@ import { AssetIncome } from 'src/asset/asset-income.entity';
 export class DistributionService {
   /**
    * CONFIG: Remzik Platform Fee (1%)
-   * In a trillion-dollar empire, every transaction fuels the ecosystem.
    */
   private readonly PLATFORM_FEE_PERCENT = 0.01;
 
   /**
-   * CONFIG: The central treasury account where platform fees are collected.
+   * CONFIG: Central treasury account context
    */
   private readonly ADMIN_WALLET_USER_ID = 'SYSTEM_REVENUE_ACCOUNT';
 
@@ -36,25 +35,27 @@ export class DistributionService {
   ) {}
 
   /**
-   * ✅ THE FINTECH ENTRY POINT
-   * Partners trigger payouts by referencing a specific Income Report.
-   * This ensures every payout is backed by real-world asset performance.
+   * ✅ THE FINTECH ENTRY POINT (FIXED FOR POSTGRES LOCKING CONSTRAINTS)
    */
   async triggerDistributionFromIncome(incomeId: string, partnerUserId: string) {
+    // 1. 🛡️ FIREWALL: Block execution immediately if auth context failed to pass down the ID
+    if (!partnerUserId) {
+      throw new BadRequestException(
+        'Partner authentication identity context is missing.',
+      );
+    }
+
     return await this.dataSource.transaction(async (manager) => {
-      // 1. Fetch and validate the specific income record
-      const income = await manager.findOne(AssetIncome, {
-        where: {
-          id: incomeId,
-          asset: { partner: { user: { id: partnerUserId } } },
-        },
-        relations: ['asset', 'asset.partner', 'asset.partner.user'],
-      });
+      // 2. Lock ONLY the primary income record row. No relations joined here to stay compliant with Postgres FOR UPDATE constraints.
+      const income = await manager
+        .getRepository(AssetIncome)
+        .createQueryBuilder('income')
+        .setLock('pessimistic_write')
+        .where('income.id = :incomeId', { incomeId })
+        .getOne();
 
       if (!income) {
-        throw new NotFoundException(
-          'Income record not found or unauthorized access.',
-        );
+        throw new NotFoundException('Income record not found.');
       }
 
       if (income.isDistributed) {
@@ -63,15 +64,29 @@ export class DistributionService {
         );
       }
 
-      // 2. Lock the income record to prevent double-spending/double-payouts
+      // 3. Fetch relational records cleanly without locks to perform security ownership context validation safely
+      const fullAssetContext = await manager.findOne(AssetIncome, {
+        where: { id: incomeId },
+        relations: ['asset', 'asset.partner', 'asset.partner.user'],
+      });
+
+      if (
+        !fullAssetContext ||
+        fullAssetContext.asset?.partner?.user?.id !== partnerUserId
+      ) {
+        throw new BadRequestException(
+          'Unauthorized access: Asset partner profile ownership mismatch.',
+        );
+      }
+
+      // 4. Flip state immediately inside locked scope
       income.isDistributed = true;
       await manager.save(income);
 
-      // 3. Chain to the yield distribution logic
-      // We pass the manager to ensure this all happens in ONE atomic transaction
+      // 5. Chain directly to the pro-rata engine using the same operational manager
       return this.triggerYieldDistribution(
         partnerUserId,
-        income.asset.id,
+        fullAssetContext.asset.id,
         Number(income.netAmount),
         manager,
       );
@@ -79,8 +94,7 @@ export class DistributionService {
   }
 
   /**
-   * CORE DISTRIBUTION LOGIC
-   * Calculates pro-rata shares for all beneficial owners.
+   * CORE DISTRIBUTION LOGIC (REMAINDER BALANCED)
    */
   async triggerYieldDistribution(
     partnerUserId: string,
@@ -89,7 +103,6 @@ export class DistributionService {
     existingManager?: EntityManager,
   ) {
     const work = async (manager: EntityManager) => {
-      // 1. SOLVENCY GUARD: Verify Partner has the cash available in their wallet
       const partnerBalance =
         await this.walletService.getAvailableBalance(partnerUserId);
       if (partnerBalance < totalAmount) {
@@ -98,12 +111,8 @@ export class DistributionService {
         );
       }
 
-      // 2. SNAPSHOT OWNERSHIP: Find everyone holding units at this exact moment
       const currentHolders = await manager.find(Ownership, {
-        where: {
-          assetId: assetId,
-          units: MoreThan(0),
-        },
+        where: { assetId: assetId, units: MoreThan(0) },
         relations: ['asset', 'investor', 'investor.user'],
       });
 
@@ -120,25 +129,37 @@ export class DistributionService {
 
       const batchId = `BATCH-${Date.now()}-${assetId.substring(0, 4)}`;
 
-      // 3. CREATE PENDING DISTRIBUTION RECORDS
-      // These will stay PENDING until the Admin approves the batch
-      const distributionPromises = currentHolders.map(async (holder) => {
-        const userShareOfUnits = Number(holder.units) / totalUnitsCirculating;
-        const grossUserYield = totalAmount * userShareOfUnits;
+      let allocatedGrossTotal = 0;
 
-        return manager.save(
+      // SEQUENTIAL LOOP IMPLEMENTING RUNNING PENNY CALCULATION
+      for (let i = 0; i < currentHolders.length; i++) {
+        const holder = currentHolders[i];
+        const isLastInvestor = i === currentHolders.length - 1;
+
+        let grossUserYield = 0;
+
+        if (isLastInvestor) {
+          // The absolute last investor absorbs the fractional drifting remainder
+          const rawLastYield = totalAmount - allocatedGrossTotal;
+          grossUserYield = Math.round(rawLastYield * 100) / 100;
+        } else {
+          const userShareOfUnits = Number(holder.units) / totalUnitsCirculating;
+          grossUserYield =
+            Math.round(totalAmount * userShareOfUnits * 100) / 100;
+          allocatedGrossTotal += grossUserYield;
+        }
+
+        await manager.save(
           manager.create(Distribution, {
             asset: holder.asset,
             investor: holder.investor,
-            amount: grossUserYield, // Gross amount before fees
+            amount: grossUserYield,
             period: new Date().toISOString(),
             status: PayoutStatus.PENDING,
             batchId: batchId,
           }),
         );
-      });
-
-      await Promise.all(distributionPromises);
+      }
 
       return {
         success: true,
@@ -155,8 +176,7 @@ export class DistributionService {
   }
 
   /**
-   * THE SETTLEMENT ENGINE
-   * Once Admin approves, money moves across the ecosystem.
+   * THE SETTLEMENT ENGINE (SEQUENTIAL & PENNY BALANCED)
    */
   async approveDistributionBatch(batchId: string) {
     return await this.dataSource.transaction(async (manager) => {
@@ -178,31 +198,29 @@ export class DistributionService {
       const partnerUserId = pendingPayouts[0].asset.partner.user.id;
       const assetTitle = pendingPayouts[0].asset.title;
 
-      // 1. CALCULATE TOTALS & FEES
       const totalGrossAmount = pendingPayouts.reduce(
         (sum, p) => sum + Number(p.amount),
         0,
       );
-      const platformFee = totalGrossAmount * this.PLATFORM_FEE_PERCENT;
-      const totalNetToInvestors = totalGrossAmount - platformFee;
 
-      // 2. DEBIT THE PARTNER (Source of Funds)
+      const platformFee =
+        Math.round(totalGrossAmount * this.PLATFORM_FEE_PERCENT * 100) / 100;
+
+      // 1. DEBIT THE PARTNER FOR THE TOTAL GROSS
       await this.walletService.debitAvailable(
         partnerUserId,
         totalGrossAmount,
         manager,
       );
-
-      // Log the debit in the ledger
       await this.walletService.credit(
         partnerUserId,
-        0, // Transaction record
+        0,
         LedgerSource.DISTRIBUTION,
         `DEBIT: Yield Payout for ${assetTitle}`,
         manager,
       );
 
-      // 3. CREDIT THE REMZIK TREASURY (Platform Revenue)
+      // 2. CREDIT SYSTEM REVENUE TREASURY
       if (platformFee > 0) {
         await this.walletService.credit(
           this.ADMIN_WALLET_USER_ID,
@@ -213,10 +231,26 @@ export class DistributionService {
         );
       }
 
-      // 4. CREDIT INVESTORS (Net Payouts)
-      const payoutPromises = pendingPayouts.map(async (payout) => {
-        const individualNetYield =
-          Number(payout.amount) * (1 - this.PLATFORM_FEE_PERCENT);
+      let distributedNetTotal = 0;
+      const totalNetToInvestors =
+        Math.round((totalGrossAmount - platformFee) * 100) / 100;
+
+      // 3. SEQUENTIAL LOOP PROCESSING (NO POOL CONCURRENCY OVERHEAD)
+      for (let i = 0; i < pendingPayouts.length; i++) {
+        const payout = pendingPayouts[i];
+        const isLastInvestor = i === pendingPayouts.length - 1;
+
+        let individualNetYield = 0;
+
+        if (isLastInvestor) {
+          individualNetYield =
+            Math.round((totalNetToInvestors - distributedNetTotal) * 100) / 100;
+        } else {
+          const rawNetYield =
+            Number(payout.amount) * (1 - this.PLATFORM_FEE_PERCENT);
+          individualNetYield = Math.round(rawNetYield * 100) / 100;
+          distributedNetTotal += individualNetYield;
+        }
 
         await this.walletService.creditEarned(
           payout.investor.user.id,
@@ -226,13 +260,10 @@ export class DistributionService {
           manager,
         );
 
-        // Update record to final state
         payout.status = PayoutStatus.PAID;
         payout.amount = individualNetYield;
-        return manager.save(payout);
-      });
-
-      await Promise.all(payoutPromises);
+        await manager.save(payout);
+      }
 
       return {
         success: true,
@@ -246,10 +277,6 @@ export class DistributionService {
     });
   }
 
-  /**
-   * ADMIN DASHBOARD QUERY
-   * Fetches all batches waiting for manual verification.
-   */
   async getGlobalPendingBatches() {
     return this.dataSource.query(`
       SELECT 
@@ -267,13 +294,7 @@ export class DistributionService {
     `);
   }
 
-  /**
-   * REJECTION LOGIC
-   * If the Admin sees an error, they can wipe the batch and let the partner try again.
-   */
   async rejectDistributionBatch(batchId: string, reason: string) {
-    // Note: In a production 'Empire', you'd likely update the status to 'REJECTED'
-    // and log the 'reason' instead of deleting.
     return await this.distributionRepo.delete({
       batchId,
       status: PayoutStatus.PENDING,

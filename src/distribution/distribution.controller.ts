@@ -2,24 +2,34 @@ import {
   Controller,
   Post,
   Body,
-  Param,
   UseGuards,
   Request,
+  BadRequestException,
+  Param,
 } from '@nestjs/common';
 import { DistributionService } from './distribution.service';
 import { JwtAuthGuard } from 'src/auth/guards/jwt.gaurd';
+
 @Controller('distributions')
 export class DistributionController {
   constructor(private readonly distributionService: DistributionService) {}
 
   /**
-   * ✅ NEW ENDPOINT: Triggered from Income Report
-   * Frontend: poster(`/distributions/trigger-from-income`, { incomeId })
+   * ✅ FIXED: Destructured body parsing + Accurate Strategy property matching
    */
   @UseGuards(JwtAuthGuard)
   @Post('trigger-from-income')
-  async triggerFromIncome(@Body('incomeId') incomeId: string, @Request() req) {
-    const partnerUserId = req.user.id;
+  async triggerFromIncome(@Body() body: { incomeId: string }, @Request() req) {
+    const incomeId = body?.incomeId;
+    if (!incomeId) {
+      throw new BadRequestException(
+        'The payload field "incomeId" is missing or unreadable.',
+      );
+    }
+
+    // 🛡️ MATCHES STRATEGY: Grab "userId", not "id"
+    const partnerUserId = req.user?.userId;
+
     return await this.distributionService.triggerDistributionFromIncome(
       incomeId,
       partnerUserId,
@@ -27,8 +37,7 @@ export class DistributionController {
   }
 
   /**
-   * LEGACY/MANUAL ENDPOINT
-   * Frontend: poster(`/partner/assets/${assetId}/distribute`, { amount })
+   * ✅ FIXED: Legacy route property tracking adjustment
    */
   @UseGuards(JwtAuthGuard)
   @Post('partner/assets/:id/distribute')
@@ -37,8 +46,11 @@ export class DistributionController {
     @Body('amount') amount: number,
     @Request() req,
   ) {
+    // 🛡️ MATCHES STRATEGY: Grab "userId"
+    const partnerUserId = req.user?.userId;
+
     return await this.distributionService.triggerYieldDistribution(
-      req.user.id,
+      partnerUserId,
       assetId,
       amount,
     );

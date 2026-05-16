@@ -12,40 +12,40 @@ import { KycProfile } from '../kyc/kyc.entity'; // Adjust path as needed
 @Entity('users')
 export class User {
   @PrimaryGeneratedColumn('uuid')
-  id: string;
+  id!: string;
 
   @Column({ unique: true })
-  email: string;
+  email!: string;
 
   @Column()
-  name: string;
+  name!: string;
+
+  @Column({ unique: true })
+  phone!: string;
 
   @Column()
-  phone: string;
-
-  @Column()
-  password: string;
+  password!: string;
 
   @Column({
     type: 'enum',
     enum: UserRole,
   })
-  role: UserRole;
+  role!: UserRole;
 
   // ✅ ADD THIS RELATION
   // This allows TypeORM to find the KYC record via the User
   @OneToOne(() => KycProfile, (kyc) => kyc.user)
-  kyc: KycProfile;
+  kyc!: KycProfile;
 
   @Column({ default: false })
-  isVerified: boolean;
+  isVerified!: boolean;
 
   @Column({ default: true })
-  isActive: boolean;
+  isActive!: boolean;
 
   @CreateDateColumn()
-  createdAt: Date;
+  createdAt!: Date;
 
   @UpdateDateColumn()
-  updatedAt: Date;
+  updatedAt!: Date;
 }

@@ -15,6 +15,7 @@ import { OwnershipService } from 'src/ownership/ownership.service';
 import { WalletService } from 'src/wallet/wallet.service';
 import { LedgerSource } from 'src/ledger/enums/ledger-source.enum';
 import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
+import { Ownership } from 'src/ownership/ownership.entity';
 
 @Injectable()
 export class InvestmentService {
@@ -33,16 +34,16 @@ export class InvestmentService {
     userId: string,
     dto: CreateInvestmentDto,
   ): Promise<Investment> {
-    const availableBalance =
-      await this.walletService.getAvailableBalance(userId);
-    if (availableBalance < dto.amount) {
-      throw new BadRequestException(
-        `Insufficient balance. Required: SAR ${dto.amount.toLocaleString()}. Available: SAR ${availableBalance.toLocaleString()}.`,
-      );
-    }
-
+    // Execute everything inside the transaction to guarantee isolation
     const savedInvestment = await this.investmentRepo.manager.transaction(
       async (manager: EntityManager) => {
+        // 1. 🛡️ FIREWALL: Check balance INSIDE the transaction boundary to block double-spend
+        const availableBalance =
+          await this.walletService.getAvailableBalance(userId);
+        if (availableBalance < dto.amount) {
+          throw new BadRequestException(`Insufficient balance.`);
+        }
+
         const investor = await manager.findOne(InvestorProfile, {
           where: { user: { id: userId } },
           relations: ['user'],
@@ -50,6 +51,7 @@ export class InvestmentService {
         if (!investor)
           throw new BadRequestException('Investor profile not found');
 
+        // ✅ Pessimistic Lock prevents over-subscription
         const token = await manager
           .getRepository(AssetToken)
           .createQueryBuilder('token')
@@ -59,57 +61,65 @@ export class InvestmentService {
 
         if (!token) throw new BadRequestException('Asset is not tokenized');
 
-        // Load Asset with Partner relation to identify the beneficiary
         const asset = await manager.findOne(Asset, {
           where: { id: dto.assetId },
           relations: ['partner', 'partner.user'],
         });
         if (!asset) throw new BadRequestException('Asset not found');
-        if (!asset.partner?.user?.id)
-          throw new BadRequestException(
-            'Asset partner beneficiary not defined',
-          );
 
+        // Calculate exact shares up to 4 decimal points
         const sharesToBuy = Number(dto.amount) / Number(token.sharePrice);
+        const preciseShares = Math.round(sharesToBuy * 10000) / 10000;
 
-        if (sharesToBuy > Number(token.availableShares)) {
+        // Check availability within the locked transaction
+        if (preciseShares > Number(token.availableShares)) {
           throw new BadRequestException(
-            'Not enough shares available for this purchase',
+            'Not enough shares available (Sold Out or Over-subscribed)',
           );
         }
 
-        /**
-         * ✅ FIX: DYNAMIC CAPITAL FLOW
-         * Moves money from the Investor's Available balance to the Partner's Available balance.
-         */
+        // ✅ UNIQUE INVESTOR CHECK
+        const existingOwnership = await manager.findOne(Ownership, {
+          where: { investorId: investor.id, assetId: asset.id },
+        });
+
+        if (!existingOwnership) {
+          asset.investors = (asset.investors || 0) + 1;
+        }
+
+        // Deduct/Transfer balances
         await this.walletService.transfer(
           userId,
           asset.partner.user.id,
           dto.amount,
           LedgerSource.ASSET_INVESTMENT,
-          `Investment from ${investor.user.id} for asset ${asset.title}`,
+          `Investment for asset ${asset.title}`,
           manager,
         );
 
-        token.availableShares = Number(token.availableShares) - sharesToBuy;
+        token.availableShares = Number(token.availableShares) - preciseShares;
         await manager.save(token);
 
         asset.funded = Number(asset.funded) + Number(dto.amount);
-        asset.investors = (asset.investors || 0) + 1;
-        await manager.save(asset);
+        await manager.save(asset); // Persists both funded and investors metrics cleanly
 
+        // ✅ FIXED PRECISE UNITS: Using preciseShares instead of Math.floor to match ledger
         const investment = manager.create(Investment, {
           investor,
           asset,
           amount: dto.amount,
+          units: preciseShares,
+          unitPriceAtPurchase: Number(token.sharePrice),
           status: InvestmentStatus.CONFIRMED,
         });
+
         const result = await manager.save(investment);
 
+        // Match the ownership records exactly to the penny
         await this.ownershipService.addShares(
           investor,
           asset,
-          sharesToBuy,
+          preciseShares,
           manager,
         );
 
@@ -156,31 +166,46 @@ export class InvestmentService {
           throw new BadRequestException('Token metadata missing for asset');
 
         const shares = investment.amount / Number(token.sharePrice);
+        const preciseShares = Math.round(shares * 10000) / 10000;
 
-        // ✅ DYNAMIC FLOW: Release capital to Partner
+        const asset = investment.asset;
+
+        // ✅ UNIQUE INVESTOR CHECK Explicit Save
+        const existingOwnership = await manager.findOne(Ownership, {
+          where: {
+            investorId: investment.investor.id,
+            assetId: asset.id,
+          },
+        });
+
+        if (!existingOwnership) {
+          asset.investors = (asset.investors || 0) + 1;
+        }
+
         await this.walletService.transfer(
           investment.investor.user.id,
-          investment.asset.partner.user.id,
+          asset.partner.user.id,
           investment.amount,
           LedgerSource.ASSET_INVESTMENT,
-          `Funding Released: ${investment.asset.title}`,
+          `Funding Released: ${asset.title}`,
           manager,
         );
 
-        token.availableShares = Number(token.availableShares) - shares;
+        token.availableShares = Number(token.availableShares) - preciseShares;
         await manager.save(token);
 
-        const asset = investment.asset;
         asset.funded = Number(asset.funded) + Number(investment.amount);
-        asset.investors = (asset.investors || 0) + 1;
+        await manager.save(asset); // Ensure asset table is saved clearly
 
-        await manager.save(asset);
+        investment.unitPriceAtPurchase = Number(token.sharePrice);
+        investment.units = preciseShares; // Avoid truncating matching anomalies
+
         const result = await manager.save(investment);
 
         await this.ownershipService.addShares(
           investment.investor,
-          investment.asset,
-          shares,
+          asset,
+          preciseShares,
           manager,
         );
 
