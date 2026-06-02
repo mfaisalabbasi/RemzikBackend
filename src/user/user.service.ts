@@ -199,4 +199,32 @@ export class UserService {
       relations: ['kyc'],
     });
   }
+
+  async syncWalletAddress(userId: string, walletAddress: string): Promise<any> {
+    // 1. Fetch the user profile from the database
+    const user = await this.userRepo.findOne({ where: { id: userId } });
+    if (!user) {
+      throw new UnauthorizedException('User profile no longer exists');
+    }
+
+    // 2. Check if this exact wallet address is already taken by another account
+    const existingWalletOwner = await this.userRepo.findOne({
+      where: { walletAddress },
+    });
+
+    if (existingWalletOwner && existingWalletOwner.id !== userId) {
+      throw new BadRequestException(
+        'This wallet address is already linked to another account',
+      );
+    }
+
+    // 3. Atomically update the wallet column
+    user.walletAddress = walletAddress;
+    await this.userRepo.save(user);
+
+    return {
+      message: 'Cryptographic wallet anchored to profile successfully',
+      walletAddress: user.walletAddress,
+    };
+  }
 }

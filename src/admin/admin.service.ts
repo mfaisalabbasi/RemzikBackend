@@ -32,6 +32,7 @@ import { Asset } from 'src/asset/asset.entity';
 import { AssetStatus } from 'src/asset/enums/asset-status.enum';
 import { AuditLog } from 'src/audit/audit.entity';
 import { User } from 'src/user/user.entity';
+import { BlockchainService } from 'src/blockchain/blockchain.service';
 
 @Injectable()
 export class AdminService {
@@ -59,9 +60,9 @@ export class AdminService {
     @InjectRepository(AuditLog)
     private readonly auditLogRepo: Repository<AuditLog>,
     private readonly dataSource: DataSource,
+    private readonly blockchainService: BlockchainService,
   ) {}
 
-  // ... (getUrgentQueue remains unchanged) ...
   async getUrgentQueue(): Promise<UrgentTask[]> {
     const [pendingKyc, pendingPartners, pendingAssets] = await Promise.all([
       this.kycService.findAllPending(),
@@ -102,6 +103,7 @@ export class AdminService {
   /**
    * Refined KYC Action:
    * Rejection keeps the account ACTIVE so the user can re-upload.
+   * Pulls walletAddress directly from the User entity relation layout.
    */
   async handleKycAction(dto: AdminActionDto, adminId: string) {
     const kyc = await this.kycRepo.findOne({
@@ -113,18 +115,32 @@ export class AdminService {
 
     if (dto.action === AdminAction.APPROVE) {
       await this.kycService.approve(dto.targetId);
-      // FLIP THE SWITCH
       if (kyc.user) {
         kyc.user.isVerified = true;
         await this.dataSource.manager.save(User, kyc.user);
+
+        // On-chain Compliance sync using your explicit column layout
+        if (kyc.user.walletAddress) {
+          await this.blockchainService.registerIdentity(
+            kyc.user.walletAddress,
+            true,
+          );
+        }
       }
     } else if (dto.action === AdminAction.REJECT) {
       if (!dto.reason) throw new BadRequestException('Reason required');
       await this.kycService.reject(dto.targetId, dto.reason);
-      // FLIP THE SWITCH
       if (kyc.user) {
         kyc.user.isVerified = false;
         await this.dataSource.manager.save(User, kyc.user);
+
+        // On-chain Compliance revocation
+        if (kyc.user.walletAddress) {
+          await this.blockchainService.registerIdentity(
+            kyc.user.walletAddress,
+            false,
+          );
+        }
       }
     }
 
@@ -139,28 +155,35 @@ export class AdminService {
   /**
    * Directly approves an investor profile and flips isVerified.
    */
+  /**
+   * Refactored: Approve KYC (Investor)
+   */
   async approveKyc(investorProfileId: string, adminId: string) {
-    return await this.dataSource.transaction(async (manager: EntityManager) => {
-      const profile = await manager.findOne(InvestorProfile, {
-        where: { id: investorProfileId },
-        relations: ['user'],
-      });
+    const profile = await this.investorRepo.findOne({
+      where: { id: investorProfileId },
+      relations: ['user'],
+    });
+    if (!profile || !profile.user)
+      throw new BadRequestException('Profile or User not found');
 
-      if (!profile || !profile.user)
-        throw new BadRequestException('Profile or User not found');
+    // 1. BLOCKCHAIN GATE: Register identity on-chain BEFORE DB changes
+    if (profile.user.walletAddress) {
+      await this.blockchainService.registerIdentity(
+        profile.user.walletAddress,
+        true,
+      );
+    }
 
-      // 1. Update User verification status
+    // 2. ATOMIC DB TRANSACTION
+    return await this.dataSource.transaction(async (manager) => {
       profile.user.isVerified = true;
       await manager.save(User, profile.user);
-
-      // 2. Update KYC status via relationship
       await manager.update(
         KycProfile,
-        { user: { id: profile.user.id } }, // Targeting the User relation
+        { user: { id: profile.user.id } },
         { status: KycStatus.APPROVED },
       );
 
-      // 3. Ledger Record
       await this.ledgerService.record(
         {
           userId: profile.user.id,
@@ -172,18 +195,19 @@ export class AdminService {
         manager,
       );
 
-      // 4. Audit Log
-      await this.auditService.log({
-        adminId,
-        action: AdminAction.KYC_APPROVED,
-        targetId: investorProfileId,
-        reason: 'Manual KYC Approval via Admin Panel',
-      });
+      await this.auditService.log(
+        {
+          adminId,
+          action: AdminAction.KYC_APPROVED,
+          targetId: investorProfileId,
+          reason: 'Manual KYC Approval via Admin Panel',
+        },
+        manager,
+      );
 
       return { success: true };
     });
   }
-
   /**
    * Freeze/Unfreeze: The ultimate safety switch.
    */
@@ -194,9 +218,18 @@ export class AdminService {
     });
     if (!profile) throw new BadRequestException('Profile not found');
 
-    const currentlyActive = profile.user.isActive;
-    profile.user.isActive = !currentlyActive;
+    const nextActiveState = !profile.user.isActive;
 
+    // 1. BLOCKCHAIN GATE
+    if (profile.user.walletAddress) {
+      await this.blockchainService.toggleFreeze(
+        profile.user.walletAddress,
+        !nextActiveState,
+      );
+    }
+
+    // 2. DB UPDATE
+    profile.user.isActive = nextActiveState;
     await this.investorRepo.manager.save(profile.user);
 
     await this.ledgerService.record({
@@ -204,20 +237,20 @@ export class AdminService {
       amount: 0,
       type: LedgerType.ADJUSTMENT,
       source: LedgerSource.ADMIN_ADJUSTMENT,
-      description: currentlyActive
-        ? `ACCOUNT FROZEN: ${reason}`
-        : 'ACCOUNT UNFROZEN',
+      description: nextActiveState
+        ? 'ACCOUNT UNFROZEN'
+        : `ACCOUNT FROZEN: ${reason}`,
     });
 
     await this.auditService.log({
       adminId,
-      action: currentlyActive
-        ? AdminAction.USER_SUSPENDED
-        : AdminAction.APPROVE,
+      action: nextActiveState
+        ? AdminAction.APPROVE
+        : AdminAction.USER_SUSPENDED,
       targetId: id,
       reason:
         reason ||
-        (currentlyActive ? 'Manual Suspension' : 'Manual Reactivation'),
+        (nextActiveState ? 'Manual Reactivation' : 'Manual Suspension'),
     });
 
     return {
@@ -226,44 +259,48 @@ export class AdminService {
     };
   }
 
+  /**
+   * Directly rejects an investor profile and strips verification state.
+   */
   async rejectKyc(investorProfileId: string, reason: string, adminId: string) {
-    return await this.dataSource.transaction(async (manager: EntityManager) => {
-      const profile = await manager.findOne(InvestorProfile, {
-        where: { id: investorProfileId },
-        relations: ['user'],
-      });
+    const profile = await this.investorRepo.findOne({
+      where: { id: investorProfileId },
+      relations: ['user'],
+    });
+    if (!profile || !profile.user)
+      throw new BadRequestException('Profile or User not found');
 
-      if (!profile || !profile.user)
-        throw new BadRequestException('Profile or User not found');
+    // 1. BLOCKCHAIN GATE: Revoke on-chain
+    if (profile.user.walletAddress) {
+      await this.blockchainService.registerIdentity(
+        profile.user.walletAddress,
+        false,
+      );
+    }
 
-      // 1. Ensure isVerified is false
+    // 2. ATOMIC DB TRANSACTION
+    return await this.dataSource.transaction(async (manager) => {
       profile.user.isVerified = false;
       await manager.save(User, profile.user);
-
-      // 2. Update KYC status and store the rejection reason
-      // This allows the user to see WHY they were rejected on their dashboard
       await manager.update(
         KycProfile,
         { user: { id: profile.user.id } },
-        {
-          status: KycStatus.REJECTED,
-          rejectionReason: reason, // Make sure this column exists in your KycProfile entity
-        },
+        { status: KycStatus.REJECTED, rejectionReason: reason },
       );
 
-      // 3. Audit Logging
-      await this.auditService.log({
-        adminId,
-        action: AdminAction.REJECT, // Use your REJECT enum
-        targetId: investorProfileId,
-        reason: `KYC Rejected: ${reason}`,
-      });
+      await this.auditService.log(
+        {
+          adminId,
+          action: AdminAction.REJECT,
+          targetId: investorProfileId,
+          reason: `KYC Rejected: ${reason}`,
+        },
+        manager,
+      );
 
       return { success: true };
     });
   }
-
-  // ... (getInvestorDetail, handlePartnerAction, etc. merged below) ...
 
   async handlePartnerAction(dto: AdminActionDto, adminId: string) {
     if (dto.action === AdminAction.APPROVE)
@@ -359,7 +396,7 @@ export class AdminService {
       this.walletRepo.findOne({ where: { userId: mainUserId } }),
       this.ledgerService.findByUser(mainUserId),
       this.kycRepo.findOne({
-        where: { user: { id: mainUserId } }, // Corrected relation lookup
+        where: { user: { id: mainUserId } },
         order: { createdAt: 'DESC' },
       }),
     ]);
@@ -455,20 +492,29 @@ export class AdminService {
   }
 
   async updatePartnerStatus(id: string, status: string, adminId: string) {
-    const partner = await this.partnerRepo.findOne({ where: { id } });
-    if (!partner) throw new NotFoundException('Partner not found');
+    const partner = await this.partnerRepo.findOne({
+      where: { id },
+      relations: ['user'],
+    });
+    if (!partner || !partner.user)
+      throw new NotFoundException('Partner or User not found');
 
     const formattedStatus = status.toUpperCase();
-    const isValid = Object.values(PartnerStatus).includes(
-      formattedStatus as any,
-    );
 
-    if (!isValid) {
-      throw new BadRequestException(`Invalid status: ${status}`);
+    // 1. BLOCKCHAIN GATE (If approving partner, register them)
+    if (
+      formattedStatus === PartnerStatus.APPROVED &&
+      partner.user.walletAddress
+    ) {
+      await this.blockchainService.registerIdentity(
+        partner.user.walletAddress,
+        true,
+      );
     }
 
-    partner.status = formattedStatus as any;
-    const updatedPartner = await this.partnerRepo.save(partner);
+    // 2. DB UPDATE
+    partner.status = formattedStatus as PartnerStatus;
+    await this.partnerRepo.save(partner);
 
     await this.auditService.log({
       adminId,
@@ -480,7 +526,7 @@ export class AdminService {
       reason: `Partner status manually updated to ${formattedStatus}`,
     });
 
-    return updatedPartner;
+    return partner;
   }
 
   async findAllAssets(): Promise<Asset[]> {
@@ -589,30 +635,34 @@ export class AdminService {
       where: { id: partnerId },
       relations: ['user'],
     });
-
     if (!partner || !partner.user)
       throw new NotFoundException('Partner User not found');
 
-    const currentlyActive = partner.user.isActive;
-    partner.user.isActive = !currentlyActive;
+    const nextActiveState = !partner.user.isActive;
 
+    // 1. BLOCKCHAIN GATE
+    if (partner.user.walletAddress) {
+      await this.blockchainService.toggleFreeze(
+        partner.user.walletAddress,
+        !nextActiveState,
+      );
+    }
+
+    // 2. DB UPDATE
+    partner.user.isActive = nextActiveState;
     await this.dataSource.manager.save(User, partner.user);
 
-    // Log to Audit and Ledger
     await this.auditService.log({
       adminId,
-      action: currentlyActive
-        ? AdminAction.USER_SUSPENDED
-        : AdminAction.APPROVE,
+      action: nextActiveState
+        ? AdminAction.APPROVE
+        : AdminAction.USER_SUSPENDED,
       targetId: partnerId,
       reason:
         reason ||
-        (currentlyActive ? 'Manual Suspension' : 'Manual Reactivation'),
+        (nextActiveState ? 'Manual Reactivation' : 'Manual Suspension'),
     });
 
-    return {
-      success: true,
-      isActive: partner.user.isActive,
-    };
+    return { success: true, isActive: partner.user.isActive };
   }
 }

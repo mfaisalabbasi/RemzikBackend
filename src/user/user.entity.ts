@@ -43,6 +43,9 @@ export class User {
   @Column({ default: true })
   isActive!: boolean;
 
+  @Column({ unique: true, nullable: true })
+  walletAddress?: string;
+
   @CreateDateColumn()
   createdAt!: Date;
 

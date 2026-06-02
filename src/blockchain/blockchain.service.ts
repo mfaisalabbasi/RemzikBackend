@@ -1,64 +1,110 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { OnchainMapping } from './entities/onchain-mapping.entity';
-import { Repository } from 'typeorm';
-import { TokenizationService } from 'src/tokenization/tokenization.service';
-import { Chain } from './enums/chain.enum';
+import {
+  Injectable,
+  Logger,
+  InternalServerErrorException,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { ethers } from 'ethers';
+import * as RemzikIdentityRegistryABI from './abi/RemzikIdentityRegistry.json';
 
 @Injectable()
 export class BlockchainService {
-  constructor(
-    @InjectRepository(OnchainMapping)
-    private mappingRepo: Repository<OnchainMapping>,
+  private readonly logger = new Logger(BlockchainService.name);
+  private provider: ethers.JsonRpcProvider;
+  private wallet: ethers.Wallet;
+  private contract: ethers.Contract;
 
-    private readonly tokenizationService: TokenizationService,
-  ) {}
+  constructor(private configService: ConfigService) {
+    const rpcUrl =
+      this.configService.get<string>('BLOCKCHAIN_RPC_URL') ||
+      'http://127.0.0.1:8545';
 
-  //Register Asset on Chain
+    // 1. Fetch and robustly typecast/validate secrets to satisfy TS strict mode
+    const privateKey = this.configService.get<string>('ADMIN_PRIVATE_KEY');
+    const contractAddress = this.configService.get<string>(
+      'COMPLIANCE_CONTRACT_ADDRESS',
+    );
 
-  async registerAssetContract(
-    assetId: string,
-    contractAddress: string,
-    chain: Chain,
-  ) {
-    const exists = await this.mappingRepo.findOne({
-      where: { asset: { id: assetId }, chain },
-    });
-
-    if (exists) {
-      throw new BadRequestException('Asset already registered on this chain');
+    if (!privateKey || !contractAddress) {
+      throw new Error(
+        'CRITICAL: ADMIN_PRIVATE_KEY or COMPLIANCE_CONTRACT_ADDRESS is missing in environment config',
+      );
     }
 
-    return this.mappingRepo.save({
-      asset: { id: assetId },
+    this.provider = new ethers.JsonRpcProvider(rpcUrl);
+    this.wallet = new ethers.Wallet(privateKey, this.provider);
+
+    this.contract = new ethers.Contract(
       contractAddress,
-      chain,
-      totalMinted: 0,
-    });
+      RemzikIdentityRegistryABI.abi,
+      this.wallet,
+    );
   }
 
-  //Mint Sync (CRITICAL LOGIC)
-
-  async syncMint(assetId: string, chain: Chain, sharesToMint: number) {
-    const mapping = await this.mappingRepo.findOne({
-      where: { asset: { id: assetId }, chain },
-    });
-
-    if (!mapping) {
-      throw new BadRequestException('Asset not registered on chain');
+  /**
+   * Updates verification/KYC status on-chain.
+   */
+  async registerIdentity(
+    investorWallet: string,
+    status: boolean,
+  ): Promise<string> {
+    try {
+      this.logger.log(
+        `Registering identity on-chain for ${investorWallet} status: ${status}`,
+      );
+      const tx = await this.contract.registerIdentity(investorWallet, status);
+      const receipt = await tx.wait(1);
+      return tx.hash;
+    } catch (error: any) {
+      this.logger.error(
+        `Failed on-chain registration for ${investorWallet}:`,
+        error.message,
+      );
+      throw new InternalServerErrorException(
+        `Blockchain transaction failed: ${error.message}`,
+      );
     }
+  }
 
-    mapping.totalMinted += sharesToMint;
+  /**
+   * Emergency switch to freeze or unfreeze a wallet on-chain.
+   */
+  async toggleFreeze(
+    investorWallet: string,
+    shouldFreeze: boolean,
+  ): Promise<string> {
+    try {
+      this.logger.log(
+        `Toggling on-chain freeze state for ${investorWallet} to: ${shouldFreeze}`,
+      );
+      const tx = await this.contract.toggleFreeze(investorWallet, shouldFreeze);
+      const receipt = await tx.wait(1);
+      return tx.hash;
+    } catch (error: any) {
+      this.logger.error(
+        `Failed executing freeze on-chain for ${investorWallet}:`,
+        error.message,
+      );
+      throw new InternalServerErrorException(
+        `Blockchain freeze transaction failed: ${error.message}`,
+      );
+    }
+  }
 
-    // 🔐 Here we WOULD call blockchain (later)
-    // mint(contractAddress, sharesToMint)
-
-    return this.mappingRepo.save(mapping);
+  /**
+   * Read view function to see if user is verified on-chain.
+   * Fixed return type to native TypeScript 'boolean'.
+   */
+  async isVerified(investorWallet: string): Promise<boolean> {
+    try {
+      // Calls your smart contract's isClearToTrade or mapping layout getter
+      return await this.contract.isClearToTrade(investorWallet);
+    } catch (error: any) {
+      this.logger.error(
+        `Failed to read verification status for wallet ${investorWallet}:`,
+        error.message,
+      );
+      return false;
+    }
   }
 }
-
-// await this.blockchainService.syncMint(
-//   assetId,
-//   Chain.POLYGON,
-//   shares,
-// );

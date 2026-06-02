@@ -30,7 +30,7 @@ import { AuditModule } from './audit/audit.module';
 import { BroadcastModule } from './broadcast/broadcast.module';
 import { FinanceModule } from './finance/finance.module';
 import { DisputeModule } from './dispute/dispute.module';
-
+import { BlockchainModule } from './blockchain/blockchain.module';
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
@@ -75,6 +75,7 @@ import { DisputeModule } from './dispute/dispute.module';
     BroadcastModule,
     FinanceModule,
     DisputeModule,
+    BlockchainModule,
   ],
   controllers: [AppController],
   providers: [AppService],

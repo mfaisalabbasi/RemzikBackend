@@ -5,6 +5,8 @@ import {
   Res,
   UseInterceptors,
   UploadedFiles,
+  UseGuards,
+  Req,
 } from '@nestjs/common';
 import { FileFieldsInterceptor } from '@nestjs/platform-express';
 import { memoryStorage } from 'multer';
@@ -12,6 +14,8 @@ import type { Response } from 'express';
 import { UserService } from './user.service';
 import { CreateUserDto } from './dto/create-user.dto';
 import { RegisterWithKycDto } from './dto/register-with-kyc.dto';
+import { JwtAuthGuard } from 'src/auth/guards/jwt.gaurd';
+import { SyncWalletDto } from './dto/sync-wallet.dto';
 
 @Controller('auth')
 export class UserController {
@@ -48,5 +52,17 @@ export class UserController {
     @Res({ passthrough: true }) res: Response,
   ) {
     return this.userService.registerWithKyc(dto, files, res);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('sync-wallet')
+  async syncWallet(
+    @Body() dto: SyncWalletDto,
+    @Req() req: Request & { user?: any },
+  ) {
+    // Extract the verified user ID directly from your existing Web2 JWT Guard payload
+    const userId = req.user?.userId;
+
+    return this.userService.syncWalletAddress(userId, dto.walletAddress);
   }
 }
