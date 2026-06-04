@@ -166,12 +166,6 @@ export class Asset {
   assetSize!: number | null;
 
   /**
-   * Token supply for fractionalization
-   */
-  @OneToOne(() => AssetToken, (token) => token.asset)
-  token?: AssetToken;
-
-  /**
    * ✅ FIX: Precision Update
    * Changed from bigint to decimal(20,4) to allow fractional share math
    * and avoid JavaScript integer overflow on multi-billion dollar supplies.
@@ -206,6 +200,27 @@ export class Asset {
    */
   @Column('int', { default: 0 })
   investors!: number;
+
+  @OneToOne(() => AssetToken, (token) => token.asset)
+  token?: AssetToken;
+
+  /**
+   * ✅ NEW: Link to the deployed Smart Contract address
+   */
+  @Column({ nullable: true })
+  tokenAddress!: string;
+
+  /**
+   * ✅ NEW: Blockchain Ticker Symbol (e.g., "AYT")
+   */
+  @Column({ nullable: true })
+  symbol!: string;
+
+  /**
+   * ✅ NEW: IPFS Hash for off-chain metadata
+   */
+  @Column({ type: 'text', nullable: true })
+  metadataHash!: string;
 
   @CreateDateColumn()
   createdAt!: Date;
