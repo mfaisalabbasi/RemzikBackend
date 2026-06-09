@@ -55,7 +55,6 @@ export class InvestorService {
     }));
   }
 
-  // ✅ UPDATED: Added manager for transaction support
   async createProfile(
     userId: string,
     manager?: EntityManager,
@@ -83,12 +82,16 @@ export class InvestorService {
     return profile;
   }
 
+  // ✅ UPDATED: Include both PENDING and CONFIRMED investments
   async getProfileData(userId: string) {
     const profile = await this.getMyProfile(userId);
     const investments = await this.investmentService.getMyInvestments(userId);
+
+    // Only count CONFIRMED investments for financial totals
     const confirmed = investments.filter(
       (inv) => inv.status === InvestmentStatus.CONFIRMED,
     );
+
     const totalInvested = confirmed.reduce(
       (sum, inv) => sum + Number(inv.amount),
       0,
@@ -100,12 +103,12 @@ export class InvestorService {
       email: profile.user.email,
       totalInvested,
       portfolioValue: totalInvested,
-      activeInvestments: confirmed.length,
-      investments: confirmed.map((inv) => ({
+      activeInvestments: investments.length, // Total count including pending
+      investments: investments.map((inv) => ({
         id: inv.id,
         assetTitle: inv.asset?.title || 'Asset',
         amountInvested: Number(inv.amount),
-        status: 'Active',
+        status: inv.status, // Now includes "PENDING" and "CONFIRMED"
       })),
     };
   }

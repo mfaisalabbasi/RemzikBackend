@@ -74,6 +74,8 @@ export class Investment {
     default: InvestmentStatus.PENDING,
   })
   status: InvestmentStatus;
+  @Column({ nullable: true })
+  txHash: string;
 
   @CreateDateColumn()
   createdAt: Date;

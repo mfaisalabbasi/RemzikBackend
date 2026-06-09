@@ -1,4 +1,8 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { LedgerService } from '../ledger/ledger.service';
 import { LedgerSource } from '../ledger/enums/ledger-source.enum';
 import { LedgerType } from '../ledger/enums/ledger-type.enum';
@@ -322,5 +326,25 @@ export class WalletService {
     if (buyerWallet && Number(buyerWallet.lockedBalance) < 0) {
       throw new BadRequestException('Insufficient escrowed funds for transfer');
     }
+  }
+  /**
+   * Refund method: Reverses a balance deduction in the event of an
+   * on-chain execution failure.
+   */
+  async refund(
+    userId: string,
+    amount: number,
+    manager: EntityManager,
+  ): Promise<void> {
+    const wallet = await manager.findOne(Wallet, {
+      where: { userId: userId },
+    });
+    if (!wallet) throw new NotFoundException('Wallet not found for refund');
+
+    wallet.availableBalance = Number(wallet.availableBalance) + Number(amount);
+    await manager.save(wallet);
+
+    // Optional: Add a ledger entry for the refund for audit trails
+    // await this.ledgerService.record(userId, amount, LedgerType.REFUND, manager);
   }
 }

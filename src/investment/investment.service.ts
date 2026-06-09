@@ -2,9 +2,13 @@ import {
   Injectable,
   BadRequestException,
   NotFoundException,
+  InternalServerErrorException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, EntityManager } from 'typeorm';
+import { InjectQueue } from '@nestjs/bull';
+import * as TypeORM from 'typeorm';
+import * as Bull from 'bull';
+
 import { Investment } from './investment.entity';
 import { CreateInvestmentDto } from './dto/create-investment.dto';
 import { InvestorProfile } from 'src/investor/investor.entity';
@@ -16,28 +20,32 @@ import { WalletService } from 'src/wallet/wallet.service';
 import { LedgerSource } from 'src/ledger/enums/ledger-source.enum';
 import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
 import { Ownership } from 'src/ownership/ownership.entity';
+import { BlockchainService } from 'src/blockchain/blockchain.service';
 
 @Injectable()
 export class InvestmentService {
   constructor(
     @InjectRepository(Investment)
-    private readonly investmentRepo: Repository<Investment>,
+    private readonly investmentRepo: TypeORM.Repository<Investment>,
 
     @InjectRepository(AssetToken)
-    private readonly assettokenRepo: Repository<AssetToken>,
+    private readonly assettokenRepo: TypeORM.Repository<AssetToken>,
+
+    @InjectQueue('investment-queue')
+    private readonly investmentQueue: Bull.Queue,
+
     private readonly notificationOrchestrator: NotificationOrchestrator,
     private readonly ownershipService: OwnershipService,
     private readonly walletService: WalletService,
+    private readonly blockchainService: BlockchainService,
   ) {}
 
   async createInvestment(
     userId: string,
     dto: CreateInvestmentDto,
   ): Promise<Investment> {
-    // Execute everything inside the transaction to guarantee isolation
     const savedInvestment = await this.investmentRepo.manager.transaction(
-      async (manager: EntityManager) => {
-        // 1. 🛡️ FIREWALL: Check balance INSIDE the transaction boundary to block double-spend
+      async (manager: TypeORM.EntityManager) => {
         const availableBalance =
           await this.walletService.getAvailableBalance(userId);
         if (availableBalance < dto.amount) {
@@ -51,7 +59,6 @@ export class InvestmentService {
         if (!investor)
           throw new BadRequestException('Investor profile not found');
 
-        // ✅ Pessimistic Lock prevents over-subscription
         const token = await manager
           .getRepository(AssetToken)
           .createQueryBuilder('token')
@@ -67,18 +74,15 @@ export class InvestmentService {
         });
         if (!asset) throw new BadRequestException('Asset not found');
 
-        // Calculate exact shares up to 4 decimal points
         const sharesToBuy = Number(dto.amount) / Number(token.sharePrice);
         const preciseShares = Math.round(sharesToBuy * 10000) / 10000;
 
-        // Check availability within the locked transaction
         if (preciseShares > Number(token.availableShares)) {
           throw new BadRequestException(
             'Not enough shares available (Sold Out or Over-subscribed)',
           );
         }
 
-        // ✅ UNIQUE INVESTOR CHECK
         const existingOwnership = await manager.findOne(Ownership, {
           where: { investorId: investor.id, assetId: asset.id },
         });
@@ -87,7 +91,6 @@ export class InvestmentService {
           asset.investors = (asset.investors || 0) + 1;
         }
 
-        // Deduct/Transfer balances
         await this.walletService.transfer(
           userId,
           asset.partner.user.id,
@@ -101,31 +104,32 @@ export class InvestmentService {
         await manager.save(token);
 
         asset.funded = Number(asset.funded) + Number(dto.amount);
-        await manager.save(asset); // Persists both funded and investors metrics cleanly
+        await manager.save(asset);
 
-        // ✅ FIXED PRECISE UNITS: Using preciseShares instead of Math.floor to match ledger
         const investment = manager.create(Investment, {
           investor,
           asset,
           amount: dto.amount,
           units: preciseShares,
           unitPriceAtPurchase: Number(token.sharePrice),
-          status: InvestmentStatus.CONFIRMED,
+          status: InvestmentStatus.PENDING,
         });
 
         const result = await manager.save(investment);
-
-        // Match the ownership records exactly to the penny
         await this.ownershipService.addShares(
           investor,
           asset,
           preciseShares,
           manager,
         );
-
         return result;
       },
     );
+
+    // Queue for background blockchain reconciliation
+    await this.investmentQueue.add('process-investment', {
+      investmentId: savedInvestment.id,
+    });
 
     await this.notificationOrchestrator.buildAndSave(
       userId,
@@ -157,30 +161,21 @@ export class InvestmentService {
     const confirmedInvestment = await this.investmentRepo.manager.transaction(
       async (manager) => {
         investment.status = InvestmentStatus.CONFIRMED;
-
         const token = await manager.findOne(AssetToken, {
           where: { asset: { id: investment.asset.id } },
         });
-
         if (!token)
           throw new BadRequestException('Token metadata missing for asset');
 
         const shares = investment.amount / Number(token.sharePrice);
         const preciseShares = Math.round(shares * 10000) / 10000;
-
         const asset = investment.asset;
 
-        // ✅ UNIQUE INVESTOR CHECK Explicit Save
         const existingOwnership = await manager.findOne(Ownership, {
-          where: {
-            investorId: investment.investor.id,
-            assetId: asset.id,
-          },
+          where: { investorId: investment.investor.id, assetId: asset.id },
         });
 
-        if (!existingOwnership) {
-          asset.investors = (asset.investors || 0) + 1;
-        }
+        if (!existingOwnership) asset.investors = (asset.investors || 0) + 1;
 
         await this.walletService.transfer(
           investment.investor.user.id,
@@ -193,22 +188,18 @@ export class InvestmentService {
 
         token.availableShares = Number(token.availableShares) - preciseShares;
         await manager.save(token);
-
         asset.funded = Number(asset.funded) + Number(investment.amount);
-        await manager.save(asset); // Ensure asset table is saved clearly
+        await manager.save(asset);
 
         investment.unitPriceAtPurchase = Number(token.sharePrice);
-        investment.units = preciseShares; // Avoid truncating matching anomalies
-
+        investment.units = preciseShares;
         const result = await manager.save(investment);
-
         await this.ownershipService.addShares(
           investment.investor,
           asset,
           preciseShares,
           manager,
         );
-
         return result;
       },
     );
@@ -224,7 +215,6 @@ export class InvestmentService {
         },
       );
     }
-
     return confirmedInvestment;
   }
 
@@ -252,7 +242,6 @@ export class InvestmentService {
         status: InvestmentStatus.CONFIRMED,
       })
       .getRawOne();
-
     return Number(result?.total) || 0;
   }
 
@@ -264,7 +253,6 @@ export class InvestmentService {
         status: InvestmentStatus.CONFIRMED,
       })
       .getRawOne();
-
     return result?.total ? parseFloat(result.total) : 0;
   }
 
@@ -273,7 +261,62 @@ export class InvestmentService {
       .createQueryBuilder('investment')
       .select('COUNT(DISTINCT(investment.investorId))', 'count')
       .getRawOne();
-
     return parseInt(result?.count || '0');
+  }
+
+  async executeBlockchainTransfer(investmentId: string): Promise<string> {
+    const investment = await this.investmentRepo.findOne({
+      where: { id: investmentId },
+      relations: ['asset', 'investor', 'investor.user'],
+    });
+
+    if (!investment) throw new NotFoundException('Investment record not found');
+    const tokenAddress = investment.asset?.tokenAddress;
+    const userWallet = investment.investor?.user?.walletAddress;
+
+    if (!tokenAddress)
+      throw new InternalServerErrorException(`Asset lacks a contract address.`);
+    if (!userWallet)
+      throw new InternalServerErrorException(
+        `Investor has no registered wallet.`,
+      );
+
+    return await this.blockchainService.transferFromVault(
+      tokenAddress,
+      userWallet,
+      investment.units,
+    );
+  }
+
+  async finalizeTokenization(
+    investmentId: string,
+    txHash: string,
+  ): Promise<void> {
+    await this.investmentRepo.update(investmentId, {
+      status: InvestmentStatus.CONFIRMED,
+      txHash: txHash,
+    });
+  }
+
+  async handleInvestmentFailure(
+    investmentId: string,
+    reason: string,
+  ): Promise<void> {
+    await this.investmentRepo.manager.transaction(async (manager) => {
+      const investment = await manager.findOne(Investment, {
+        where: { id: investmentId },
+        relations: ['investor', 'investor.user'],
+      });
+
+      if (investment && investment.status !== InvestmentStatus.FAILED) {
+        await this.walletService.refund(
+          investment.investor.user.id,
+          investment.amount,
+          manager,
+        );
+        investment.status = InvestmentStatus.FAILED;
+        await manager.save(investment);
+      }
+    });
   }
 }
