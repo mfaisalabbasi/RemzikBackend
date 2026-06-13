@@ -41,16 +41,22 @@ export class Investment {
   amount: number;
 
   /**
-   * ✅ NEW: Quantity of tokens/units purchased
+   * ✅ FIXED: Changed from 'int' to 'decimal' to accurately store fractional shares/units (4 decimal precision)
    */
   @Column({
-    type: 'int',
+    type: 'decimal',
+    precision: 12,
+    scale: 4,
     default: 0,
+    transformer: {
+      to: (value: number) => value,
+      from: (value: string) => parseFloat(value),
+    },
   })
   units: number;
 
   /**
-   * ✅ NEW: Snapshot of the unit price at the time of purchase
+   * ✅ Snapshot of the unit price at the time of purchase
    * Essential for historical audits and ROI calculations.
    */
   @Column({
@@ -74,6 +80,7 @@ export class Investment {
     default: InvestmentStatus.PENDING,
   })
   status: InvestmentStatus;
+
   @Column({ nullable: true })
   txHash: string;
 

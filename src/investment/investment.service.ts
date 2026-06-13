@@ -44,13 +44,12 @@ export class InvestmentService {
     userId: string,
     dto: CreateInvestmentDto,
   ): Promise<Investment> {
-    const savedInvestment = await this.investmentRepo.manager.transaction(
+    return await this.investmentRepo.manager.transaction(
       async (manager: TypeORM.EntityManager) => {
         const availableBalance =
           await this.walletService.getAvailableBalance(userId);
-        if (availableBalance < dto.amount) {
+        if (availableBalance < dto.amount)
           throw new BadRequestException(`Insufficient balance.`);
-        }
 
         const investor = await manager.findOne(InvestorProfile, {
           where: { user: { id: userId } },
@@ -68,154 +67,145 @@ export class InvestmentService {
 
         if (!token) throw new BadRequestException('Asset is not tokenized');
 
-        const asset = await manager.findOne(Asset, {
-          where: { id: dto.assetId },
-          relations: ['partner', 'partner.user'],
-        });
-        if (!asset) throw new BadRequestException('Asset not found');
-
         const sharesToBuy = Number(dto.amount) / Number(token.sharePrice);
         const preciseShares = Math.round(sharesToBuy * 10000) / 10000;
 
         if (preciseShares > Number(token.availableShares)) {
-          throw new BadRequestException(
-            'Not enough shares available (Sold Out or Over-subscribed)',
-          );
+          throw new BadRequestException('Not enough shares available');
         }
 
-        const existingOwnership = await manager.findOne(Ownership, {
-          where: { investorId: investor.id, assetId: asset.id },
-        });
-
-        if (!existingOwnership) {
-          asset.investors = (asset.investors || 0) + 1;
-        }
-
-        await this.walletService.transfer(
-          userId,
-          asset.partner.user.id,
-          dto.amount,
-          LedgerSource.ASSET_INVESTMENT,
-          `Investment for asset ${asset.title}`,
-          manager,
-        );
-
+        // RESERVE shares immediately so no one else buys them
         token.availableShares = Number(token.availableShares) - preciseShares;
         await manager.save(token);
 
-        asset.funded = Number(asset.funded) + Number(dto.amount);
-        await manager.save(asset);
-
         const investment = manager.create(Investment, {
           investor,
-          asset,
+          asset: { id: dto.assetId } as Asset,
           amount: dto.amount,
           units: preciseShares,
           unitPriceAtPurchase: Number(token.sharePrice),
           status: InvestmentStatus.PENDING,
         });
 
-        const result = await manager.save(investment);
-        await this.ownershipService.addShares(
-          investor,
-          asset,
-          preciseShares,
-          manager,
-        );
-        return result;
+        const savedInvestment = await manager.save(investment);
+
+        // Queue for background blockchain reconciliation
+        await this.investmentQueue.add('process-investment', {
+          investmentId: savedInvestment.id,
+        });
+
+        return savedInvestment;
       },
     );
-
-    // Queue for background blockchain reconciliation
-    await this.investmentQueue.add('process-investment', {
-      investmentId: savedInvestment.id,
-    });
-
-    await this.notificationOrchestrator.buildAndSave(
-      userId,
-      'investment.created',
-      {
-        amount: savedInvestment.amount,
-        asset: savedInvestment.asset.title,
-      },
-    );
-
-    return savedInvestment;
   }
 
-  async confirmInvestment(id: string): Promise<Investment> {
-    const investment = await this.investmentRepo.findOne({
-      where: { id },
-      relations: [
-        'investor',
-        'investor.user',
-        'asset',
-        'asset.partner',
-        'asset.partner.user',
-      ],
-    });
-
-    if (!investment) throw new NotFoundException('Investment record not found');
-    if (investment.status === InvestmentStatus.CONFIRMED) return investment;
-
+  async finalizeTokenization(
+    investmentId: string,
+    txHash: string,
+  ): Promise<void> {
     const confirmedInvestment = await this.investmentRepo.manager.transaction(
       async (manager) => {
-        investment.status = InvestmentStatus.CONFIRMED;
-        const token = await manager.findOne(AssetToken, {
-          where: { asset: { id: investment.asset.id } },
+        const investment = await manager.findOne(Investment, {
+          where: { id: investmentId },
+          relations: [
+            'asset',
+            'asset.partner',
+            'asset.partner.user',
+            'investor',
+            'investor.user',
+          ],
         });
-        if (!token)
-          throw new BadRequestException('Token metadata missing for asset');
 
-        const shares = investment.amount / Number(token.sharePrice);
-        const preciseShares = Math.round(shares * 10000) / 10000;
+        // Ensure investment exists and isn't already confirmed to prevent double-processing
+        if (!investment || investment.status === InvestmentStatus.CONFIRMED)
+          return null;
+
         const asset = investment.asset;
 
-        const existingOwnership = await manager.findOne(Ownership, {
-          where: { investorId: investment.investor.id, assetId: asset.id },
-        });
-
-        if (!existingOwnership) asset.investors = (asset.investors || 0) + 1;
-
+        // 1. Transfer funds
         await this.walletService.transfer(
           investment.investor.user.id,
           asset.partner.user.id,
           investment.amount,
           LedgerSource.ASSET_INVESTMENT,
-          `Funding Released: ${asset.title}`,
+          `Investment Finalized: ${asset.title}`,
           manager,
         );
 
-        token.availableShares = Number(token.availableShares) - preciseShares;
-        await manager.save(token);
+        // 2. Update Asset Data (Funded amount and unique investor count)
         asset.funded = Number(asset.funded) + Number(investment.amount);
+        const existingOwnership = await manager.findOne(Ownership, {
+          where: { investorId: investment.investor.id, assetId: asset.id },
+        });
+        if (!existingOwnership) asset.investors = (asset.investors || 0) + 1;
         await manager.save(asset);
 
-        investment.unitPriceAtPurchase = Number(token.sharePrice);
-        investment.units = preciseShares;
-        const result = await manager.save(investment);
+        // 3. Confirm Ownership
         await this.ownershipService.addShares(
           investment.investor,
           asset,
-          preciseShares,
+          investment.units,
           manager,
         );
-        return result;
+
+        // 4. Mark Confirmed
+        investment.status = InvestmentStatus.CONFIRMED;
+        investment.txHash = txHash;
+        return await manager.save(investment);
       },
     );
 
-    const userId = confirmedInvestment.investor?.user?.id;
-    if (userId) {
+    // TRIGGER NOTIFICATION: Only if the transaction was successful and returned an object
+    if (confirmedInvestment) {
       await this.notificationOrchestrator.buildAndSave(
-        userId,
+        confirmedInvestment.investor.user.id,
         'investment.created',
         {
+          title: 'Investment Confirmed!',
+          message: `Your investment of SAR ${confirmedInvestment.amount} in "${confirmedInvestment.asset.title}" is now finalized on the blockchain.`,
           amount: confirmedInvestment.amount,
           asset: confirmedInvestment.asset.title,
+          timestamp: new Date(),
         },
       );
     }
-    return confirmedInvestment;
+  }
+
+  async handleInvestmentFailure(
+    investmentId: string,
+    reason: string,
+  ): Promise<void> {
+    await this.investmentRepo.manager.transaction(async (manager) => {
+      const investment = await manager.findOne(Investment, {
+        where: { id: investmentId },
+        relations: ['investor', 'investor.user', 'asset'],
+      });
+
+      if (investment && investment.status !== InvestmentStatus.FAILED) {
+        // Rollback: Return reserved shares to token pool
+        const token = await manager.findOne(AssetToken, {
+          where: { asset: { id: investment.asset.id } },
+        });
+        if (token) {
+          token.availableShares =
+            Number(token.availableShares) + Number(investment.units);
+          await manager.save(token);
+        }
+        investment.status = InvestmentStatus.FAILED;
+        await manager.save(investment);
+      }
+    });
+  }
+
+  async confirmInvestment(id: string): Promise<Investment> {
+    const investment = await this.investmentRepo.findOne({ where: { id } });
+
+    if (!investment) {
+      throw new NotFoundException(`Investment with ID ${id} not found`);
+    }
+
+    await this.investmentQueue.add('process-investment', { investmentId: id });
+    return investment; // TypeScript now knows 'investment' is type 'Investment', not 'null'
   }
 
   async getMyInvestments(userId: string): Promise<Investment[]> {
@@ -235,33 +225,31 @@ export class InvestmentService {
 
   async getTotalByAsset(assetId: string): Promise<number> {
     const result = await this.investmentRepo
-      .createQueryBuilder('investment')
-      .select('SUM(investment.amount)', 'total')
-      .where('investment.assetId = :assetId', { assetId })
-      .andWhere('investment.status = :status', {
-        status: InvestmentStatus.CONFIRMED,
+      .createQueryBuilder('i')
+      .select('SUM(i.amount)', 't')
+      .where('i.assetId = :assetId AND i.status = :s', {
+        assetId,
+        s: InvestmentStatus.CONFIRMED,
       })
       .getRawOne();
-    return Number(result?.total) || 0;
+    return Number(result?.t) || 0;
   }
 
   async getTotalInvested(): Promise<number> {
     const result = await this.investmentRepo
-      .createQueryBuilder('investment')
-      .select('SUM(CAST(investment.amount AS FLOAT))', 'total')
-      .where('investment.status = :status', {
-        status: InvestmentStatus.CONFIRMED,
-      })
+      .createQueryBuilder('i')
+      .select('SUM(CAST(i.amount AS FLOAT))', 't')
+      .where('i.status = :s', { s: InvestmentStatus.CONFIRMED })
       .getRawOne();
-    return result?.total ? parseFloat(result.total) : 0;
+    return result?.t ? parseFloat(result.t) : 0;
   }
 
   async countUniqueInvestors(): Promise<number> {
     const result = await this.investmentRepo
-      .createQueryBuilder('investment')
-      .select('COUNT(DISTINCT(investment.investorId))', 'count')
+      .createQueryBuilder('i')
+      .select('COUNT(DISTINCT(i.investorId))', 'c')
       .getRawOne();
-    return parseInt(result?.count || '0');
+    return parseInt(result?.c || '0');
   }
 
   async executeBlockchainTransfer(investmentId: string): Promise<string> {
@@ -271,52 +259,24 @@ export class InvestmentService {
     });
 
     if (!investment) throw new NotFoundException('Investment record not found');
-    const tokenAddress = investment.asset?.tokenAddress;
-    const userWallet = investment.investor?.user?.walletAddress;
 
-    if (!tokenAddress)
-      throw new InternalServerErrorException(`Asset lacks a contract address.`);
-    if (!userWallet)
+    // Guard Clauses: Ensure data exists before calling the blockchain service
+    if (!investment.asset?.tokenAddress) {
       throw new InternalServerErrorException(
-        `Investor has no registered wallet.`,
+        'Asset lacks a valid token contract address.',
       );
+    }
+
+    if (!investment.investor?.user?.walletAddress) {
+      throw new InternalServerErrorException(
+        'Investor does not have a registered wallet address.',
+      );
+    }
 
     return await this.blockchainService.transferFromVault(
-      tokenAddress,
-      userWallet,
+      investment.asset.tokenAddress,
+      investment.investor.user.walletAddress,
       investment.units,
     );
-  }
-
-  async finalizeTokenization(
-    investmentId: string,
-    txHash: string,
-  ): Promise<void> {
-    await this.investmentRepo.update(investmentId, {
-      status: InvestmentStatus.CONFIRMED,
-      txHash: txHash,
-    });
-  }
-
-  async handleInvestmentFailure(
-    investmentId: string,
-    reason: string,
-  ): Promise<void> {
-    await this.investmentRepo.manager.transaction(async (manager) => {
-      const investment = await manager.findOne(Investment, {
-        where: { id: investmentId },
-        relations: ['investor', 'investor.user'],
-      });
-
-      if (investment && investment.status !== InvestmentStatus.FAILED) {
-        await this.walletService.refund(
-          investment.investor.user.id,
-          investment.amount,
-          manager,
-        );
-        investment.status = InvestmentStatus.FAILED;
-        await manager.save(investment);
-      }
-    });
   }
 }
