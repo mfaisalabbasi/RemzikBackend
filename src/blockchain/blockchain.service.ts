@@ -2,6 +2,7 @@ import {
   Injectable,
   Logger,
   InternalServerErrorException,
+  OnModuleInit,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ethers } from 'ethers';
@@ -9,12 +10,12 @@ import * as RemzikIdentityRegistryABI from './abi/RemzikIdentityRegistry.json';
 import * as AssetFactoryABI from './abi/AssetFactory.json';
 
 @Injectable()
-export class BlockchainService {
+export class BlockchainService implements OnModuleInit {
   private readonly logger = new Logger(BlockchainService.name);
   private wallet: ethers.Wallet;
+  private provider: ethers.JsonRpcProvider;
   private registryContract: ethers.Contract;
-  private factoryAddr: string;
-  private factoryInterface: ethers.Interface;
+  private factoryContract: ethers.Contract;
 
   constructor(private configService: ConfigService) {
     const rpcUrl = this.configService.get<string>('BLOCKCHAIN_RPC_URL')!;
@@ -22,30 +23,53 @@ export class BlockchainService {
     const registryAddr = this.configService.get<string>(
       'COMPLIANCE_CONTRACT_ADDRESS',
     )!;
-    this.factoryAddr = this.configService.get<string>(
+    const factoryAddr = this.configService.get<string>(
       'ASSET_FACTORY_CONTRACT_ADDRESS',
     )!;
 
-    // No-ENS zone configuration
-    const network: ethers.Networkish = {
+    console.log('DEBUG: Registry being used:', registryAddr);
+    console.log('DEBUG: Factory being used:', factoryAddr);
+
+    this.provider = new ethers.JsonRpcProvider(rpcUrl, {
       name: 'local-hardhat',
       chainId: 31337,
-      ensAddress: undefined,
-    };
-
-    const provider = new ethers.JsonRpcProvider(rpcUrl, network, {
-      staticNetwork: true,
     });
 
-    this.wallet = new ethers.Wallet(privateKey, provider);
+    this.wallet = new ethers.Wallet(privateKey, this.provider);
 
+    // Initialize contracts using ABI and Signer
     this.registryContract = new ethers.Contract(
       registryAddr,
-      RemzikIdentityRegistryABI.abi,
+      (RemzikIdentityRegistryABI as any).abi || RemzikIdentityRegistryABI,
       this.wallet,
     );
+    this.factoryContract = new ethers.Contract(
+      factoryAddr,
+      (AssetFactoryABI as any).abi || AssetFactoryABI,
+      this.wallet,
+    );
+  }
 
-    this.factoryInterface = new ethers.Interface(AssetFactoryABI.abi);
+  async onModuleInit() {
+    this.logger.log(`Blockchain Service initialized.`);
+    this.logger.log(`Registry: ${this.registryContract.target}`);
+    this.logger.log(`Factory: ${this.factoryContract.target}`);
+  }
+
+  public getProvider() {
+    return this.provider;
+  }
+  public getRegistryAddress() {
+    return this.registryContract.target as string;
+  }
+  public getFactoryAddress() {
+    return this.factoryContract.target as string;
+  }
+  public getRegistryAbi() {
+    return (RemzikIdentityRegistryABI as any).abi || RemzikIdentityRegistryABI;
+  }
+  public getFactoryAbi() {
+    return (AssetFactoryABI as any).abi || AssetFactoryABI;
   }
 
   async deployAssetContract(
@@ -56,55 +80,31 @@ export class BlockchainService {
     treasuryAddress: string,
   ): Promise<string> {
     try {
-      this.logger.log(`Deploying token contract: ${name} (${symbol})`);
+      this.logger.log(`Deploying token: ${name} (${symbol}) via Factory...`);
 
-      // 1. Verify contract exists at address
-      const code = await this.wallet.provider!.getCode(this.factoryAddr);
-      if (code === '0x') {
-        throw new Error(
-          `No contract found at address ${this.factoryAddr}. Check your .env.`,
-        );
-      }
-
-      const data = this.factoryInterface.encodeFunctionData('deployAsset', [
+      const tx = await this.factoryContract.deployAsset(
         name,
         symbol,
         supply,
         metadataHash,
         treasuryAddress,
-      ]);
-
-      const tx = await this.wallet.sendTransaction({
-        to: this.factoryAddr,
-        data: data,
-        gasLimit: 5000000n,
-      });
-
-      const receipt = await tx.wait(1);
-
-      // 2. Validate receipt status
-      if (receipt?.status === 0) {
-        throw new Error(
-          'Transaction reverted by EVM. Check Solidity require/revert conditions.',
-        );
-      }
-
-      // 3. Robust Event Retrieval
-      const eventFragment =
-        this.factoryInterface.getEvent('AssetTokenDeployed');
-      const log = receipt?.logs.find(
-        (l) => l.topics[0] === eventFragment?.topicHash,
       );
 
-      if (!log) {
-        this.logger.error(`Receipt logs: ${JSON.stringify(receipt?.logs)}`);
-        throw new Error(
-          'Transaction succeeded but AssetTokenDeployed event was not found. ABI may be mismatched.',
-        );
-      }
+      const receipt = await tx.wait(1);
+      if (receipt?.status === 0) throw new Error('Deployment reverted by EVM.');
 
-      const parsed = this.factoryInterface.parseLog(log);
-      return parsed?.args.tokenAddress;
+      const event = receipt?.logs.find((log: any) => {
+        try {
+          const parsed = this.factoryContract.interface.parseLog(log);
+          return parsed?.name === 'AssetTokenDeployed';
+        } catch {
+          return false;
+        }
+      });
+
+      if (!event) throw new Error('AssetTokenDeployed event not found.');
+
+      return this.factoryContract.interface.parseLog(event)!.args.tokenAddress;
     } catch (error: any) {
       this.logger.error(`Deployment failed: ${error.message}`);
       throw new InternalServerErrorException(error.message);
@@ -137,48 +137,24 @@ export class BlockchainService {
     return await this.registryContract.isClearToTrade(investorWallet);
   }
 
-  /**
-   * Executes a token transfer from the Treasury/Vault to an Investor.
-   * This is the heart of the "Mirror" process.
-   */
   async transferFromVault(
     tokenAddress: string,
     to: string,
     amount: number,
-    decimals: number = 18, // Ensure this matches your RemzikAssetToken
+    decimals: number = 18,
   ): Promise<string> {
-    try {
-      // 1. Initialize the Token Contract Interface
-      const erc20Abi = [
-        'function transfer(address to, uint256 amount) external returns (bool)',
-        'function decimals() view returns (uint8)',
-      ];
-      const tokenContract = new ethers.Contract(
-        tokenAddress,
-        erc20Abi,
-        this.wallet,
-      );
-
-      // 2. Convert human-readable amount to BigInt
-      const amountBigInt = ethers.parseUnits(amount.toString(), decimals);
-
-      // 3. Execute Transfer
-      this.logger.log(`Transferring ${amount} units from Treasury to ${to}`);
-      const tx = await tokenContract.transfer(to, amountBigInt);
-
-      // 4. Wait for confirmation
-      const receipt = await tx.wait(1);
-
-      if (receipt?.status === 0) {
-        throw new Error(
-          'Transaction reverted by the EVM (likely compliance check failure)',
-        );
-      }
-
-      return receipt!.hash;
-    } catch (error: any) {
-      this.logger.error(`Blockchain Transfer Failed: ${error.message}`);
-      throw error; // Re-throw to be handled by the BullMQ worker for retries
-    }
+    const erc20Abi = [
+      'function transfer(address to, uint256 amount) external returns (bool)',
+    ];
+    const tokenContract = new ethers.Contract(
+      tokenAddress,
+      erc20Abi,
+      this.wallet,
+    );
+    const amountBigInt = ethers.parseUnits(amount.toString(), decimals);
+    const tx = await tokenContract.transfer(to, amountBigInt);
+    const receipt = await tx.wait(1);
+    if (receipt?.status === 0) throw new Error('Transfer reverted.');
+    return receipt!.hash;
   }
 }

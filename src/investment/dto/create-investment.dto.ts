@@ -1,10 +1,16 @@
-import { IsNumber, IsUUID, Min } from 'class-validator';
+// src/investments/dto/create-investment.dto.ts
+import { IsNotEmpty, IsNumber, IsUUID, Min } from 'class-validator';
 
 export class CreateInvestmentDto {
   @IsUUID()
-  assetId: string;
+  @IsNotEmpty()
+  assetId!: string;
 
   @IsNumber()
   @Min(1)
-  amount: number;
+  amount!: number;
+
+  @IsNotEmpty()
+  @IsUUID()
+  transactionId!: string;
 }

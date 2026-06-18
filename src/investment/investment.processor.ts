@@ -2,6 +2,7 @@ import { Processor, Process } from '@nestjs/bull';
 import type { Job } from 'bull';
 import { InvestmentService } from './investment.service';
 import { Logger } from '@nestjs/common';
+import { InvestmentStatus } from './enums/investment-status.enum';
 
 @Processor('investment-queue')
 export class InvestmentProcessor {
@@ -12,37 +13,34 @@ export class InvestmentProcessor {
   @Process('process-investment')
   async handleInvestment(job: Job<{ investmentId: string }>) {
     const { investmentId } = job.data;
-    this.logger.log(
-      `[Queue] Starting tokenization for Investment: ${investmentId}`,
-    );
 
     try {
-      // 1. Execute blockchain transfer
+      // ATOMICITY CHECK: Ensure we aren't re-processing a completed job
+      const investment = await this.investmentService.getById(investmentId);
+      if (investment?.status === InvestmentStatus.CONFIRMED) {
+        this.logger.warn(
+          `Investment ${investmentId} already confirmed. Skipping.`,
+        );
+        return;
+      }
+
+      // Execute transfer
       const txHash =
         await this.investmentService.executeBlockchainTransfer(investmentId);
 
-      this.logger.log(
-        `[Queue] Blockchain transfer successful. Hash: ${txHash}`,
-      );
-
-      // 2. Finalize status in DB
+      // Finalize
       await this.investmentService.finalizeTokenization(investmentId, txHash);
 
-      this.logger.log(
-        `[Queue] Investment ${investmentId} successfully finalized.`,
-      );
+      this.logger.log(`[Queue] Successfully finalized ${investmentId}`);
     } catch (error: any) {
       this.logger.error(
-        `[Queue] Failed to process investment ${investmentId}: ${error.message}`,
+        `[Queue] Failed processing ${investmentId}: ${error.message}`,
       );
-
-      // 3. Rollback balance and update status to FAILED
       await this.investmentService.handleInvestmentFailure(
         investmentId,
         error.message,
       );
-
-      throw error; // Let BullMQ handle retry logic
+      throw error; // Let BullMQ retry
     }
   }
 }

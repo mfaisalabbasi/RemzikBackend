@@ -24,6 +24,7 @@ export class AuditService {
       targetId: string;
       action: AdminAction;
       reason?: string;
+      txHash?: string;
     },
     manager?: EntityManager, // ✅ Added optional manager
   ) {

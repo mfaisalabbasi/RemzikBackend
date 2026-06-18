@@ -24,6 +24,8 @@ export class AuditLog {
 
   @Column({ type: 'text', nullable: true })
   reason?: string;
+  @Column({ nullable: true })
+  txHash!: string;
 
   @CreateDateColumn()
   createdAt!: Date;

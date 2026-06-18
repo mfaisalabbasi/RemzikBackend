@@ -33,6 +33,7 @@ import { AssetStatus } from 'src/asset/enums/asset-status.enum';
 import { AuditLog } from 'src/audit/audit.entity';
 import { User } from 'src/user/user.entity';
 import { BlockchainService } from 'src/blockchain/blockchain.service';
+import { ChainEventLog } from 'src/blockchain/chain-event-log.entity';
 
 @Injectable()
 export class AdminService {
@@ -61,6 +62,8 @@ export class AdminService {
     private readonly auditLogRepo: Repository<AuditLog>,
     private readonly dataSource: DataSource,
     private readonly blockchainService: BlockchainService,
+    @InjectRepository(ChainEventLog)
+    private readonly chainEventRepo: Repository<ChainEventLog>,
   ) {}
 
   async getUrgentQueue(): Promise<UrgentTask[]> {
@@ -664,5 +667,68 @@ export class AdminService {
     });
 
     return { success: true, isActive: partner.user.isActive };
+  }
+
+  // src/admin/admin.service.ts
+
+  async getExplorerData(query: string | undefined, page: number = 1) {
+    const limit = 20;
+
+    if (query && query.trim() !== '') {
+      // 1. Search Chain Events (by txHash OR eventName)
+      const events = await this.chainEventRepo
+        .createQueryBuilder('log')
+        .where('log.txHash ILIKE :query', { query: `%${query}%` })
+        .orWhere('log.eventName ILIKE :query', { query: `%${query}%` })
+        .getMany();
+
+      // 2. Search Audit Logs (by targetId)
+      const audits = await this.auditLogRepo
+        .createQueryBuilder('audit')
+        .where('audit.targetId = :query', { query })
+        .getMany();
+
+      return [...events, ...audits].sort(
+        (a, b) => b.createdAt.getTime() - a.createdAt.getTime(),
+      );
+    }
+
+    // Default view
+    return await this.chainEventRepo.find({
+      order: { createdAt: 'DESC' },
+      take: limit,
+    });
+  }
+
+  async getAddressState(targetId: string) {
+    const latestEvent = await this.chainEventRepo
+      .createQueryBuilder('log')
+      .where("log.eventData->>'targetId' = :targetId", { targetId })
+      .orderBy('log.createdAt', 'DESC')
+      .getOne();
+
+    return {
+      targetId,
+      isVerified: latestEvent?.eventData?.status === true,
+      lastEvent: latestEvent?.eventName,
+      lastUpdated: latestEvent?.createdAt,
+    };
+  }
+
+  async getTransactionDetail(txHash: string) {
+    // 1. Get the Chain Reality
+    const event = await this.chainEventRepo.findOne({ where: { txHash } });
+
+    // 2. Get the Admin Intent (The AuditLog)
+    const audit = await this.auditLogRepo.findOne({ where: { txHash } });
+
+    if (!event) throw new NotFoundException('Transaction not found on chain');
+
+    return {
+      event, // The "Truth": Contract event details
+      audit, // The "Intent": Which admin did this and why
+      block: event.blockNumber,
+      timestamp: event.createdAt,
+    };
   }
 }

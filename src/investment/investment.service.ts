@@ -40,6 +40,10 @@ export class InvestmentService {
     private readonly blockchainService: BlockchainService,
   ) {}
 
+  async getById(id: string): Promise<Investment | null> {
+    return await this.investmentRepo.findOne({ where: { id } });
+  }
+
   async createInvestment(
     userId: string,
     dto: CreateInvestmentDto,
@@ -70,11 +74,9 @@ export class InvestmentService {
         const sharesToBuy = Number(dto.amount) / Number(token.sharePrice);
         const preciseShares = Math.round(sharesToBuy * 10000) / 10000;
 
-        if (preciseShares > Number(token.availableShares)) {
+        if (preciseShares > Number(token.availableShares))
           throw new BadRequestException('Not enough shares available');
-        }
 
-        // RESERVE shares immediately so no one else buys them
         token.availableShares = Number(token.availableShares) - preciseShares;
         await manager.save(token);
 
@@ -89,10 +91,16 @@ export class InvestmentService {
 
         const savedInvestment = await manager.save(investment);
 
-        // Queue for background blockchain reconciliation
-        await this.investmentQueue.add('process-investment', {
-          investmentId: savedInvestment.id,
-        });
+        // PRODUCTION FIX: Unique transactionId enforces idempotency via BullMQ jobId
+        await this.investmentQueue.add(
+          'process-investment',
+          { investmentId: savedInvestment.id },
+          {
+            jobId: dto.transactionId,
+            attempts: 3,
+            removeOnComplete: true,
+          },
+        );
 
         return savedInvestment;
       },
@@ -116,13 +124,10 @@ export class InvestmentService {
           ],
         });
 
-        // Ensure investment exists and isn't already confirmed to prevent double-processing
         if (!investment || investment.status === InvestmentStatus.CONFIRMED)
           return null;
 
         const asset = investment.asset;
-
-        // 1. Transfer funds
         await this.walletService.transfer(
           investment.investor.user.id,
           asset.partner.user.id,
@@ -132,7 +137,6 @@ export class InvestmentService {
           manager,
         );
 
-        // 2. Update Asset Data (Funded amount and unique investor count)
         asset.funded = Number(asset.funded) + Number(investment.amount);
         const existingOwnership = await manager.findOne(Ownership, {
           where: { investorId: investment.investor.id, assetId: asset.id },
@@ -140,7 +144,6 @@ export class InvestmentService {
         if (!existingOwnership) asset.investors = (asset.investors || 0) + 1;
         await manager.save(asset);
 
-        // 3. Confirm Ownership
         await this.ownershipService.addShares(
           investment.investor,
           asset,
@@ -148,21 +151,19 @@ export class InvestmentService {
           manager,
         );
 
-        // 4. Mark Confirmed
         investment.status = InvestmentStatus.CONFIRMED;
         investment.txHash = txHash;
         return await manager.save(investment);
       },
     );
 
-    // TRIGGER NOTIFICATION: Only if the transaction was successful and returned an object
     if (confirmedInvestment) {
       await this.notificationOrchestrator.buildAndSave(
         confirmedInvestment.investor.user.id,
         'investment.created',
         {
           title: 'Investment Confirmed!',
-          message: `Your investment of SAR ${confirmedInvestment.amount} in "${confirmedInvestment.asset.title}" is now finalized on the blockchain.`,
+          message: `Your investment of SAR ${confirmedInvestment.amount} in "${confirmedInvestment.asset.title}" is now finalized.`,
           amount: confirmedInvestment.amount,
           asset: confirmedInvestment.asset.title,
           timestamp: new Date(),
@@ -180,9 +181,7 @@ export class InvestmentService {
         where: { id: investmentId },
         relations: ['investor', 'investor.user', 'asset'],
       });
-
       if (investment && investment.status !== InvestmentStatus.FAILED) {
-        // Rollback: Return reserved shares to token pool
         const token = await manager.findOne(AssetToken, {
           where: { asset: { id: investment.asset.id } },
         });
@@ -257,22 +256,12 @@ export class InvestmentService {
       where: { id: investmentId },
       relations: ['asset', 'investor', 'investor.user'],
     });
-
     if (!investment) throw new NotFoundException('Investment record not found');
-
-    // Guard Clauses: Ensure data exists before calling the blockchain service
-    if (!investment.asset?.tokenAddress) {
-      throw new InternalServerErrorException(
-        'Asset lacks a valid token contract address.',
-      );
-    }
-
-    if (!investment.investor?.user?.walletAddress) {
-      throw new InternalServerErrorException(
-        'Investor does not have a registered wallet address.',
-      );
-    }
-
+    if (
+      !investment.asset?.tokenAddress ||
+      !investment.investor?.user?.walletAddress
+    )
+      throw new InternalServerErrorException('Missing blockchain credentials');
     return await this.blockchainService.transferFromVault(
       investment.asset.tokenAddress,
       investment.investor.user.walletAddress,

@@ -315,4 +315,25 @@ export class AdminController {
   ) {
     return this.adminService.togglePartnerFreeze(id, reason, req.user.userId);
   }
+
+  @Get('explorer/unified')
+  @Roles(UserRole.ADMIN)
+  async getUnifiedExplorer(
+    @Query('query') query?: string,
+    @Query('page') page: number = 1,
+  ) {
+    return await this.adminService.getExplorerData(query, page);
+  }
+
+  @Get('explorer/state/:targetId')
+  @Roles(UserRole.ADMIN)
+  async getTargetState(@Param('targetId') targetId: string) {
+    return await this.adminService.getAddressState(targetId);
+  }
+
+  @Get('explorer/transaction/:txHash')
+  @Roles(UserRole.ADMIN)
+  async getTransactionDetail(@Param('txHash') txHash: string) {
+    return await this.adminService.getTransactionDetail(txHash);
+  }
 }

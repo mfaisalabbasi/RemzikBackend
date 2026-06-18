@@ -5,7 +5,7 @@ import { EventEmitterModule } from '@nestjs/event-emitter';
 import { Investment } from './investment.entity';
 import { InvestmentService } from './investment.service';
 import { InvestmentController } from './investment.controller';
-import { InvestmentProcessor } from './investment.processor'; // Added
+import { InvestmentProcessor } from './investment.processor';
 import { InvestorProfile } from '../investor/investor.entity';
 import { Asset } from '../asset/asset.entity';
 import { KycModule } from 'src/kyc/kyc.module';
@@ -25,6 +25,11 @@ import { NotificationsModule } from 'src/notifications/notifications.module';
     NotificationsModule,
     BullModule.registerQueue({
       name: 'investment-queue',
+      defaultJobOptions: {
+        attempts: 3,
+        removeOnComplete: true, // Crucial: Auto-deletes finished jobs
+        removeOnFail: true, // Crucial: Auto-deletes failed jobs
+      },
     }),
   ],
   providers: [InvestmentService, NotificationOrchestrator, InvestmentProcessor],

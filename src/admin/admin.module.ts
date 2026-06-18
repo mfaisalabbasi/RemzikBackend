@@ -20,6 +20,7 @@ import { PartnerProfile } from 'src/partner/partner.entity';
 import { Asset } from 'src/asset/asset.entity';
 import { AuditLog } from 'src/audit/audit.entity';
 import { DistributionModule } from 'src/distribution/distribution.module';
+import { ChainEventLog } from 'src/blockchain/chain-event-log.entity';
 
 @Module({
   controllers: [AdminController],
@@ -35,6 +36,7 @@ import { DistributionModule } from 'src/distribution/distribution.module';
       PartnerProfile,
       Asset,
       AuditLog,
+      ChainEventLog, // ✅ Added ChainEventLog to the TypeOrmModule imports
     ]),
     PartnerModule,
     AssetModule,
