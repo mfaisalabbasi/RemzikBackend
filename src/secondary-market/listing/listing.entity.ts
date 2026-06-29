@@ -46,6 +46,9 @@ export class SecondaryMarketListing {
   @Column({ type: 'timestamp', nullable: true })
   expiresAt: Date | null;
 
+  @Column({ type: 'varchar', default: 'PENDING' })
+  blockchainStatus: string;
+
   @CreateDateColumn()
   createdAt: Date;
 

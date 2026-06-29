@@ -1,25 +1,22 @@
 import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, DataSource } from 'typeorm';
 import { ChainEventLog } from './chain-event-log.entity';
 import { BlockchainService } from './blockchain.service';
+import { ConfigService } from '@nestjs/config';
 import { ethers, LogDescription } from 'ethers';
-import * as AssetTokenABI from './abi/RemzikAssetToken.json';
 
 @Injectable()
 export class IndexerService implements OnModuleInit {
   private readonly logger = new Logger(IndexerService.name);
-  private tokenInterface: ethers.Interface;
 
   constructor(
     @InjectRepository(ChainEventLog)
     private readonly logRepo: Repository<ChainEventLog>,
     private readonly blockchainService: BlockchainService,
-  ) {
-    this.tokenInterface = new ethers.Interface(
-      (AssetTokenABI as any).abi || AssetTokenABI,
-    );
-  }
+    private readonly dataSource: DataSource,
+    private readonly configService: ConfigService,
+  ) {}
 
   async onModuleInit() {
     this.logger.log('Production Indexer initialized...');
@@ -28,19 +25,10 @@ export class IndexerService implements OnModuleInit {
     );
   }
 
-  /**
-   * Helper to safely serialize BigInt for database storage
-   */
-  private serializeEventData(data: any): any {
-    return JSON.parse(
-      JSON.stringify(data, (key, value) =>
-        typeof value === 'bigint' ? value.toString() : value,
-      ),
-    );
-  }
-
   private async syncLoop() {
-    const provider = this.blockchainService.getProvider();
+    // USE ISOLATED PROVIDER from BlockchainService to prevent API blocking
+    const provider = this.blockchainService.getIndexerProvider();
+
     const registryInterface = new ethers.Interface(
       this.blockchainService.getRegistryAbi(),
     );
@@ -50,75 +38,76 @@ export class IndexerService implements OnModuleInit {
 
     while (true) {
       try {
-        // 1. Fetch all previously deployed tokens to monitor their events dynamically
-        const deployedTokens = await this.logRepo.find({
-          where: { eventName: 'AssetTokenDeployed' },
-        });
-        const tokenAddresses = deployedTokens.map(
-          (t) => t.eventData.tokenAddress,
-        );
-
-        // 2. Combine all addresses to watch
-        const addressesToWatch = [
-          this.blockchainService.getRegistryAddress(),
-          this.blockchainService.getFactoryAddress(),
-          ...tokenAddresses,
-        ];
-
-        const lastLog = await this.logRepo.findOne({
-          where: {},
+        const latestLogs = await this.logRepo.find({
           order: { blockNumber: 'DESC' },
+          take: 1,
         });
+
+        const lastLog = latestLogs.length > 0 ? latestLogs[0] : null;
         let fromBlock = lastLog ? Number(lastLog.blockNumber) + 1 : 0;
+        fromBlock = Math.max(0, fromBlock);
+
         const currentBlock = await provider.getBlockNumber();
 
         if (fromBlock <= currentBlock) {
-          this.logger.log(`Scanning blocks ${fromBlock} to ${currentBlock}...`);
+          const toBlock = Math.min(fromBlock + 10, currentBlock);
+
+          this.logger.log(`Syncing blocks ${fromBlock} to ${toBlock}...`);
 
           const logs = await provider.getLogs({
             fromBlock,
-            toBlock: currentBlock,
-            address: addressesToWatch,
+            toBlock,
+            address: [
+              this.blockchainService.getRegistryAddress(),
+              this.blockchainService.getFactoryAddress(),
+            ],
           });
 
-          for (const log of logs) {
-            let parsed: LogDescription | null = null;
+          if (logs.length > 0) {
+            await this.dataSource.transaction(
+              async (transactionalEntityManager) => {
+                for (const log of logs) {
+                  let parsed: LogDescription | null = null;
+                  try {
+                    parsed =
+                      registryInterface.parseLog(log) ||
+                      factoryInterface.parseLog(log);
+                  } catch {}
 
-            try {
-              // Try parsing against all known interfaces
-              parsed =
-                registryInterface.parseLog(log) ||
-                factoryInterface.parseLog(log) ||
-                this.tokenInterface.parseLog(log);
-            } catch (e) {
-              // Silently ignore logs that don't match our ABIs
-            }
+                  const entity = this.logRepo.create({
+                    txHash: log.transactionHash,
+                    eventName: parsed
+                      ? (parsed as LogDescription).name
+                      : 'Unknown',
+                    eventData:
+                      parsed && (parsed as LogDescription).args
+                        ? JSON.parse(
+                            JSON.stringify(
+                              (parsed as LogDescription).args.toObject(),
+                              (k, v) =>
+                                typeof v === 'bigint' ? v.toString() : v,
+                            ),
+                          )
+                        : { rawData: log.data },
+                    blockNumber: Number(log.blockNumber),
+                  });
 
-            // Upsert ensures we don't duplicate logs and handles BigInt serialization
-            await this.logRepo.upsert(
-              {
-                txHash: log.transactionHash,
-                eventName: parsed ? parsed.name : 'Unknown',
-                eventData: parsed
-                  ? this.serializeEventData(parsed.args.toObject())
-                  : { rawData: log.data },
-                blockNumber: Number(log.blockNumber),
+                  await transactionalEntityManager.upsert(
+                    ChainEventLog,
+                    entity,
+                    ['txHash'],
+                  );
+                }
               },
-              ['txHash'],
             );
-
-            if (parsed) {
-              this.logger.log(
-                `Indexed: ${parsed.name} | Source: ${log.address.slice(0, 8)}...`,
-              );
-            }
+            this.logger.log(`Indexed ${logs.length} logs.`);
           }
         }
       } catch (err) {
         this.logger.error(`Sync loop error: ${(err as Error).message}`);
       }
-      // Wait 10 seconds before next poll
-      await new Promise((resolve) => setTimeout(resolve, 10000));
+      // 20s interval is the "sweet spot" for local Hardhat node stability
+      await new Promise((resolve) => setTimeout(resolve, 90000));
     }
   }
 }

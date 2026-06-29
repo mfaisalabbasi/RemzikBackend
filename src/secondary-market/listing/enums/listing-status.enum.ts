@@ -3,4 +3,7 @@ export enum ListingStatus {
   SOLD = 'SOLD',
   CANCELLED = 'CANCELLED',
   EXPIRED = 'EXPIRED',
+
+  PENDING = 'PENDING',
+  FAILED = 'FAILED',
 }

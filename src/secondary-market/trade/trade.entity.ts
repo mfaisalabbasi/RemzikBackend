@@ -46,6 +46,9 @@ export class Trade {
   @Column({ type: 'timestamp', nullable: true })
   executedAt: Date;
 
+  @Column({ nullable: true })
+  txHash: string;
+
   @CreateDateColumn()
   createdAt: Date;
 

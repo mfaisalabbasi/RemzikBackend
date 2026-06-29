@@ -5,6 +5,7 @@ import {
   IsUUID,
   IsOptional,
   IsDateString,
+  IsString,
 } from 'class-validator';
 
 export class CreateListingDto {
@@ -18,6 +19,9 @@ export class CreateListingDto {
   @IsNumber()
   @IsPositive()
   pricePerUnit: number;
+
+  @IsString()
+  approvalTxHash: string;
 
   @IsOptional()
   @IsDateString()

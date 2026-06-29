@@ -20,6 +20,7 @@ import { CreateTradeDto } from './dto/create-trade.dto';
 import { EscrowService } from 'src/escrow/escrow.service';
 import { Escrow } from 'src/escrow/escrow.entity';
 import { SecondaryMarketListing } from '../listing/listing.entity';
+import { BlockchainService } from 'src/blockchain/blockchain.service';
 
 @Injectable()
 export class TradeService {
@@ -31,6 +32,7 @@ export class TradeService {
     private readonly tradeLockService: TradeLockService,
     private readonly auditService: AuditService,
     private readonly escrowService: EscrowService,
+    private readonly blockchainService: BlockchainService,
   ) {}
 
   async createTrade(
@@ -48,7 +50,6 @@ export class TradeService {
       );
     }
 
-    // 🛡️ PREVENT FLOAT POINT TRUNCATION ON TOTAL PRICE MULTIPLICATION
     const calculatedTotal = Number(dto.units) * Number(dto.pricePerUnit);
     const preciseTotalPrice = Math.round(calculatedTotal * 100) / 100;
 
@@ -75,7 +76,6 @@ export class TradeService {
     try {
       return await this.tradeRepo.manager.transaction(
         async (manager: EntityManager) => {
-          // 🛡️ FETCH INSIDE TRANSACTION WITH PESSIMISTIC ROW-LEVEL DB LOCK
           const listing = await manager
             .getRepository(SecondaryMarketListing)
             .createQueryBuilder('listing')
@@ -95,21 +95,29 @@ export class TradeService {
           const rawTotalPrice = unitsToBuy * Number(listing.pricePerUnit);
           const totalPrice = Math.round(rawTotalPrice * 100) / 100;
 
-          const buyerBalance = await this.walletService.getAvailableBalance(
-            buyer.user.id,
-          );
-
-          if (Number(buyerBalance) < totalPrice) {
+          // 🛡️ TYPE GUARD: Ensure addresses exist for the blockchain call
+          const sellerWallet = listing.sellerId;
+          const buyerWallet = buyer.user.walletAddress;
+          if (!sellerWallet || !buyerWallet) {
             throw new BadRequestException(
-              `Insufficient balance. Have: ${buyerBalance} SAR, Need: ${totalPrice} SAR`,
+              'Seller or Buyer wallet address is missing.',
             );
           }
+
+          // 1. ATOMIC SWAP ON-CHAIN
+          const txHash = await this.blockchainService.executeAtomicSwap(
+            sellerWallet,
+            buyerWallet,
+            listing.assetId,
+            unitsToBuy,
+            totalPrice,
+          );
 
           const sellerProfile = await this.ownershipService.getInvestorByUserId(
             listing.sellerId,
           );
 
-          // 1. Create Trade Record First (within transaction manager context)
+          // 2. CREATE TRADE RECORD WITH TX HASH
           const trade = manager.create(Trade, {
             buyer,
             seller: sellerProfile,
@@ -118,12 +126,12 @@ export class TradeService {
             pricePerUnit: listing.pricePerUnit,
             totalPrice: totalPrice,
             status: TradeStatus.LOCKED,
+            txHash: txHash,
             executedAt: new Date(),
           });
 
           const savedTrade = await manager.save(trade);
 
-          // 2. USE ESCROW SERVICE WITH INJECTED MANAGER
           await this.escrowService.createEscrow(
             {
               tradeId: savedTrade.id,
@@ -141,7 +149,6 @@ export class TradeService {
             unitsToBuy,
             manager,
           );
-
           await this.ownershipService.addUnits(
             buyer,
             listing.assetId,
@@ -157,7 +164,7 @@ export class TradeService {
               adminId: buyer.user.id,
               targetId: savedTrade.id,
               action: AdminAction.TRADE_EXECUTED,
-              reason: `P2P Purchase (Escrow Locked): ${unitsToBuy} units @ ${listing.pricePerUnit} SAR`,
+              reason: `Atomic P2P Purchase. TX: ${txHash}`,
             },
             manager,
           );
@@ -184,18 +191,12 @@ export class TradeService {
         });
 
         if (!trade) throw new BadRequestException('Trade not found');
-
-        if (trade.buyer.user.id !== currentUserId) {
-          throw new BadRequestException(
-            'Unauthorized: Only the buyer can release escrowed funds',
-          );
-        }
-
-        if (trade.status !== TradeStatus.LOCKED) {
+        if (trade.buyer.user.id !== currentUserId)
+          throw new BadRequestException('Unauthorized');
+        if (trade.status !== TradeStatus.LOCKED)
           throw new BadRequestException(
             `Cannot settle trade in ${trade.status} status`,
           );
-        }
 
         const escrow = await manager.findOne(Escrow, { where: { tradeId } });
         if (escrow) {
@@ -209,24 +210,11 @@ export class TradeService {
         }
 
         trade.status = TradeStatus.COMPLETED;
-        const updatedTrade = await manager.save(trade);
-
-        await this.auditService.log(
-          {
-            adminId: currentUserId,
-            targetId: trade.id,
-            action: AdminAction.TRADE_COMPLETED,
-            reason: `Escrow released by buyer: Funds transferred to seller for trade ${trade.id}`,
-          },
-          manager,
-        );
-
-        return updatedTrade;
+        return await manager.save(trade);
       },
     );
   }
 
-  // Keep helper queries intact...
   async getTrades() {
     return this.tradeRepo.find({
       relations: ['seller', 'buyer', 'asset'],
@@ -251,15 +239,9 @@ export class TradeService {
       relations: ['buyer', 'seller', 'buyer.user', 'seller.user'],
     });
 
-    if (!trade)
-      throw new BadRequestException(
-        'Trade record not found in the Remzik ledger',
-      );
+    if (!trade) throw new BadRequestException('Trade record not found');
     if (trade.status !== TradeStatus.LOCKED)
-      throw new BadRequestException(
-        `Dispute denied: Trade status is ${trade.status}. Only LOCKED trades can be disputed.`,
-      );
-
+      throw new BadRequestException('Only LOCKED trades can be disputed.');
     return trade;
   }
 }

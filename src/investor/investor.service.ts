@@ -52,6 +52,7 @@ export class InvestorService {
       quantity: Number(h.units),
       avgPrice: 0,
       pnl: 0,
+      tokenAddress: h.asset?.tokenAddress || '',
     }));
   }
 
