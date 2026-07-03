@@ -15,6 +15,7 @@ import { AdminAction } from 'src/audit/enums/audit-action.enum';
 import { Escrow } from '../escrow/escrow.entity';
 import { OwnershipService } from '../ownership/ownership.service';
 import { Trade } from '../secondary-market/trade/trade.entity';
+import { BlockchainService } from '../blockchain/blockchain.service';
 
 @Injectable()
 export class DisputeService {
@@ -25,6 +26,7 @@ export class DisputeService {
     private readonly auditService: AuditService,
     private readonly dataSource: DataSource,
     private readonly ownershipService: OwnershipService,
+    private readonly blockchainService: BlockchainService,
   ) {}
 
   async createDispute(userId: string, dto: CreateDisputeDto) {
@@ -54,18 +56,13 @@ export class DisputeService {
         dto.type === DisputeType.SECONDARY_TRADE
       ) {
         try {
-          // 1. Handle Escrow Logic (Money Freeze)
           await this.escrowService.disputeEscrow(dto.referenceId, manager);
-
-          // 2. Update Trade Status to DISPUTED to sync with Frontend
-          // Ensure your 'trades_status_enum' in DB has 'DISPUTED'
           await manager.update(Trade, dto.referenceId, {
             status: 'DISPUTED' as any,
           });
         } catch (e: unknown) {
-          const msg = e instanceof Error ? e.message : 'Unknown error';
           throw new BadRequestException(
-            `Financial link failed: Trade ${dto.referenceId} update error: ${msg}`,
+            `Financial link failed: ${e instanceof Error ? e.message : 'Unknown error'}`,
           );
         }
       }
@@ -85,9 +82,7 @@ export class DisputeService {
   }
 
   async getAllDisputes() {
-    return this.disputeRepo.find({
-      order: { createdAt: 'DESC' },
-    });
+    return this.disputeRepo.find({ order: { createdAt: 'DESC' } });
   }
 
   async getUserDisputes(userId: string) {
@@ -106,16 +101,15 @@ export class DisputeService {
       const dispute = await manager.findOne(Dispute, {
         where: { id: disputeId },
       });
-
       if (!dispute) throw new NotFoundException('Dispute record not found');
 
-      const terminalStatuses = [
-        DisputeStatus.RESOLVED_FAVOR_BUYER,
-        DisputeStatus.RESOLVED_FAVOR_SELLER,
-        DisputeStatus.REJECTED,
-      ];
-
-      if (terminalStatuses.includes(dispute.status)) {
+      if (
+        [
+          DisputeStatus.RESOLVED_FAVOR_BUYER,
+          DisputeStatus.RESOLVED_FAVOR_SELLER,
+          DisputeStatus.REJECTED,
+        ].includes(dispute.status)
+      ) {
         throw new BadRequestException(
           'Dispute has already reached a terminal state',
         );
@@ -139,8 +133,6 @@ export class DisputeService {
 
       const updatedDispute = await manager.save(dispute);
 
-      // --- CRITICAL FIX FOR DB ENUM ERROR ---
-      // We use 'COMPLETED' instead of 'SETTLED' to align with your Postgres trades_status_enum
       if (
         dto.status === DisputeStatus.RESOLVED_FAVOR_SELLER ||
         dto.status === DisputeStatus.RESOLVED_FAVOR_BUYER
@@ -169,48 +161,66 @@ export class DisputeService {
     targetStatus: DisputeStatus,
     manager: EntityManager,
   ) {
-    const escrow = await manager.getRepository(Escrow).findOne({
-      where: { tradeId: referenceId },
+    const trade = await manager.getRepository(Trade).findOne({
+      where: { id: referenceId },
+      relations: ['buyer', 'buyer.user', 'seller', 'seller.user', 'asset'],
     });
 
-    if (!escrow) {
-      throw new BadRequestException(
-        `Ledger Error: No active escrow record found for trade ${referenceId}`,
-      );
-    }
+    if (!trade) throw new BadRequestException('Trade not found');
+
+    const escrow = await manager
+      .getRepository(Escrow)
+      .findOne({ where: { tradeId: referenceId } });
+    if (!escrow) throw new BadRequestException('Escrow record not found');
 
     try {
       switch (targetStatus) {
         case DisputeStatus.RESOLVED_FAVOR_SELLER:
+          // 1. Release funds from escrow to seller's wallet
           await this.escrowService.releaseEscrowByTradeId(referenceId, manager);
-          break;
 
-        case DisputeStatus.RESOLVED_FAVOR_BUYER:
-          await this.escrowService.refundEscrowByTradeId(referenceId, manager);
+          const sellerWallet = trade.seller.user?.walletAddress;
+          const buyerWallet = trade.buyer.user?.walletAddress;
 
-          const trade = await manager.getRepository(Trade).findOne({
-            where: { id: referenceId },
-            relations: ['buyer', 'seller', 'asset'],
-          });
-
-          if (!trade || !trade.buyer || !trade.seller || !trade.asset) {
+          if (!sellerWallet || !buyerWallet) {
             throw new BadRequestException(
-              'Rollback failed: Trade relations missing.',
+              'Trade participants lack valid wallets.',
             );
           }
 
+          // 2. Perform on-chain settlement (moves ownership from Seller -> Buyer)
+          const txHash = await this.blockchainService.settleTrade(
+            trade.listingId,
+            sellerWallet,
+            buyerWallet,
+          );
+
+          // 3. INTERNAL LEDGER UPDATES: Mirroring settleTrade() logic
+          // Move tokens from seller to buyer in the database
           await this.ownershipService.removeUnits(
-            trade.buyer.id,
+            trade.seller.id,
             trade.asset.id,
             trade.units,
             manager,
           );
+
           await this.ownershipService.addUnits(
-            trade.seller,
+            trade.buyer,
             trade.asset.id,
             trade.units,
             manager,
           );
+
+          await manager.update(Trade, referenceId, { txHash });
+          break;
+
+        case DisputeStatus.RESOLVED_FAVOR_BUYER:
+          // 1. REFUND: Return money from Escrow to Buyer
+          await this.escrowService.refundEscrowByTradeId(referenceId, manager);
+
+          // 2. TOKEN STATUS:
+          // Tokens were never removed from Seller; they remain in Seller's ownership.
+          // No action needed for tokens.
           break;
 
         case DisputeStatus.FROZEN:
@@ -221,7 +231,10 @@ export class DisputeService {
           break;
       }
     } catch (error: any) {
-      throw new BadRequestException(`Settlement failed: ${error.message}`);
+      console.error('DEBUG: Financial Resolution Failed:', error);
+      throw new BadRequestException(
+        `Resolution execution failed: ${error.message}`,
+      );
     }
   }
 }

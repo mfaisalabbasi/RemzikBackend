@@ -6,10 +6,12 @@ import {
   CreateDateColumn,
   UpdateDateColumn,
   Index,
+  JoinColumn,
 } from 'typeorm';
 import { InvestorProfile } from '../../investor/investor.entity';
 import { Asset } from '../../asset/asset.entity';
 import { TradeStatus } from './enums/trade-status.enum';
+import { SecondaryMarketListing } from '../listing/listing.entity';
 
 @Entity('trades')
 export class Trade {
@@ -42,6 +44,14 @@ export class Trade {
     default: TradeStatus.PENDING,
   })
   status: TradeStatus;
+
+  @Column()
+  listingId: string;
+
+  // 2. Add the relationship
+  @ManyToOne(() => SecondaryMarketListing)
+  @JoinColumn({ name: 'listingId' })
+  listing: SecondaryMarketListing;
 
   @Column({ type: 'timestamp', nullable: true })
   executedAt: Date;
