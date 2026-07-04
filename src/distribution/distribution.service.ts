@@ -12,6 +12,7 @@ import { LedgerSource } from 'src/ledger/enums/ledger-source.enum';
 import { PayoutStatus } from './enums/payout-status.enum';
 import { Investment } from 'src/investment/investment.entity';
 import { AssetIncome } from 'src/asset/asset-income.entity';
+import { BlockchainService } from 'src/blockchain/blockchain.service';
 
 @Injectable()
 export class DistributionService {
@@ -32,6 +33,7 @@ export class DistributionService {
     private readonly distributionRepo: Repository<Distribution>,
     private readonly walletService: WalletService,
     private readonly dataSource: DataSource,
+    private readonly blockchainService: BlockchainService,
   ) {}
 
   /**
@@ -179,7 +181,7 @@ export class DistributionService {
    * THE SETTLEMENT ENGINE (SEQUENTIAL & PENNY BALANCED)
    */
   async approveDistributionBatch(batchId: string) {
-    return await this.dataSource.transaction(async (manager) => {
+    const result = await this.dataSource.transaction(async (manager) => {
       const pendingPayouts = await manager.find(Distribution, {
         where: { batchId, status: PayoutStatus.PENDING },
         relations: [
@@ -197,6 +199,8 @@ export class DistributionService {
 
       const partnerUserId = pendingPayouts[0].asset.partner.user.id;
       const assetTitle = pendingPayouts[0].asset.title;
+      // Capture the contract address for the Notary
+      const assetAddress = pendingPayouts[0].asset.tokenAddress;
 
       const totalGrossAmount = pendingPayouts.reduce(
         (sum, p) => sum + Number(p.amount),
@@ -206,7 +210,7 @@ export class DistributionService {
       const platformFee =
         Math.round(totalGrossAmount * this.PLATFORM_FEE_PERCENT * 100) / 100;
 
-      // 1. DEBIT THE PARTNER FOR THE TOTAL GROSS
+      // 1. DEBIT THE PARTNER
       await this.walletService.debitAvailable(
         partnerUserId,
         totalGrossAmount,
@@ -220,7 +224,7 @@ export class DistributionService {
         manager,
       );
 
-      // 2. CREDIT SYSTEM REVENUE TREASURY
+      // 2. CREDIT SYSTEM REVENUE
       if (platformFee > 0) {
         await this.walletService.credit(
           this.ADMIN_WALLET_USER_ID,
@@ -235,7 +239,7 @@ export class DistributionService {
       const totalNetToInvestors =
         Math.round((totalGrossAmount - platformFee) * 100) / 100;
 
-      // 3. SEQUENTIAL LOOP PROCESSING (NO POOL CONCURRENCY OVERHEAD)
+      // 3. SEQUENTIAL LOOP PROCESSING
       for (let i = 0; i < pendingPayouts.length; i++) {
         const payout = pendingPayouts[i];
         const isLastInvestor = i === pendingPayouts.length - 1;
@@ -272,9 +276,27 @@ export class DistributionService {
           remzikRevenue: platformFee,
           netInvestorPayout: totalNetToInvestors,
           batchId: batchId,
+          assetAddress: assetAddress, // Passed for Web3
         },
       };
     });
+
+    // 4. TRIGGER WEB3 NOTARY (Outside transaction for reliability)
+    try {
+      await this.blockchainService.recordYieldOnChain(
+        result.summary.batchId,
+        result.summary.assetAddress,
+        result.summary.netInvestorPayout,
+      );
+    } catch (error) {
+      console.error(
+        `Web3 Notary failed for batch ${batchId}, will retry via queue:`,
+        error,
+      );
+      // Optional: Add to a BullMQ failure-retry queue here if needed
+    }
+
+    return result;
   }
 
   async getGlobalPendingBatches() {

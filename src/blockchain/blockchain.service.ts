@@ -8,6 +8,7 @@ import { ConfigService } from '@nestjs/config';
 import { ethers } from 'ethers';
 import * as RemzikIdentityRegistryABI from './abi/RemzikIdentityRegistry.json';
 import * as AssetFactoryABI from './abi/AssetFactory.json';
+import * as YieldNotaryABI from './abi/YieldNotary.json';
 
 @Injectable()
 export class BlockchainService implements OnModuleInit {
@@ -17,6 +18,7 @@ export class BlockchainService implements OnModuleInit {
   private registryContract: ethers.Contract;
   private factoryContract: ethers.Contract;
   private marketplaceContract: ethers.Contract;
+  private yieldNotaryContract: ethers.Contract;
 
   constructor(private configService: ConfigService) {
     const rpcUrl = this.configService.get<string>('BLOCKCHAIN_RPC_URL')!;
@@ -59,6 +61,14 @@ export class BlockchainService implements OnModuleInit {
     this.marketplaceContract = new ethers.Contract(
       marketplaceAddr,
       marketplaceAbi,
+      this.wallet,
+    );
+
+    const notaryAddr = this.configService.get<string>('YIELD_NOTARY_ADDRESS')!;
+
+    this.yieldNotaryContract = new ethers.Contract(
+      notaryAddr,
+      (YieldNotaryABI as any).abi || YieldNotaryABI,
       this.wallet,
     );
   }
@@ -231,6 +241,20 @@ export class BlockchainService implements OnModuleInit {
       tokenAddress,
       ethers.parseUnits(amount.toString(), 18),
       ethers.parseUnits(price.toString(), 18),
+    );
+    return (await tx.wait(1)).hash;
+  }
+
+  async recordYieldOnChain(
+    batchId: string,
+    propertyAddress: string,
+    totalNetYield: number,
+  ): Promise<string> {
+    // Convert string batchId to bytes32 if needed, or send as string if ABI handles it
+    const tx = await this.yieldNotaryContract.recordYield(
+      ethers.encodeBytes32String(batchId),
+      propertyAddress,
+      ethers.parseUnits(totalNetYield.toString(), 18),
     );
     return (await tx.wait(1)).hash;
   }
