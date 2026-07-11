@@ -1,180 +1,253 @@
-import {
-  Injectable,
-  Logger,
-  InternalServerErrorException,
-  OnModuleInit,
-} from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ethers } from 'ethers';
 import * as RemzikIdentityRegistryABI from './abi/RemzikIdentityRegistry.json';
 import * as AssetFactoryABI from './abi/AssetFactory.json';
 import * as YieldNotaryABI from './abi/YieldNotary.json';
+import { Mutex } from 'async-mutex';
 
 @Injectable()
 export class BlockchainService implements OnModuleInit {
   private readonly logger = new Logger(BlockchainService.name);
-  private wallet: ethers.Wallet;
   private provider: ethers.JsonRpcProvider;
+  private wallet: ethers.Wallet;
   private registryContract: ethers.Contract;
   private factoryContract: ethers.Contract;
   private marketplaceContract: ethers.Contract;
   private yieldNotaryContract: ethers.Contract;
+  private readonly transactionMutex = new Mutex();
 
   constructor(private configService: ConfigService) {
     const rpcUrl = this.configService.get<string>('BLOCKCHAIN_RPC_URL')!;
     const privateKey = this.configService.get<string>('ADMIN_PRIVATE_KEY')!;
-    const registryAddr = this.configService.get<string>(
-      'COMPLIANCE_CONTRACT_ADDRESS',
-    )!;
-    const factoryAddr = this.configService.get<string>(
-      'ASSET_FACTORY_CONTRACT_ADDRESS',
-    )!;
-    const marketplaceAddr = this.configService.get<string>(
-      'MARKETPLACE_CONTRACT_ADDRESS',
-    )!;
 
     const network = { name: 'local-hardhat', chainId: 31337 };
-
     this.provider = new ethers.JsonRpcProvider(rpcUrl, network, {
       staticNetwork: true,
     });
+
     this.wallet = new ethers.Wallet(privateKey, this.provider);
 
     this.registryContract = new ethers.Contract(
-      registryAddr,
+      this.configService.get('COMPLIANCE_CONTRACT_ADDRESS')!,
       (RemzikIdentityRegistryABI as any).abi || RemzikIdentityRegistryABI,
       this.wallet,
     );
+
     this.factoryContract = new ethers.Contract(
-      factoryAddr,
+      this.configService.get('ASSET_FACTORY_CONTRACT_ADDRESS')!,
       (AssetFactoryABI as any).abi || AssetFactoryABI,
       this.wallet,
     );
 
-    // Initialize Marketplace Interface
     const marketplaceAbi = [
       'function createListing(string calldata listingId, address token, uint256 amount) external',
-      'function settleTrade(string calldata listingId, address seller, address buyer) external',
+      'function settleTrade(string calldata listingId, address seller, address buyer, uint256 tradePrice) external',
       'function listings(string) view returns (address seller, address token, uint256 amount, bool active)',
       'function cancelListing(string calldata listingId) external',
     ];
     this.marketplaceContract = new ethers.Contract(
-      marketplaceAddr,
+      this.configService.get('MARKETPLACE_CONTRACT_ADDRESS')!,
       marketplaceAbi,
       this.wallet,
     );
 
-    const notaryAddr = this.configService.get<string>('YIELD_NOTARY_ADDRESS')!;
-
     this.yieldNotaryContract = new ethers.Contract(
-      notaryAddr,
+      this.configService.get('YIELD_NOTARY_ADDRESS')!,
       (YieldNotaryABI as any).abi || YieldNotaryABI,
       this.wallet,
     );
   }
 
   async onModuleInit() {
-    this.logger.log(`Blockchain Service initialized.`);
-    this.logger.log(`Registry: ${this.registryContract.target}`);
-    this.logger.log(`Factory: ${this.factoryContract.target}`);
+    this.logger.log('Blockchain Service initialized.');
   }
 
-  // --- IDENTITY & ASSET MANAGEMENT ---
-  public getIndexerProvider() {
-    return new ethers.JsonRpcProvider(
-      this.configService.get<string>('BLOCKCHAIN_RPC_URL')!,
+  // --- MANUAL NONCE EXECUTION WRAPPER ---
+  private async executeTx(
+    contractMethod: (
+      nonce: number,
+    ) => Promise<ethers.ContractTransactionResponse>,
+  ) {
+    return await this.transactionMutex.runExclusive(async () => {
+      const address = await this.wallet.getAddress();
+      // UPDATED: Using 'pending' to account for transactions currently in the mempool
+      const nonce = await this.provider.getTransactionCount(address, 'pending');
+
+      const tx = await contractMethod(nonce);
+      await tx.wait();
+      this.logger.log(`Transaction mined: ${tx.hash} (Nonce: ${nonce})`);
+      return tx;
+    });
+  }
+
+  // --- CONTRACT METHODS ---
+
+  /**
+   * @notice Settles a trade on-chain for a given listing.
+   * @param listingId The unique identifier of the listing.
+   * @param sellerAddress The wallet address of the seller.
+   * @param buyerAddress The wallet address of the buyer.
+   * @param priceWei The total execution price in Wei (18-decimal scale).
+   */
+  async settleTrade(
+    listingId: string,
+    sellerAddress: string,
+    buyerAddress: string,
+    priceWei: string,
+  ) {
+    // This call is wrapped in executeTx, which uses:
+    // 1. Mutex (transactionMutex) to serialize requests.
+    // 2. 'pending' nonce count to account for mempool transactions.
+    // 3. await tx.wait() to force the node to process the nonce increment.
+    return await this.executeTx((nonce) =>
+      this.marketplaceContract.settleTrade(
+        listingId,
+        sellerAddress,
+        buyerAddress,
+        BigInt(priceWei),
+        {
+          nonce,
+          // Explicit gas settings are not required if your provider estimates them,
+          // but if you experience sporadic timeouts, you can add:
+          // gasLimit: 500000,
+        },
+      ),
     );
-  }
-  public getProvider() {
-    return this.provider;
-  }
-  public getRegistryAddress() {
-    return this.registryContract.target as string;
-  }
-  public getFactoryAddress() {
-    return this.factoryContract.target as string;
-  }
-  public getRegistryAbi() {
-    return (RemzikIdentityRegistryABI as any).abi || RemzikIdentityRegistryABI;
-  }
-  public getFactoryAbi() {
-    return (AssetFactoryABI as any).abi || AssetFactoryABI;
   }
 
   async deployAssetContract(
     name: string,
     symbol: string,
-    supply: bigint,
+    supply: string,
     metadataHash: string,
     treasuryAddress: string,
   ): Promise<string> {
-    const tx = await this.factoryContract.deployAsset(
-      name,
-      symbol,
-      supply,
-      metadataHash,
-      treasuryAddress,
+    const tx = await this.executeTx((nonce) =>
+      this.factoryContract.deployAsset(
+        name,
+        symbol,
+        BigInt(supply),
+        metadataHash,
+        treasuryAddress,
+        { nonce },
+      ),
     );
-    const receipt = await tx.wait(1);
-    if (receipt?.status === 0) throw new Error('Deployment reverted.');
-    const event = receipt?.logs.find(
-      (log: any) =>
-        this.factoryContract.interface.parseLog(log)?.name ===
-        'AssetTokenDeployed',
+
+    const receipt = await tx.wait();
+    if (!receipt || receipt.status === 0) throw new Error('Deployment failed.');
+
+    for (const log of receipt.logs) {
+      try {
+        const parsedLog = this.factoryContract.interface.parseLog(log as any);
+        if (parsedLog?.name === 'AssetTokenDeployed')
+          return parsedLog.args.tokenAddress;
+      } catch (e) {}
+    }
+    throw new Error('AssetTokenDeployed event not found.');
+  }
+
+  async createListingOnChain(
+    listingId: string,
+    tokenAddress: string,
+    amount: string,
+  ) {
+    return await this.executeTx((nonce) =>
+      this.marketplaceContract.createListing(
+        listingId,
+        tokenAddress,
+        BigInt(amount),
+        { nonce },
+      ),
     );
-    return this.factoryContract.interface.parseLog(event)!.args.tokenAddress;
   }
 
-  async registerIdentity(
-    investorWallet: string,
-    status: boolean,
-  ): Promise<string> {
-    return (
-      await (
-        await this.registryContract.registerIdentity(investorWallet, status)
-      ).wait(1)
-    ).hash;
+  async updatePriceBandOnChain(tokenAddress: string, min: string, max: string) {
+    const oracleContract = new ethers.Contract(
+      this.configService.get('PRICE_ORACLE_CONTRACT_ADDRESS')!,
+      [
+        'function setPriceBand(address token, uint256 lowerBound, uint256 upperBound) external',
+      ],
+      this.wallet,
+    );
+    return await this.executeTx((nonce) =>
+      oracleContract.setPriceBand(tokenAddress, BigInt(min), BigInt(max), {
+        nonce,
+      }),
+    );
   }
 
-  async toggleFreeze(
-    investorWallet: string,
-    shouldFreeze: boolean,
-  ): Promise<string> {
-    return (
-      await (
-        await this.registryContract.toggleFreeze(investorWallet, shouldFreeze)
-      ).wait(1)
-    ).hash;
+  async registerIdentity(investorWallet: string, status: boolean) {
+    return await this.executeTx((nonce) =>
+      this.registryContract.registerIdentity(investorWallet, status, { nonce }),
+    );
   }
 
-  async isVerified(investorWallet: string): Promise<boolean> {
-    return await this.registryContract.isClearToTrade(investorWallet);
+  async toggleFreeze(investorWallet: string, shouldFreeze: boolean) {
+    return await this.executeTx((nonce) =>
+      this.registryContract.toggleFreeze(investorWallet, shouldFreeze, {
+        nonce,
+      }),
+    );
   }
 
   async transferFromVault(
     tokenAddress: string,
     to: string,
-    amount: number,
-    decimals: number = 18,
-  ): Promise<string> {
+    amount: string,
+    decimals = 18,
+  ) {
     const tokenContract = new ethers.Contract(
       tokenAddress,
       ['function transfer(address, uint256) returns (bool)'],
       this.wallet,
     );
-    const tx = await tokenContract.transfer(
-      to,
-      ethers.parseUnits(amount.toString(), decimals),
+    return await this.executeTx((nonce) =>
+      tokenContract.transfer(to, ethers.parseUnits(amount, decimals), {
+        nonce,
+      }),
     );
-    return (await tx.wait(1)).hash;
+  }
+
+  async recordYieldOnChain(
+    batchId: string,
+    propertyAddress: string,
+    totalNetYield: string,
+  ) {
+    return await this.executeTx((nonce) =>
+      this.yieldNotaryContract.recordYield(
+        ethers.encodeBytes32String(batchId),
+        propertyAddress,
+        ethers.parseUnits(totalNetYield, 18),
+        { nonce },
+      ),
+    );
+  }
+
+  // --- HELPERS ---
+
+  getIndexerProvider = () => this.provider;
+  getProvider = () => this.provider;
+  public getRegistryAddress = () => this.registryContract.target as string;
+  public getFactoryAddress = () => this.factoryContract.target as string;
+  public getRegistryAbi = () =>
+    (RemzikIdentityRegistryABI as any).abi || RemzikIdentityRegistryABI;
+  public getFactoryAbi = () => (AssetFactoryABI as any).abi || AssetFactoryABI;
+
+  async isVerified(investorWallet: string): Promise<boolean> {
+    return await this.registryContract.isClearToTrade(investorWallet);
+  }
+
+  async isListingActive(listingId: string): Promise<boolean> {
+    return (await this.marketplaceContract.listings(listingId)).active === true;
   }
 
   async verifyApproval(
     tokenAddress: string,
     sellerWallet: string,
     spenderAddress: string,
-    requiredAmount: number,
-    decimals: number = 18,
+    requiredAmount: string,
+    decimals = 18,
   ): Promise<boolean> {
     const tokenContract = new ethers.Contract(
       tokenAddress,
@@ -185,77 +258,23 @@ export class BlockchainService implements OnModuleInit {
       sellerWallet,
       spenderAddress,
     );
-    return (
-      BigInt(allowance) >=
-      ethers.parseUnits(requiredAmount.toString(), decimals)
-    );
+    return BigInt(allowance) >= ethers.parseUnits(requiredAmount, decimals);
   }
 
-  // --- MARKETPLACE LOGIC ---
-  async settleTrade(
-    listingId: string,
-    sellerAddress: string,
-    buyerAddress: string,
-  ): Promise<string> {
-    const tx = await this.marketplaceContract.settleTrade(
-      listingId,
-      sellerAddress,
-      buyerAddress,
-    );
-    return (await tx.wait(1)).hash;
-  }
-
-  async createListingOnChain(
-    listingId: string,
+  async getAllowance(
     tokenAddress: string,
-    amount: bigint,
-  ) {
-    try {
-      const tx = await this.marketplaceContract.createListing(
-        listingId,
-        tokenAddress,
-        amount,
-      );
-      await tx.wait(1);
-    } catch (err: any) {
-      if (!(await this.isListingActive(listingId))) throw err;
-    }
-  }
-
-  async isListingActive(listingId: string): Promise<boolean> {
-    const listing = await this.marketplaceContract.listings(listingId);
-    return listing.active === true;
-  }
-
-  async executeAtomicSwap(
-    seller: string,
-    buyer: string,
-    tokenAddress: string,
-    amount: number,
-    price: number,
-  ): Promise<string> {
-    // Legacy support for your existing workflow
-    const tx = await this.marketplaceContract.executeTrade(
-      seller,
-      buyer,
+    owner: string,
+    spender: string,
+  ): Promise<bigint> {
+    const tokenContract = new ethers.Contract(
       tokenAddress,
-      ethers.parseUnits(amount.toString(), 18),
-      ethers.parseUnits(price.toString(), 18),
+      ['function allowance(address, address) view returns (uint256)'],
+      this.provider,
     );
-    return (await tx.wait(1)).hash;
+    return await tokenContract.allowance(owner, spender);
   }
 
-  async recordYieldOnChain(
-    batchId: string,
-    propertyAddress: string,
-    totalNetYield: number,
-  ): Promise<string> {
-    // Convert string batchId to bytes32 if needed, or send as string if ABI handles it
-    const tx = await this.yieldNotaryContract.recordYield(
-      ethers.encodeBytes32String(batchId),
-      propertyAddress,
-      ethers.parseUnits(totalNetYield.toString(), 18),
-    );
-    return (await tx.wait(1)).hash;
+  getMarketplaceAddress(): string {
+    return this.configService.get('MARKETPLACE_CONTRACT_ADDRESS')!;
   }
 }

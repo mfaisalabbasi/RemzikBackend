@@ -11,6 +11,7 @@ import { LedgerModule } from '../../ledger/ledger.module';
 import { TradeLockModule } from './trade-lock.module';
 import { User } from 'src/user/user.entity';
 import { EscrowModule } from 'src/escrow/escrow.module';
+import { OracleService } from './oracle.service';
 
 @Module({
   imports: [
@@ -26,8 +27,8 @@ import { EscrowModule } from 'src/escrow/escrow.module';
     TradeLockModule,
     EscrowModule,
   ],
-  providers: [TradeService],
+  providers: [TradeService, OracleService],
   controllers: [TradeController],
-  exports: [TradeService],
+  exports: [TradeService, OracleService],
 })
 export class TradeModule {}

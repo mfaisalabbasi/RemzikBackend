@@ -24,6 +24,7 @@ import { BroadcastService } from '../broadcast/broadcast.service';
 import { CreateBroadcastDto } from '../broadcast/dto/create-broadcast.dto';
 import { DistributionService } from 'src/distribution/distribution.service';
 import { AdminAction } from 'src/audit/enums/audit-action.enum';
+import { OracleService } from 'src/secondary-market/trade/oracle.service';
 
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('admin')
@@ -32,6 +33,7 @@ export class AdminController {
     private readonly adminService: AdminService,
     private readonly broadcastService: BroadcastService,
     private readonly distributionService: DistributionService,
+    private readonly oracleService: OracleService,
   ) {}
 
   @Get('notifications')
@@ -335,5 +337,26 @@ export class AdminController {
   @Roles(UserRole.ADMIN)
   async getTransactionDetail(@Param('txHash') txHash: string) {
     return await this.adminService.getTransactionDetail(txHash);
+  }
+
+  @Patch('assets/:id/update-price')
+  @Roles(UserRole.ADMIN)
+  async updateAssetPrice(
+    @Param('id') id: string,
+    @Body('newPrice') newPrice: number,
+    @Req() req,
+  ) {
+    // 1. Update your database via AdminService (or directly via repository)
+    // Assuming you have a method in adminService to handle this:
+    const updatedAsset = await this.adminService.updateAssetPrice(id, newPrice);
+
+    // 2. Sync the new price to the Blockchain Oracle
+    const txHash = await this.oracleService.syncAssetPriceToOracle(id);
+
+    return {
+      message: 'Asset price updated and synced to blockchain',
+      txHash,
+      updatedAsset,
+    };
   }
 }

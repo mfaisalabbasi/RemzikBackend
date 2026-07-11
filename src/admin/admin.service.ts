@@ -34,6 +34,8 @@ import { AuditLog } from 'src/audit/audit.entity';
 import { User } from 'src/user/user.entity';
 import { BlockchainService } from 'src/blockchain/blockchain.service';
 import { ChainEventLog } from 'src/blockchain/chain-event-log.entity';
+import { OracleService } from 'src/secondary-market/trade/oracle.service';
+import { Mutex } from 'async-mutex';
 
 @Injectable()
 export class AdminService {
@@ -64,7 +66,9 @@ export class AdminService {
     private readonly blockchainService: BlockchainService,
     @InjectRepository(ChainEventLog)
     private readonly chainEventRepo: Repository<ChainEventLog>,
+    private readonly oracleService: OracleService,
   ) {}
+  private readonly mutex = new Mutex();
 
   async getUrgentQueue(): Promise<UrgentTask[]> {
     const [pendingKyc, pendingPartners, pendingAssets] = await Promise.all([
@@ -730,5 +734,18 @@ export class AdminService {
       block: event.blockNumber,
       timestamp: event.createdAt,
     };
+  }
+
+  // Inside AdminService.ts
+  async updateAssetPrice(id: string, newPrice: number) {
+    return await this.mutex.runExclusive(async () => {
+      // 1. Update Database
+      await this.assetRepo.update(id, { unitPrice: newPrice });
+
+      // 2. Sync to Blockchain (this now waits for the previous sync to fully finish)
+      await this.oracleService.syncAssetPriceToOracle(id);
+
+      return await this.assetRepo.findOne({ where: { id } });
+    });
   }
 }

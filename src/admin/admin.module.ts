@@ -21,6 +21,7 @@ import { Asset } from 'src/asset/asset.entity';
 import { AuditLog } from 'src/audit/audit.entity';
 import { DistributionModule } from 'src/distribution/distribution.module';
 import { ChainEventLog } from 'src/blockchain/chain-event-log.entity';
+import { TradeModule } from 'src/secondary-market/trade/trade.module';
 
 @Module({
   controllers: [AdminController],
@@ -48,6 +49,7 @@ import { ChainEventLog } from 'src/blockchain/chain-event-log.entity';
     InvestmentModule,
     LedgerModule,
     DistributionModule,
+    TradeModule,
   ],
 })
 export class AdminModule {}

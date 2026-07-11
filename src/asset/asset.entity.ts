@@ -222,6 +222,9 @@ export class Asset {
   @Column({ type: 'text', nullable: true })
   metadataHash!: string;
 
+  @Column({ type: 'timestamp', nullable: true })
+  lastPriceSync!: Date;
+
   @CreateDateColumn()
   createdAt!: Date;
 

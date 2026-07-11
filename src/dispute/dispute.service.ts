@@ -1,10 +1,14 @@
 import {
   Injectable,
-  NotFoundException,
   BadRequestException,
+  NotFoundException,
+  InternalServerErrorException,
+  Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource, EntityManager } from 'typeorm';
+import { ethers } from 'ethers';
+import { Mutex } from 'async-mutex';
 import { Dispute } from './dispute.entity';
 import { CreateDisputeDto } from './dto/create-dispute.dto';
 import { DisputeStatus, DisputeType } from './dispute.enums';
@@ -12,16 +16,21 @@ import { ResolveDisputeDto } from './dto/resolve-dispute.dto';
 import { EscrowService } from '../escrow/escrow.service';
 import { AuditService } from 'src/audit/audit.service';
 import { AdminAction } from 'src/audit/enums/audit-action.enum';
-import { Escrow } from '../escrow/escrow.entity';
 import { OwnershipService } from '../ownership/ownership.service';
 import { Trade } from '../secondary-market/trade/trade.entity';
 import { BlockchainService } from '../blockchain/blockchain.service';
+import { TradeStatus } from 'src/secondary-market/trade/enums/trade-status.enum';
 
 @Injectable()
 export class DisputeService {
+  private readonly logger = new Logger(DisputeService.name);
+  private readonly disputeMutex = new Mutex();
+
   constructor(
     @InjectRepository(Dispute)
     private readonly disputeRepo: Repository<Dispute>,
+    @InjectRepository(Trade)
+    private readonly tradeRepo: Repository<Trade>,
     private readonly escrowService: EscrowService,
     private readonly auditService: AuditService,
     private readonly dataSource: DataSource,
@@ -81,24 +90,14 @@ export class DisputeService {
     });
   }
 
-  async getAllDisputes() {
-    return this.disputeRepo.find({ order: { createdAt: 'DESC' } });
-  }
-
-  async getUserDisputes(userId: string) {
-    return this.disputeRepo.find({
-      where: { userId },
-      order: { createdAt: 'DESC' },
-    });
-  }
-
   async resolveDispute(
     disputeId: string,
     adminId: string,
     dto: ResolveDisputeDto,
   ) {
-    return await this.dataSource.transaction(async (manager) => {
-      const dispute = await manager.findOne(Dispute, {
+    // Lock critical resolution path to prevent concurrent non-deterministic states
+    return await this.disputeMutex.runExclusive(async () => {
+      const dispute = await this.disputeRepo.findOne({
         where: { id: disputeId },
       });
       if (!dispute) throw new NotFoundException('Dispute record not found');
@@ -115,44 +114,87 @@ export class DisputeService {
         );
       }
 
-      if (
-        dispute.type === DisputeType.TRADE ||
-        dispute.type === DisputeType.SECONDARY_TRADE
-      ) {
-        await this.handleFinancialResolution(
-          dispute.referenceId,
-          dto.status,
+      return await this.dataSource.transaction(async (manager) => {
+        let txHash: string | null = null;
+
+        if (
+          dto.status === DisputeStatus.RESOLVED_FAVOR_SELLER &&
+          (dispute.type === DisputeType.TRADE ||
+            dispute.type === DisputeType.SECONDARY_TRADE)
+        ) {
+          const trade = await manager.getRepository(Trade).findOne({
+            where: { id: dispute.referenceId },
+            relations: [
+              'seller',
+              'seller.user',
+              'buyer',
+              'buyer.user',
+              'asset',
+            ],
+          });
+
+          const sellerAddr = trade?.seller.user?.walletAddress;
+          const buyerAddr = trade?.buyer.user?.walletAddress;
+
+          if (!sellerAddr || !buyerAddr) {
+            throw new BadRequestException(
+              'Trade participants lack valid wallet addresses.',
+            );
+          }
+
+          const priceString = ethers
+            .parseUnits(trade!.totalPrice.toString(), 18)
+            .toString();
+
+          const receipt = await this.blockchainService.settleTrade(
+            String(trade!.listingId),
+            sellerAddr,
+            buyerAddr,
+            priceString,
+          );
+          txHash = receipt.hash;
+        }
+
+        if (
+          dispute.type === DisputeType.TRADE ||
+          dispute.type === DisputeType.SECONDARY_TRADE
+        ) {
+          await this.handleFinancialResolution(
+            dispute.referenceId,
+            dto.status,
+            manager,
+            txHash || undefined,
+          );
+        }
+
+        dispute.status = dto.status;
+        dispute.adminNote = dto.adminNote;
+        dispute.adminId = adminId;
+        dispute.resolvedAt = new Date();
+        const updatedDispute = await manager.save(dispute);
+
+        if (
+          dto.status === DisputeStatus.RESOLVED_FAVOR_SELLER ||
+          dto.status === DisputeStatus.RESOLVED_FAVOR_BUYER
+        ) {
+          await manager.update(Trade, dispute.referenceId, {
+            status: TradeStatus.COMPLETED as any,
+            ...(txHash && { txHash }),
+          });
+        }
+
+        await this.auditService.log(
+          {
+            adminId,
+            targetId: disputeId,
+            action: AdminAction.DISPUTE_RESOLVED,
+            reason: `Resolution: ${dto.status}. Note: ${dto.adminNote}`,
+          },
           manager,
         );
-      }
 
-      dispute.status = dto.status;
-      dispute.adminNote = dto.adminNote;
-      dispute.adminId = adminId;
-      dispute.resolvedAt = new Date();
-
-      const updatedDispute = await manager.save(dispute);
-
-      if (
-        dto.status === DisputeStatus.RESOLVED_FAVOR_SELLER ||
-        dto.status === DisputeStatus.RESOLVED_FAVOR_BUYER
-      ) {
-        await manager.update(Trade, dispute.referenceId, {
-          status: 'COMPLETED' as any,
-        });
-      }
-
-      await this.auditService.log(
-        {
-          adminId,
-          targetId: disputeId,
-          action: AdminAction.DISPUTE_RESOLVED,
-          reason: `Resolution: ${dto.status}. Note: ${dto.adminNote}`,
-        },
-        manager,
-      );
-
-      return updatedDispute;
+        return updatedDispute;
+      });
     });
   }
 
@@ -160,6 +202,7 @@ export class DisputeService {
     referenceId: string,
     targetStatus: DisputeStatus,
     manager: EntityManager,
+    txHash?: string,
   ) {
     const trade = await manager.getRepository(Trade).findOne({
       where: { id: referenceId },
@@ -168,73 +211,65 @@ export class DisputeService {
 
     if (!trade) throw new BadRequestException('Trade not found');
 
-    const escrow = await manager
-      .getRepository(Escrow)
-      .findOne({ where: { tradeId: referenceId } });
-    if (!escrow) throw new BadRequestException('Escrow record not found');
+    switch (targetStatus) {
+      case DisputeStatus.RESOLVED_FAVOR_BUYER:
+        await this.escrowService.refundEscrowByTradeId(referenceId, manager);
+        break;
 
-    try {
-      switch (targetStatus) {
-        case DisputeStatus.RESOLVED_FAVOR_SELLER:
-          // 1. Release funds from escrow to seller's wallet
-          await this.escrowService.releaseEscrowByTradeId(referenceId, manager);
+      case DisputeStatus.FROZEN:
+        await this.escrowService.freezeEscrow(referenceId, manager);
+        break;
 
-          const sellerWallet = trade.seller.user?.walletAddress;
-          const buyerWallet = trade.buyer.user?.walletAddress;
+      case DisputeStatus.RESOLVED_FAVOR_SELLER:
+        if (!txHash)
+          throw new BadRequestException('Missing blockchain transaction hash.');
 
-          if (!sellerWallet || !buyerWallet) {
-            throw new BadRequestException(
-              'Trade participants lack valid wallets.',
-            );
-          }
-
-          // 2. Perform on-chain settlement (moves ownership from Seller -> Buyer)
-          const txHash = await this.blockchainService.settleTrade(
-            trade.listingId,
-            sellerWallet,
-            buyerWallet,
+        const receipt = await this.blockchainService
+          .getProvider()
+          .getTransactionReceipt(txHash);
+        if (!receipt || receipt.status !== 1) {
+          throw new InternalServerErrorException(
+            'Transaction not found or failed on-chain.',
           );
+        }
 
-          // 3. INTERNAL LEDGER UPDATES: Mirroring settleTrade() logic
-          // Move tokens from seller to buyer in the database
-          await this.ownershipService.removeUnits(
-            trade.seller.id,
-            trade.asset.id,
-            trade.units,
-            manager,
-          );
+        await this.escrowService.releaseEscrowByTradeId(referenceId, manager);
+        await this.ownershipService.removeUnits(
+          trade.seller.id,
+          trade.asset.id,
+          trade.units,
+          manager,
+        );
+        await this.ownershipService.addUnits(
+          trade.buyer.id,
+          trade.asset.id,
+          trade.units,
+          manager,
+        );
 
-          await this.ownershipService.addUnits(
-            trade.buyer,
-            trade.asset.id,
-            trade.units,
-            manager,
-          );
+        await manager.update(Trade, referenceId, {
+          txHash,
+          status: TradeStatus.COMPLETED,
+        });
+        break;
 
-          await manager.update(Trade, referenceId, { txHash });
-          break;
-
-        case DisputeStatus.RESOLVED_FAVOR_BUYER:
-          // 1. REFUND: Return money from Escrow to Buyer
-          await this.escrowService.refundEscrowByTradeId(referenceId, manager);
-
-          // 2. TOKEN STATUS:
-          // Tokens were never removed from Seller; they remain in Seller's ownership.
-          // No action needed for tokens.
-          break;
-
-        case DisputeStatus.FROZEN:
-          await this.escrowService.freezeEscrow(referenceId, manager);
-          break;
-
-        default:
-          break;
-      }
-    } catch (error: any) {
-      console.error('DEBUG: Financial Resolution Failed:', error);
-      throw new BadRequestException(
-        `Resolution execution failed: ${error.message}`,
-      );
+      default:
+        throw new BadRequestException('Invalid resolution status');
     }
+  }
+
+  async getUserDisputes(userId: string): Promise<Dispute[]> {
+    return await this.disputeRepo.find({
+      where: { userId },
+      order: { createdAt: 'DESC' },
+      relations: ['trade'],
+    });
+  }
+
+  async getAllDisputes(): Promise<Dispute[]> {
+    return await this.disputeRepo.find({
+      order: { createdAt: 'DESC' },
+      relations: ['trade'],
+    });
   }
 }

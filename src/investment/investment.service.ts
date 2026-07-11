@@ -256,16 +256,34 @@ export class InvestmentService {
       where: { id: investmentId },
       relations: ['asset', 'investor', 'investor.user'],
     });
-    if (!investment) throw new NotFoundException('Investment record not found');
+
+    if (!investment) {
+      throw new NotFoundException('Investment record not found');
+    }
+
     if (
       !investment.asset?.tokenAddress ||
       !investment.investor?.user?.walletAddress
-    )
+    ) {
       throw new InternalServerErrorException('Missing blockchain credentials');
-    return await this.blockchainService.transferFromVault(
+    }
+
+    // 1. Capture the receipt object returned by the blockchain service
+    const receipt: any = await this.blockchainService.transferFromVault(
       investment.asset.tokenAddress,
       investment.investor.user.walletAddress,
-      investment.units,
+      investment.units.toString(), // Ensuring units are sent as string
     );
+
+    // 2. Extract the hash to satisfy Promise<string> requirement
+    const txHash: string = receipt.hash || receipt.transactionHash;
+
+    if (!txHash) {
+      throw new InternalServerErrorException(
+        'Blockchain transfer failed to return a transaction hash.',
+      );
+    }
+
+    return txHash;
   }
 }

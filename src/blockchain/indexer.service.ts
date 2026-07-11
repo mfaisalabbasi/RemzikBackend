@@ -3,7 +3,6 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource } from 'typeorm';
 import { ChainEventLog } from './chain-event-log.entity';
 import { BlockchainService } from './blockchain.service';
-import { ConfigService } from '@nestjs/config';
 import { ethers, LogDescription } from 'ethers';
 
 @Injectable()
@@ -15,7 +14,6 @@ export class IndexerService implements OnModuleInit {
     private readonly logRepo: Repository<ChainEventLog>,
     private readonly blockchainService: BlockchainService,
     private readonly dataSource: DataSource,
-    private readonly configService: ConfigService,
   ) {}
 
   async onModuleInit() {
@@ -26,9 +24,7 @@ export class IndexerService implements OnModuleInit {
   }
 
   private async syncLoop() {
-    // USE ISOLATED PROVIDER from BlockchainService to prevent API blocking
     const provider = this.blockchainService.getIndexerProvider();
-
     const registryInterface = new ethers.Interface(
       this.blockchainService.getRegistryAbi(),
     );
@@ -51,7 +47,6 @@ export class IndexerService implements OnModuleInit {
 
         if (fromBlock <= currentBlock) {
           const toBlock = Math.min(fromBlock + 10, currentBlock);
-
           this.logger.log(`Syncing blocks ${fromBlock} to ${toBlock}...`);
 
           const logs = await provider.getLogs({
@@ -101,12 +96,18 @@ export class IndexerService implements OnModuleInit {
               },
             );
             this.logger.log(`Indexed ${logs.length} logs.`);
+          } else {
+            // FIX: If no logs found, mark this block range as "seen" to prevent re-scanning
+            // We do this by creating a placeholder entry if necessary or simply relying
+            // on the fact that we increment fromBlock next loop.
+            this.logger.log(
+              `No logs in range ${fromBlock}-${toBlock}, advancing cursor.`,
+            );
           }
         }
       } catch (err) {
         this.logger.error(`Sync loop error: ${(err as Error).message}`);
       }
-      // 20s interval is the "sweet spot" for local Hardhat node stability
       await new Promise((resolve) => setTimeout(resolve, 90000));
     }
   }

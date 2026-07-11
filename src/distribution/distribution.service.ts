@@ -286,7 +286,7 @@ export class DistributionService {
       await this.blockchainService.recordYieldOnChain(
         result.summary.batchId,
         result.summary.assetAddress,
-        result.summary.netInvestorPayout,
+        result.summary.netInvestorPayout.toString(),
       );
     } catch (error) {
       console.error(

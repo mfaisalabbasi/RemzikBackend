@@ -1,10 +1,7 @@
-import {
-  Injectable,
-  BadRequestException,
-  InternalServerErrorException,
-} from '@nestjs/common';
+import { Injectable, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, EntityManager } from 'typeorm';
+import { ethers } from 'ethers';
 import { Trade } from './trade.entity';
 import { TradeStatus } from './enums/trade-status.enum';
 import { TradeLockService } from './trade-lock.service';
@@ -20,9 +17,11 @@ import { EscrowService } from 'src/escrow/escrow.service';
 import { Escrow } from 'src/escrow/escrow.entity';
 import { SecondaryMarketListing } from '../listing/listing.entity';
 import { BlockchainService } from 'src/blockchain/blockchain.service';
+import { Mutex } from 'async-mutex';
 
 @Injectable()
 export class TradeService {
+  private readonly settlementMutex = new Mutex();
   constructor(
     @InjectRepository(Trade)
     private readonly tradeRepo: Repository<Trade>,
@@ -48,15 +47,12 @@ export class TradeService {
       );
     }
 
-    const calculatedTotal = Number(dto.units) * Number(dto.pricePerUnit);
-    const preciseTotalPrice = Math.round(calculatedTotal * 100) / 100;
-
     const trade = this.tradeRepo.create({
       seller,
       asset: { id: dto.assetId } as Asset,
       units: dto.units,
       pricePerUnit: dto.pricePerUnit,
-      totalPrice: preciseTotalPrice,
+      totalPrice: Number(dto.units) * Number(dto.pricePerUnit),
       status: TradeStatus.PENDING,
     });
 
@@ -70,7 +66,6 @@ export class TradeService {
     if (!this.tradeLockService.lock(listingId)) {
       throw new BadRequestException('Transaction in progress...');
     }
-
     try {
       return await this.tradeRepo.manager.transaction(
         async (manager: EntityManager) => {
@@ -86,9 +81,7 @@ export class TradeService {
           }
 
           const totalPrice =
-            Math.round(
-              Number(listing.unitsForSale) * Number(listing.pricePerUnit) * 100,
-            ) / 100;
+            Number(listing.unitsForSale) * Number(listing.pricePerUnit);
           const buyerBalance = await this.walletService.getAvailableBalance(
             buyer.user.id,
           );
@@ -100,21 +93,19 @@ export class TradeService {
           const sellerProfile = await this.ownershipService.getInvestorByUserId(
             listing.sellerId,
           );
-
           const trade = manager.create(Trade, {
             buyer,
             seller: sellerProfile,
-            listingId: listing.id, // Store reference for settlement
+            listingId: listing.id,
             asset: { id: listing.assetId } as any,
             units: Number(listing.unitsForSale),
             pricePerUnit: listing.pricePerUnit,
-            totalPrice: totalPrice,
+            totalPrice,
             status: TradeStatus.LOCKED,
             executedAt: new Date(),
           });
 
           const savedTrade = await manager.save(trade);
-
           await this.escrowService.createEscrow(
             {
               tradeId: savedTrade.id,
@@ -128,7 +119,6 @@ export class TradeService {
 
           listing.status = ListingStatus.PENDING;
           await manager.save(listing);
-
           return savedTrade;
         },
       );
@@ -138,40 +128,73 @@ export class TradeService {
   }
 
   async settleTrade(tradeId: string, currentUserId: string): Promise<Trade> {
-    return await this.tradeRepo.manager.transaction(
-      async (manager: EntityManager) => {
-        const trade = await manager.findOne(Trade, {
+    return await this.settlementMutex.runExclusive(async () => {
+      // 1. Fetch record for validation
+      const trade = await this.tradeRepo.findOne({
+        where: { id: tradeId },
+        relations: ['seller', 'seller.user', 'buyer', 'buyer.user', 'asset'],
+      });
+
+      if (!trade || trade.buyer.user.id !== currentUserId)
+        throw new BadRequestException('Unauthorized or trade not found');
+      if (trade.status !== TradeStatus.LOCKED)
+        throw new BadRequestException(
+          `Cannot settle trade in ${trade.status} status`,
+        );
+
+      // 2. PRE-FLIGHT ALLOWANCE CHECK
+      // This stops the process if the seller hasn't approved the marketplace,
+      // preventing the "ERC20InsufficientAllowance" revert on-chain.
+      const marketplaceAddress = this.blockchainService.getMarketplaceAddress();
+      const currentAllowance = await this.blockchainService.getAllowance(
+        trade.asset.tokenAddress, // Ensure this exists on your Asset entity
+        trade.seller.user.walletAddress!,
+        marketplaceAddress,
+      );
+
+      // We compare against the units being traded.
+      // If you are using Infinite Approval, this will pass.
+      if (currentAllowance < BigInt(trade.units)) {
+        throw new BadRequestException(
+          'Seller allowance insufficient. Trade aborted.',
+        );
+      }
+
+      // 3. Perform Blockchain Settlement
+      const priceInWei = ethers
+        .parseUnits(trade.totalPrice.toString(), 18)
+        .toString();
+
+      const receipt = await this.blockchainService.settleTrade(
+        trade.listingId,
+        trade.seller.user.walletAddress!,
+        trade.buyer.user.walletAddress!,
+        priceInWei,
+      );
+
+      // 4. Atomic Database Update
+      return await this.tradeRepo.manager.transaction(async (manager) => {
+        const txTrade = await manager.findOne(Trade, {
           where: { id: tradeId },
-          relations: ['seller', 'seller.user', 'buyer', 'buyer.user', 'asset'],
+          lock: { mode: 'pessimistic_write' },
         });
 
-        if (!trade) throw new BadRequestException('Trade not found');
-        if (trade.buyer.user.id !== currentUserId)
-          throw new BadRequestException('Unauthorized');
-        if (trade.status !== TradeStatus.LOCKED)
-          throw new BadRequestException(
-            `Cannot settle trade in ${trade.status} status`,
-          );
+        if (!txTrade || txTrade.status !== TradeStatus.LOCKED)
+          throw new Error('Trade already resolved or state mismatch.');
 
-        // 1. TRIGGER ON-CHAIN SETTLEMENT
-        // This is where the blockchain moves ownership from Seller -> Buyer
-        // 1. TRIGGER ON-CHAIN SETTLEMENT
-        if (
-          !trade.seller.user.walletAddress ||
-          !trade.buyer.user.walletAddress
-        ) {
-          throw new BadRequestException(
-            'Seller or Buyer wallet address is missing.',
+        // Escrow and Wallet logic
+        const escrow = await manager.findOne(Escrow, { where: { tradeId } });
+        if (escrow) {
+          await this.escrowService.releaseEscrow(escrow.id, manager);
+        } else {
+          await this.walletService.creditAvailable(
+            trade.seller.user.id,
+            trade.totalPrice,
+            manager,
           );
         }
 
-        await this.blockchainService.settleTrade(
-          trade.listingId,
-          trade.seller.user.walletAddress, // TypeScript now knows these are strings
-          trade.buyer.user.walletAddress, // because of the check above
-        );
-
-        // 2. INTERNAL LEDGER UPDATES
+        // Ownership and Status Updates
         await this.ownershipService.removeUnits(
           trade.seller.id,
           trade.asset.id,
@@ -185,41 +208,29 @@ export class TradeService {
           manager,
         );
 
-        // 3. RELEASE ESCROW
-        const escrow = await manager.findOne(Escrow, { where: { tradeId } });
-        if (escrow) {
-          await this.escrowService.releaseEscrow(escrow.id, manager);
-        } else {
-          await this.walletService.creditAvailable(
-            trade.seller.user.id,
-            trade.totalPrice,
-            manager,
-          );
-        }
+        txTrade.status = TradeStatus.COMPLETED;
+        txTrade.txHash = receipt.hash;
+        await manager.save(txTrade);
 
-        // 4. FINAL STATE
-        trade.status = TradeStatus.COMPLETED;
-        const updatedTrade = await manager.save(trade);
         await manager.update(
           SecondaryMarketListing,
           { id: trade.listingId },
           { status: ListingStatus.SOLD },
         );
 
-        // 5. AUDIT
         await this.auditService.log(
           {
             adminId: currentUserId,
             targetId: trade.id,
             action: AdminAction.TRADE_COMPLETED,
-            reason: `Settlement finalized on-chain and funds released.`,
+            reason: `Settlement finalized on-chain (TX: ${receipt.hash}).`,
           },
           manager,
         );
 
-        return updatedTrade;
-      },
-    );
+        return txTrade;
+      });
+    });
   }
 
   async getTrades() {

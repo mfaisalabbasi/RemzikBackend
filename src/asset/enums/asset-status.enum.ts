@@ -5,4 +5,5 @@ export enum AssetStatus {
   REJECTED = 'REJECTED',
   FREEZ = 'FREEZ',
   PAID = 'PAID',
+  SYNC_PENDING = 'SYNC_PENDING',
 }

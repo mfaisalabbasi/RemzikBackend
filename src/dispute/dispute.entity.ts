@@ -4,8 +4,11 @@ import {
   Column,
   CreateDateColumn,
   UpdateDateColumn,
+  ManyToOne,
+  JoinColumn,
 } from 'typeorm';
 import { DisputeStatus, DisputeType } from './dispute.enums';
+import { Trade } from 'src/secondary-market/trade/trade.entity';
 
 @Entity('disputes')
 export class Dispute {
@@ -30,6 +33,10 @@ export class Dispute {
   // reference id (investmentId / payoutId / tradeId)
   @Column()
   referenceId: string;
+
+  @ManyToOne(() => Trade)
+  @JoinColumn({ name: 'referenceId' }) // Tells TypeORM this ID links to Trade
+  trade: Trade;
 
   // dispute explanation
   @Column('text')
