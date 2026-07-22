@@ -3,8 +3,11 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource } from 'typeorm';
 import { ChainEventLog } from './chain-event-log.entity';
 import { BlockchainService } from './blockchain.service';
+import { GovernanceService } from '../governance/governance.service'; // Added
+import { Asset } from '../asset/asset.entity'; // Added
 import { ethers, LogDescription } from 'ethers';
-
+import * as PropertyGovernanceABI from './abi/PropertyGovernance.json'; // Ensure this ABI is available
+import { AssetStatus } from '../asset/enums/asset-status.enum';
 @Injectable()
 export class IndexerService implements OnModuleInit {
   private readonly logger = new Logger(IndexerService.name);
@@ -14,6 +17,7 @@ export class IndexerService implements OnModuleInit {
     private readonly logRepo: Repository<ChainEventLog>,
     private readonly blockchainService: BlockchainService,
     private readonly dataSource: DataSource,
+    private readonly governanceService: GovernanceService, // Added
   ) {}
 
   async onModuleInit() {
@@ -31,6 +35,7 @@ export class IndexerService implements OnModuleInit {
     const factoryInterface = new ethers.Interface(
       this.blockchainService.getFactoryAbi(),
     );
+    const govInterface = new ethers.Interface(PropertyGovernanceABI.abi); // Added
 
     while (true) {
       try {
@@ -49,12 +54,21 @@ export class IndexerService implements OnModuleInit {
           const toBlock = Math.min(fromBlock + 10, currentBlock);
           this.logger.log(`Syncing blocks ${fromBlock} to ${toBlock}...`);
 
+          // Fetch active governance addresses to monitor
+          const activeAssets = await this.dataSource.getRepository(Asset).find({
+            where: { status: AssetStatus.APPROVED },
+          }); // Assuming 1 is APPROVED
+          const govAddresses = activeAssets
+            .map((a) => a.governanceAddress)
+            .filter(Boolean);
+
           const logs = await provider.getLogs({
             fromBlock,
             toBlock,
             address: [
               this.blockchainService.getRegistryAddress(),
               this.blockchainService.getFactoryAddress(),
+              ...govAddresses,
             ],
           });
 
@@ -66,8 +80,27 @@ export class IndexerService implements OnModuleInit {
                   try {
                     parsed =
                       registryInterface.parseLog(log) ||
-                      factoryInterface.parseLog(log);
+                      factoryInterface.parseLog(log) ||
+                      govInterface.parseLog(log);
                   } catch {}
+
+                  // Handle Liquidation Event
+                  if (parsed?.name === 'LiquidationActivated') {
+                    const asset = await transactionalEntityManager
+                      .getRepository(Asset)
+                      .findOne({
+                        where: { governanceAddress: log.address },
+                      });
+                    if (asset) {
+                      await this.governanceService.triggerLiquidation(
+                        asset.id,
+                        log.address,
+                      );
+                      this.logger.log(
+                        `Auto-liquidation triggered for asset: ${asset.id}`,
+                      );
+                    }
+                  }
 
                   const entity = this.logRepo.create({
                     txHash: log.transactionHash,
@@ -96,13 +129,6 @@ export class IndexerService implements OnModuleInit {
               },
             );
             this.logger.log(`Indexed ${logs.length} logs.`);
-          } else {
-            // FIX: If no logs found, mark this block range as "seen" to prevent re-scanning
-            // We do this by creating a placeholder entry if necessary or simply relying
-            // on the fact that we increment fromBlock next loop.
-            this.logger.log(
-              `No logs in range ${fromBlock}-${toBlock}, advancing cursor.`,
-            );
           }
         }
       } catch (err) {

@@ -4,6 +4,8 @@ import { ethers } from 'ethers';
 import * as RemzikIdentityRegistryABI from './abi/RemzikIdentityRegistry.json';
 import * as AssetFactoryABI from './abi/AssetFactory.json';
 import * as YieldNotaryABI from './abi/YieldNotary.json';
+import * as RemzikAssetTokenABI from './abi/RemzikAssetToken.json';
+import * as PropertyGovernanceABI from './abi/PropertyGovernance.json';
 import { Mutex } from 'async-mutex';
 
 @Injectable()
@@ -116,20 +118,106 @@ export class BlockchainService implements OnModuleInit {
     );
   }
 
+  /**
+   * Ensures the AssetFactory has its sub-deployers linked. If not, links them automatically.
+   */
+  async ensureFactoryLinked() {
+    const tokenDeployer = await this.factoryContract.tokenDeployer();
+    const govDeployer = await this.factoryContract.govDeployer();
+
+    const envTokenDeployer = this.configService.get<string>(
+      'TOKEN_DEPLOYER_ADDRESS',
+    );
+    const envGovDeployer = this.configService.get<string>(
+      'GOV_DEPLOYER_ADDRESS',
+    );
+
+    if (!envTokenDeployer || !envGovDeployer) {
+      throw new Error(
+        'TOKEN_DEPLOYER_ADDRESS or GOV_DEPLOYER_ADDRESS is missing in .env',
+      );
+    }
+
+    // If on-chain factory points to zero or mismatch, link them properly
+    if (
+      tokenDeployer === ethers.ZeroAddress ||
+      govDeployer === ethers.ZeroAddress ||
+      tokenDeployer.toLowerCase() !== envTokenDeployer.toLowerCase() ||
+      govDeployer.toLowerCase() !== envGovDeployer.toLowerCase()
+    ) {
+      this.logger.warn(`⚠️ Linking deployers to AssetFactory on-chain...`);
+      const tx = await this.executeTx((nonce) =>
+        this.factoryContract.setDeployers(envTokenDeployer, envGovDeployer, {
+          nonce,
+        }),
+      );
+      await tx.wait();
+      this.logger.log(
+        `✅ AssetFactory successfully linked to deployers! Hash: ${tx.hash}`,
+      );
+    }
+  }
+
   async deployAssetContract(
     name: string,
     symbol: string,
     supply: string,
     metadataHash: string,
+    registryAddress: string,
     treasuryAddress: string,
-  ): Promise<string> {
-    const tx = await this.executeTx((nonce) =>
-      this.factoryContract.deployAsset(
+  ): Promise<{
+    tokenAddress: string;
+    treasuryAddress: string;
+    governanceAddress: string;
+  }> {
+    // 🛡️ Ensure factory deployers are linked and active before deployment
+    await this.ensureFactoryLinked();
+
+    // 🛡️ Ensure the platform treasury is whitelisted in the compliance registry
+    await this.ensureWalletWhitelisted(treasuryAddress);
+
+    const adminWallet = await this.wallet.getAddress();
+    const factoryAddress = await this.factoryContract.getAddress();
+
+    const tokenBytecode = (RemzikAssetTokenABI as any).bytecode;
+    const govBytecode = (PropertyGovernanceABI as any).bytecode;
+
+    // 🛠️ FIX: Encode 7 parameters including factoryAddress as the token admin
+    const tokenArgs = ethers.AbiCoder.defaultAbiCoder().encode(
+      [
+        'string',
+        'string',
+        'uint256',
+        'string',
+        'address',
+        'address',
+        'address',
+      ],
+      [
         name,
         symbol,
         BigInt(supply),
         metadataHash,
+        registryAddress,
         treasuryAddress,
+        factoryAddress,
+      ],
+    );
+
+    const govArgs = ethers.AbiCoder.defaultAbiCoder().encode(
+      ['address', 'address', 'address', 'address'],
+      [factoryAddress, treasuryAddress, ethers.ZeroAddress, adminWallet],
+    );
+
+    const tx = await this.executeTx((nonce) =>
+      this.factoryContract.deployAssetWithBytecode(
+        tokenBytecode,
+        tokenArgs,
+        govBytecode,
+        govArgs,
+        name,
+        treasuryAddress,
+        adminWallet,
         { nonce },
       ),
     );
@@ -140,13 +228,17 @@ export class BlockchainService implements OnModuleInit {
     for (const log of receipt.logs) {
       try {
         const parsedLog = this.factoryContract.interface.parseLog(log as any);
-        if (parsedLog?.name === 'AssetTokenDeployed')
-          return parsedLog.args.tokenAddress;
+        if (parsedLog?.name === 'AssetPodDeployed') {
+          return {
+            tokenAddress: parsedLog.args.tokenAddress,
+            treasuryAddress: parsedLog.args.treasuryAddress,
+            governanceAddress: parsedLog.args.governanceAddress,
+          };
+        }
       } catch (e) {}
     }
-    throw new Error('AssetTokenDeployed event not found.');
+    throw new Error('AssetPodDeployed event not found.');
   }
-
   async createListingOnChain(
     listingId: string,
     tokenAddress: string,
@@ -276,5 +368,107 @@ export class BlockchainService implements OnModuleInit {
 
   getMarketplaceAddress(): string {
     return this.configService.get('MARKETPLACE_CONTRACT_ADDRESS')!;
+  }
+
+  async triggerLiquidationOnChain(governanceAddress: string) {
+    // 1. Validation Guard: Check if the address is provided and is a valid format
+    if (!governanceAddress || !ethers.isAddress(governanceAddress)) {
+      throw new Error(
+        `Invalid Contract Target: Cannot trigger liquidation. 
+         Received: ${governanceAddress}. Ensure the asset has a deployed governanceAddress.`,
+      );
+    }
+
+    // PropertyGovernance executes liquidation natively via a "LIQUIDATE" proposal string
+    const governanceAbi = [
+      'function createProposal(string memory _description, uint256 _duration) external',
+    ];
+
+    // 2. Now it is safe to instantiate the contract
+    const govContract = new ethers.Contract(
+      governanceAddress,
+      governanceAbi,
+      this.wallet,
+    );
+
+    return await this.executeTx((nonce) =>
+      govContract.createProposal('LIQUIDATE', 0, { nonce }),
+    );
+  }
+
+  /**
+   * Creates a proposal on a specific Asset's governance contract.
+   */
+  async createProposalOnChain(
+    governanceAddress: string,
+    description: string,
+    duration: number,
+  ) {
+    const governanceAbi = [
+      'function createProposal(string memory _description, uint256 _duration) external',
+    ];
+    const govContract = new ethers.Contract(
+      governanceAddress,
+      governanceAbi,
+      this.wallet,
+    );
+
+    return await this.executeTx((nonce) =>
+      govContract.createProposal(description, duration, { nonce }),
+    );
+  }
+
+  /**
+   * Executes a proposal (e.g., to trigger liquidation or other actions) after voting.
+   */
+  async executeProposalOnChain(governanceAddress: string, proposalId: number) {
+    const governanceAbi = [
+      'function executeProposal(uint256 _proposalId) external',
+    ];
+    const govContract = new ethers.Contract(
+      governanceAddress,
+      governanceAbi,
+      this.wallet,
+    );
+
+    return await this.executeTx((nonce) =>
+      govContract.executeProposal(proposalId, { nonce }),
+    );
+  }
+
+  /**
+   * Optional: Read-only helper to check the status of a proposal from the blockchain.
+   */
+  async getProposalStatus(governanceAddress: string, proposalId: number) {
+    const governanceAbi = [
+      'function proposals(uint256) view returns (string description, uint256 voteYes, uint256 voteNo, uint256 deadline, bool executed, bool exists)',
+    ];
+    const govContract = new ethers.Contract(
+      governanceAddress,
+      governanceAbi,
+      this.provider,
+    );
+    return await govContract.proposals(proposalId);
+  }
+
+  /**
+   * Ensures a wallet (such as the Platform Treasury) is registered and clear to trade in the compliance registry.
+   */
+  async ensureWalletWhitelisted(walletAddress: string) {
+    if (!ethers.isAddress(walletAddress)) {
+      throw new Error(`Invalid wallet address format: ${walletAddress}`);
+    }
+
+    const isClear = await this.registryContract.isClearToTrade(walletAddress);
+    if (!isClear) {
+      this.logger.warn(
+        `⚠️ Wallet ${walletAddress} is not whitelisted in Identity Registry. Auto-registering...`,
+      );
+      const tx = await this.registerIdentity(walletAddress, true);
+      await tx.wait();
+      this.logger.log(
+        `✅ Wallet ${walletAddress} successfully whitelisted on-chain.`,
+      );
+    }
   }
 }

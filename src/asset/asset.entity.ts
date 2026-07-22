@@ -7,7 +7,6 @@ import {
   UpdateDateColumn,
   OneToOne,
   OneToMany,
-  JoinColumn,
 } from 'typeorm';
 
 import { PartnerProfile } from 'src/partner/partner.entity';
@@ -15,6 +14,7 @@ import { AssetType } from './enums/asset-type.enum';
 import { AssetStatus } from './enums/asset-status.enum';
 import { AssetToken } from 'src/tokenization/entities/asset-token.entity';
 import { AssetIncome } from './asset-income.entity';
+import { GovernanceProposal } from 'src/governance/governance.entity';
 
 @Entity('assets')
 export class Asset {
@@ -167,8 +167,6 @@ export class Asset {
 
   /**
    * ✅ FIX: Precision Update
-   * Changed from bigint to decimal(20,4) to allow fractional share math
-   * and avoid JavaScript integer overflow on multi-billion dollar supplies.
    */
   @Column('decimal', {
     precision: 20,
@@ -211,6 +209,12 @@ export class Asset {
   tokenAddress!: string;
 
   /**
+   * ✅ PHASE 9: Link to the deployed Governance Smart Contract address
+   */
+  @Column({ nullable: true })
+  governanceAddress!: string;
+
+  /**
    * ✅ NEW: Blockchain Ticker Symbol (e.g., "AYT")
    */
   @Column({ nullable: true })
@@ -236,4 +240,10 @@ export class Asset {
    */
   @OneToMany(() => AssetIncome, (income) => income.asset)
   incomes!: AssetIncome[];
+
+  /**
+   * ✅ PHASE 9: Relationship to Governance Proposals
+   */
+  @OneToMany(() => GovernanceProposal, (proposal) => proposal.asset)
+  governanceProposals!: GovernanceProposal[];
 }

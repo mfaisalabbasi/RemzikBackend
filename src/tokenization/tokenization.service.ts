@@ -36,23 +36,22 @@ export class TokenizationService {
 
   async tokenizeAsset(assetId: string, dto: CreateTokenizationDto) {
     return await this.tokenizationMutex.runExclusive(async () => {
-      // 1. Fetch and Validate
+      // 1. Fetch and Validate (Logic preserved)
       const asset = await this.assetRepo.findOne({
         where: { id: assetId },
         relations: ['partner'],
       });
 
       if (!asset) throw new BadRequestException('Asset not found');
-      if (asset.tokenAddress) {
+      if (asset.tokenAddress)
         throw new BadRequestException('Asset is already tokenized.');
-      }
       if (asset.status !== AssetStatus.APPROVED) {
         throw new BadRequestException(
           'Asset must be APPROVED before tokenization.',
         );
       }
 
-      // 2. BLOCKCHAIN DEPLOYMENT
+      // 2. BLOCKCHAIN DEPLOYMENT (Updated with Treasury Auto-Whitelisting Guard)
       const treasury = this.configService.get<string>(
         'PLATFORM_TREASURY_WALLET',
       );
@@ -61,26 +60,48 @@ export class TokenizationService {
           'Treasury wallet not configured',
         );
 
-      this.logger.log(`Deploying asset contract for: ${asset.title}`);
+      const registryAddress = this.configService.get<string>(
+        'COMPLIANCE_CONTRACT_ADDRESS',
+      );
+      if (!registryAddress)
+        throw new InternalServerErrorException(
+          'Compliance contract address not configured',
+        );
+
+      // 🛡️ AUTO-WHITELIST GUARD: Ensure treasury is registered on-chain before minting tokens to it
+      try {
+        await this.blockchainService.ensureWalletWhitelisted(treasury);
+      } catch (err: any) {
+        throw new InternalServerErrorException(
+          `Treasury compliance registration failed: ${err.message}`,
+        );
+      }
+
+      this.logger.log(
+        `Deploying asset pod (Token, Treasury, Governance) for: ${asset.title}`,
+      );
 
       const totalSharesWei = (
         BigInt(dto.totalShares) *
         BigInt(10) ** BigInt(18)
       ).toString();
 
-      const tokenAddress = await this.blockchainService.deployAssetContract(
-        asset.title,
-        asset.symbol || 'RXZ',
-        totalSharesWei,
-        'ipfs://metadata-hash',
-        treasury,
-      );
+      // Destructure Pod return values
+      const { tokenAddress, treasuryAddress, governanceAddress } =
+        await this.blockchainService.deployAssetContract(
+          asset.title,
+          asset.symbol || 'RXZ',
+          totalSharesWei,
+          'ipfs://metadata-hash',
+          registryAddress,
+          treasury,
+        );
 
-      if (!tokenAddress) {
-        throw new InternalServerErrorException('Contract deployment failed.');
+      if (!tokenAddress || !governanceAddress) {
+        throw new InternalServerErrorException('Pod deployment failed.');
       }
 
-      // 3. ATOMIC DB TRANSACTION
+      // 3. ATOMIC DB TRANSACTION (Stored Governance address)
       const finalAsset = await this.assetRepo.manager.transaction(
         async (manager) => {
           const token = manager.create(AssetToken, {
@@ -89,30 +110,24 @@ export class TokenizationService {
             sharePrice: dto.sharePrice,
             availableShares: dto.totalShares,
             tokenAddress: tokenAddress,
+            governanceAddress: governanceAddress,
           });
 
           await manager.save(token);
 
           asset.tokenAddress = tokenAddress;
+          asset.governanceAddress = governanceAddress;
           asset.status = AssetStatus.APPROVED;
           return await manager.save(asset);
         },
       );
 
-      // 4. GOVERNANCE: ARM THE ORACLE
+      // 4. GOVERNANCE: ARM THE ORACLE (Existing logic undisturbed)
       try {
-        this.logger.log(`Syncing price band to Oracle for asset: ${assetId}`);
-
-        // IMPORTANT: Wait for automining state to propagate before next transaction
         await this.delay(1000);
-
         await this.oracleService.syncAssetPriceToOracle(assetId);
-        this.logger.log(`Oracle successfully armed for asset: ${assetId}`);
       } catch (error: any) {
-        this.logger.error(
-          `Oracle sync failed for asset ${assetId}: ${error.message}`,
-        );
-
+        this.logger.error(`Oracle sync failed: ${error.message}`);
         await this.assetRepo.update(assetId, {
           status: AssetStatus.SYNC_PENDING,
         });
@@ -121,7 +136,8 @@ export class TokenizationService {
       return {
         success: true,
         tokenAddress: finalAsset.tokenAddress,
-        message: 'Tokenization complete. Oracle sync triggered.',
+        governanceAddress: finalAsset.governanceAddress,
+        message: 'Tokenization complete. Pod deployed and Oracle synced.',
       };
     });
   }

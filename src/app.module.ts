@@ -31,6 +31,7 @@ import { BroadcastModule } from './broadcast/broadcast.module';
 import { FinanceModule } from './finance/finance.module';
 import { DisputeModule } from './dispute/dispute.module';
 import { BlockchainModule } from './blockchain/blockchain.module';
+import { GovernanceModule } from './governance/governance.module';
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
@@ -76,6 +77,7 @@ import { BlockchainModule } from './blockchain/blockchain.module';
     FinanceModule,
     DisputeModule,
     BlockchainModule,
+    GovernanceModule, // ✅ Governance module added here
   ],
   controllers: [AppController],
   providers: [AppService],
