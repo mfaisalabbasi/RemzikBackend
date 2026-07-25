@@ -6,4 +6,5 @@ export enum AssetStatus {
   FREEZ = 'FREEZ',
   PAID = 'PAID',
   SYNC_PENDING = 'SYNC_PENDING',
+  LIQUIDATED = 'LIQUIDATED',
 }

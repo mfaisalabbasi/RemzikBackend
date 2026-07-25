@@ -1,15 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
-
 import { InjectRepository } from '@nestjs/typeorm';
-
 import { Repository } from 'typeorm';
-
 import { GovernanceProposal } from './governance.entity';
-
 import { Asset } from '../asset/asset.entity';
-
 import { BlockchainService } from '../blockchain/blockchain.service';
-
 import { ethers } from 'ethers';
 
 @Injectable()
@@ -27,15 +21,10 @@ export class GovernanceService {
   ) {}
 
   /**
-
-* 1. Submit proposal to the blockchain
-
-* 2. Parse the on-chain proposalId from logs
-
-* 3. Save proposal record with proposalId in the database
-
-*/
-
+   * 1. Submit proposal to the blockchain
+   * 2. Parse the on-chain proposalId from logs
+   * 3. Save proposal record with proposalId in the database
+   */
   async proposeAction(assetId: string, description: string, duration: number) {
     const asset = await this.assetRepo.findOneBy({ id: assetId });
 
@@ -45,12 +34,9 @@ export class GovernanceService {
 
     try {
       // 1. Submit to blockchain
-
       const tx = await this.blockchainService.createProposalOnChain(
         asset.governanceAddress,
-
         description,
-
         duration,
       );
 
@@ -61,7 +47,6 @@ export class GovernanceService {
       }
 
       // 2. Parse the ProposalCreated event from logs to extract proposalId
-
       let onChainProposalId: number | undefined = undefined;
 
       const govContractInterface = new ethers.Interface([
@@ -81,13 +66,10 @@ export class GovernanceService {
       }
 
       // Fallback: Read current proposal count directly from contract if event wasn't matched
-
       if (onChainProposalId === undefined) {
         const govContract = new ethers.Contract(
           asset.governanceAddress,
-
           ['function proposalCount() view returns (uint256)'],
-
           this.blockchainService.getProvider(),
         );
 
@@ -95,16 +77,11 @@ export class GovernanceService {
       }
 
       // 3. Save to database with the required proposalId
-
       return await this.proposalRepo.save({
         proposalId: onChainProposalId,
-
         asset: { id: assetId },
-
         description,
-
         status: 'PENDING',
-
         txHash: tx.hash,
       });
     } catch (error: any) {
@@ -117,11 +94,8 @@ export class GovernanceService {
   }
 
   /**
-
-* Finalizes an existing proposal on the blockchain.
-
-*/
-
+   * Finalizes an existing proposal on the blockchain.
+   */
   async executeProposal(assetId: string, proposalId: number) {
     const asset = await this.assetRepo.findOneBy({ id: assetId });
 
@@ -130,13 +104,11 @@ export class GovernanceService {
     try {
       await this.blockchainService.executeProposalOnChain(
         asset.governanceAddress,
-
         proposalId,
       );
 
       await this.proposalRepo.update(
         { asset: { id: assetId }, proposalId },
-
         { status: 'EXECUTED' },
       );
 
@@ -151,11 +123,8 @@ export class GovernanceService {
   }
 
   /**
-
-* Triggers the liquidation kill-switch on-chain.
-
-*/
-
+   * Triggers the liquidation kill-switch on-chain with robust pause-state guards.
+   */
   async triggerLiquidation(assetId: string, governanceAddress: string) {
     if (!assetId || !governanceAddress) {
       throw new Error('Missing assetId or governanceAddress.');
@@ -163,19 +132,45 @@ export class GovernanceService {
 
     try {
       // On-chain call
-
       await this.blockchainService.triggerLiquidationOnChain(governanceAddress);
 
-      // Update DB
-
+      // Update proposal/governance status
       await this.proposalRepo.update(
         { asset: { id: assetId } },
-
         { status: 'LIQUIDATED' },
       );
 
+      // Update main Asset status to prevent sync loops
+      await this.assetRepo.update({ id: assetId }, {
+        status: 'LIQUIDATED',
+      } as any);
+
       return { success: true };
     } catch (error: any) {
+      // 🛡️ PERMANENT FIX: Catch EnforcedPause() or VM custom error desyncs gracefully
+      if (
+        error.message?.includes('EnforcedPause') ||
+        error.message?.includes('0xd93c0665') ||
+        error.data === '0xd93c0665'
+      ) {
+        this.logger.warn(
+          `⚠️ Asset ${assetId} is already paused/liquidated on-chain. Syncing local database state...`,
+        );
+
+        await this.proposalRepo.update(
+          { asset: { id: assetId } },
+          { status: 'LIQUIDATED' },
+        );
+        await this.assetRepo.update({ id: assetId }, {
+          status: 'LIQUIDATED',
+        } as any);
+
+        return {
+          success: true,
+          message: 'Already liquidated on-chain; state synced.',
+        };
+      }
+
       this.logger.error(
         `Liquidation failed for asset ${assetId}: ${error.message}`,
       );

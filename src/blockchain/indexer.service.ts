@@ -1,13 +1,14 @@
 import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, DataSource } from 'typeorm';
+import { Repository, DataSource, Not } from 'typeorm';
 import { ChainEventLog } from './chain-event-log.entity';
 import { BlockchainService } from './blockchain.service';
-import { GovernanceService } from '../governance/governance.service'; // Added
-import { Asset } from '../asset/asset.entity'; // Added
+import { GovernanceService } from '../governance/governance.service';
+import { Asset } from '../asset/asset.entity';
 import { ethers, LogDescription } from 'ethers';
-import * as PropertyGovernanceABI from './abi/PropertyGovernance.json'; // Ensure this ABI is available
+import * as PropertyGovernanceABI from './abi/PropertyGovernance.json';
 import { AssetStatus } from '../asset/enums/asset-status.enum';
+
 @Injectable()
 export class IndexerService implements OnModuleInit {
   private readonly logger = new Logger(IndexerService.name);
@@ -17,7 +18,7 @@ export class IndexerService implements OnModuleInit {
     private readonly logRepo: Repository<ChainEventLog>,
     private readonly blockchainService: BlockchainService,
     private readonly dataSource: DataSource,
-    private readonly governanceService: GovernanceService, // Added
+    private readonly governanceService: GovernanceService,
   ) {}
 
   async onModuleInit() {
@@ -35,7 +36,7 @@ export class IndexerService implements OnModuleInit {
     const factoryInterface = new ethers.Interface(
       this.blockchainService.getFactoryAbi(),
     );
-    const govInterface = new ethers.Interface(PropertyGovernanceABI.abi); // Added
+    const govInterface = new ethers.Interface(PropertyGovernanceABI.abi);
 
     while (true) {
       try {
@@ -54,10 +55,11 @@ export class IndexerService implements OnModuleInit {
           const toBlock = Math.min(fromBlock + 10, currentBlock);
           this.logger.log(`Syncing blocks ${fromBlock} to ${toBlock}...`);
 
-          // Fetch active governance addresses to monitor
+          // 🛡️ FIX: Fetch active or operational assets to monitor (exclude LIQUIDATED to prevent spam loops)
           const activeAssets = await this.dataSource.getRepository(Asset).find({
-            where: { status: AssetStatus.APPROVED },
-          }); // Assuming 1 is APPROVED
+            where: { status: Not(AssetStatus.LIQUIDATED as any) },
+          });
+
           const govAddresses = activeAssets
             .map((a) => a.governanceAddress)
             .filter(Boolean);
@@ -91,14 +93,21 @@ export class IndexerService implements OnModuleInit {
                       .findOne({
                         where: { governanceAddress: log.address },
                       });
-                    if (asset) {
-                      await this.governanceService.triggerLiquidation(
-                        asset.id,
-                        log.address,
-                      );
-                      this.logger.log(
-                        `Auto-liquidation triggered for asset: ${asset.id}`,
-                      );
+
+                    if (asset && asset.status !== AssetStatus.LIQUIDATED) {
+                      try {
+                        await this.governanceService.triggerLiquidation(
+                          asset.id,
+                          log.address,
+                        );
+                        this.logger.log(
+                          `Auto-liquidation successfully synced for asset: ${asset.id}`,
+                        );
+                      } catch (liquidationErr: any) {
+                        this.logger.warn(
+                          `⚠️ Liquidation sync notice for asset ${asset.id}: ${liquidationErr.message}`,
+                        );
+                      }
                     }
                   }
 

@@ -1,23 +1,22 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { ethers } from 'ethers';
+import { ethers, Wallet, NonceManager } from 'ethers'; // 👈 Import NonceManager
 import * as RemzikIdentityRegistryABI from './abi/RemzikIdentityRegistry.json';
 import * as AssetFactoryABI from './abi/AssetFactory.json';
 import * as YieldNotaryABI from './abi/YieldNotary.json';
 import * as RemzikAssetTokenABI from './abi/RemzikAssetToken.json';
 import * as PropertyGovernanceABI from './abi/PropertyGovernance.json';
-import { Mutex } from 'async-mutex';
 
 @Injectable()
 export class BlockchainService implements OnModuleInit {
   private readonly logger = new Logger(BlockchainService.name);
   private provider: ethers.JsonRpcProvider;
-  private wallet: ethers.Wallet;
+  private adminWallet: Wallet;
+  private managedSigner: NonceManager; // 👈 Managed signer handling nonces natively
   private registryContract: ethers.Contract;
   private factoryContract: ethers.Contract;
   private marketplaceContract: ethers.Contract;
   private yieldNotaryContract: ethers.Contract;
-  private readonly transactionMutex = new Mutex();
 
   constructor(private configService: ConfigService) {
     const rpcUrl = this.configService.get<string>('BLOCKCHAIN_RPC_URL')!;
@@ -28,18 +27,22 @@ export class BlockchainService implements OnModuleInit {
       staticNetwork: true,
     });
 
-    this.wallet = new ethers.Wallet(privateKey, this.provider);
+    this.adminWallet = new ethers.Wallet(privateKey, this.provider);
 
+    // 🛡️ THE PERMANENT FIX: NonceManager intercepts and completely automates sequential nonces
+    this.managedSigner = new NonceManager(this.adminWallet);
+
+    // Bind all contracts to `this.managedSigner` instead of raw `this.adminWallet`
     this.registryContract = new ethers.Contract(
       this.configService.get('COMPLIANCE_CONTRACT_ADDRESS')!,
       (RemzikIdentityRegistryABI as any).abi || RemzikIdentityRegistryABI,
-      this.wallet,
+      this.managedSigner,
     );
 
     this.factoryContract = new ethers.Contract(
       this.configService.get('ASSET_FACTORY_CONTRACT_ADDRESS')!,
       (AssetFactoryABI as any).abi || AssetFactoryABI,
-      this.wallet,
+      this.managedSigner,
     );
 
     const marketplaceAbi = [
@@ -51,76 +54,41 @@ export class BlockchainService implements OnModuleInit {
     this.marketplaceContract = new ethers.Contract(
       this.configService.get('MARKETPLACE_CONTRACT_ADDRESS')!,
       marketplaceAbi,
-      this.wallet,
+      this.managedSigner,
     );
 
     this.yieldNotaryContract = new ethers.Contract(
       this.configService.get('YIELD_NOTARY_ADDRESS')!,
       (YieldNotaryABI as any).abi || YieldNotaryABI,
-      this.wallet,
+      this.managedSigner,
     );
   }
 
   async onModuleInit() {
-    this.logger.log('Blockchain Service initialized.');
+    this.logger.log(
+      'Blockchain Service initialized cleanly using native ethers NonceManager.',
+    );
   }
 
-  // --- MANUAL NONCE EXECUTION WRAPPER ---
-  private async executeTx(
-    contractMethod: (
-      nonce: number,
-    ) => Promise<ethers.ContractTransactionResponse>,
-  ) {
-    return await this.transactionMutex.runExclusive(async () => {
-      const address = await this.wallet.getAddress();
-      // UPDATED: Using 'pending' to account for transactions currently in the mempool
-      const nonce = await this.provider.getTransactionCount(address, 'pending');
+  // --- CONTRACT METHODS (Completely cleaned of manual nonce parameters/locks) ---
 
-      const tx = await contractMethod(nonce);
-      await tx.wait();
-      this.logger.log(`Transaction mined: ${tx.hash} (Nonce: ${nonce})`);
-      return tx;
-    });
-  }
-
-  // --- CONTRACT METHODS ---
-
-  /**
-   * @notice Settles a trade on-chain for a given listing.
-   * @param listingId The unique identifier of the listing.
-   * @param sellerAddress The wallet address of the seller.
-   * @param buyerAddress The wallet address of the buyer.
-   * @param priceWei The total execution price in Wei (18-decimal scale).
-   */
   async settleTrade(
     listingId: string,
     sellerAddress: string,
     buyerAddress: string,
     priceWei: string,
   ) {
-    // This call is wrapped in executeTx, which uses:
-    // 1. Mutex (transactionMutex) to serialize requests.
-    // 2. 'pending' nonce count to account for mempool transactions.
-    // 3. await tx.wait() to force the node to process the nonce increment.
-    return await this.executeTx((nonce) =>
-      this.marketplaceContract.settleTrade(
-        listingId,
-        sellerAddress,
-        buyerAddress,
-        BigInt(priceWei),
-        {
-          nonce,
-          // Explicit gas settings are not required if your provider estimates them,
-          // but if you experience sporadic timeouts, you can add:
-          // gasLimit: 500000,
-        },
-      ),
+    const tx = await this.marketplaceContract.settleTrade(
+      listingId,
+      sellerAddress,
+      buyerAddress,
+      BigInt(priceWei),
     );
+    await tx.wait();
+    this.logger.log(`Transaction mined: ${tx.hash}`);
+    return tx;
   }
 
-  /**
-   * Ensures the AssetFactory has its sub-deployers linked. If not, links them automatically.
-   */
   async ensureFactoryLinked() {
     const tokenDeployer = await this.factoryContract.tokenDeployer();
     const govDeployer = await this.factoryContract.govDeployer();
@@ -138,7 +106,6 @@ export class BlockchainService implements OnModuleInit {
       );
     }
 
-    // If on-chain factory points to zero or mismatch, link them properly
     if (
       tokenDeployer === ethers.ZeroAddress ||
       govDeployer === ethers.ZeroAddress ||
@@ -146,15 +113,15 @@ export class BlockchainService implements OnModuleInit {
       govDeployer.toLowerCase() !== envGovDeployer.toLowerCase()
     ) {
       this.logger.warn(`⚠️ Linking deployers to AssetFactory on-chain...`);
-      const tx = await this.executeTx((nonce) =>
-        this.factoryContract.setDeployers(envTokenDeployer, envGovDeployer, {
-          nonce,
-        }),
+      const tx = await this.factoryContract.setDeployers(
+        envTokenDeployer,
+        envGovDeployer,
       );
       await tx.wait();
       this.logger.log(
         `✅ AssetFactory successfully linked to deployers! Hash: ${tx.hash}`,
       );
+      return tx;
     }
   }
 
@@ -170,19 +137,15 @@ export class BlockchainService implements OnModuleInit {
     treasuryAddress: string;
     governanceAddress: string;
   }> {
-    // 🛡️ Ensure factory deployers are linked and active before deployment
     await this.ensureFactoryLinked();
-
-    // 🛡️ Ensure the platform treasury is whitelisted in the compliance registry
     await this.ensureWalletWhitelisted(treasuryAddress);
 
-    const adminWallet = await this.wallet.getAddress();
+    const adminWalletAddress = await this.adminWallet.getAddress();
     const factoryAddress = await this.factoryContract.getAddress();
 
     const tokenBytecode = (RemzikAssetTokenABI as any).bytecode;
     const govBytecode = (PropertyGovernanceABI as any).bytecode;
 
-    // 🛠️ FIX: Encode 7 parameters including factoryAddress as the token admin
     const tokenArgs = ethers.AbiCoder.defaultAbiCoder().encode(
       [
         'string',
@@ -206,52 +169,104 @@ export class BlockchainService implements OnModuleInit {
 
     const govArgs = ethers.AbiCoder.defaultAbiCoder().encode(
       ['address', 'address', 'address', 'address'],
-      [factoryAddress, treasuryAddress, ethers.ZeroAddress, adminWallet],
+      [factoryAddress, treasuryAddress, ethers.ZeroAddress, adminWalletAddress],
     );
 
-    const tx = await this.executeTx((nonce) =>
-      this.factoryContract.deployAssetWithBytecode(
-        tokenBytecode,
-        tokenArgs,
-        govBytecode,
-        govArgs,
-        name,
-        treasuryAddress,
-        adminWallet,
-        { nonce },
-      ),
+    // 1. Deploy via Factory (Nonce handled automatically)
+    const tx = await this.factoryContract.deployAssetWithBytecode(
+      tokenBytecode,
+      tokenArgs,
+      govBytecode,
+      govArgs,
+      name,
+      treasuryAddress,
+      adminWalletAddress,
     );
 
     const receipt = await tx.wait();
     if (!receipt || receipt.status === 0) throw new Error('Deployment failed.');
 
+    let deployedTokenAddress = '';
+    let deployedGovAddress = '';
+
     for (const log of receipt.logs) {
       try {
         const parsedLog = this.factoryContract.interface.parseLog(log as any);
         if (parsedLog?.name === 'AssetPodDeployed') {
-          return {
-            tokenAddress: parsedLog.args.tokenAddress,
-            treasuryAddress: parsedLog.args.treasuryAddress,
-            governanceAddress: parsedLog.args.governanceAddress,
-          };
+          deployedTokenAddress = parsedLog.args.tokenAddress;
+          deployedGovAddress = parsedLog.args.governanceAddress;
+          break;
         }
       } catch (e) {}
     }
-    throw new Error('AssetPodDeployed event not found.');
+
+    if (!deployedGovAddress || !deployedTokenAddress) {
+      throw new Error('AssetPodDeployed event not found.');
+    }
+
+    const govContract = new ethers.Contract(
+      deployedGovAddress,
+      ['function setToken(address _token) external'],
+      this.managedSigner,
+    );
+
+    // 2. Link Token back to Governance
+    const linkTx = await govContract.setToken(deployedTokenAddress);
+    await linkTx.wait();
+
+    // 3. GRANT GOVERNANCE ROLE
+    const tokenContract = new ethers.Contract(
+      deployedTokenAddress,
+      [
+        'function grantRole(bytes32 role, address account) external',
+        'function GOVERNANCE_ROLE() view returns (bytes32)',
+        'function DEFAULT_ADMIN_ROLE() view returns (bytes32)',
+        'function hasRole(bytes32 role, address account) view returns (bool)',
+      ],
+      this.managedSigner,
+    );
+
+    const govRole = await tokenContract.GOVERNANCE_ROLE();
+    const defaultAdminRole = await tokenContract.DEFAULT_ADMIN_ROLE();
+    const isAdmin = await tokenContract.hasRole(
+      defaultAdminRole,
+      adminWalletAddress,
+    );
+
+    if (isAdmin) {
+      const grantTx = await tokenContract.grantRole(
+        govRole,
+        deployedGovAddress,
+      );
+      await grantTx.wait();
+      this.logger.log(
+        `✅ Governance role granted to contract: ${deployedGovAddress}`,
+      );
+    } else {
+      this.logger.warn(
+        `⚠️ Admin wallet lacks DEFAULT_ADMIN_ROLE on token; skipping manual role grant.`,
+      );
+    }
+
+    return {
+      tokenAddress: deployedTokenAddress,
+      treasuryAddress,
+      governanceAddress: deployedGovAddress,
+    };
   }
+
   async createListingOnChain(
     listingId: string,
     tokenAddress: string,
     amount: string,
   ) {
-    return await this.executeTx((nonce) =>
-      this.marketplaceContract.createListing(
-        listingId,
-        tokenAddress,
-        BigInt(amount),
-        { nonce },
-      ),
+    const tx = await this.marketplaceContract.createListing(
+      listingId,
+      tokenAddress,
+      BigInt(amount),
     );
+    await tx.wait();
+    return tx;
   }
 
   async updatePriceBandOnChain(tokenAddress: string, min: string, max: string) {
@@ -260,27 +275,33 @@ export class BlockchainService implements OnModuleInit {
       [
         'function setPriceBand(address token, uint256 lowerBound, uint256 upperBound) external',
       ],
-      this.wallet,
+      this.managedSigner,
     );
-    return await this.executeTx((nonce) =>
-      oracleContract.setPriceBand(tokenAddress, BigInt(min), BigInt(max), {
-        nonce,
-      }),
+    const tx = await oracleContract.setPriceBand(
+      tokenAddress,
+      BigInt(min),
+      BigInt(max),
     );
+    await tx.wait();
+    return tx;
   }
 
   async registerIdentity(investorWallet: string, status: boolean) {
-    return await this.executeTx((nonce) =>
-      this.registryContract.registerIdentity(investorWallet, status, { nonce }),
+    const tx = await this.registryContract.registerIdentity(
+      investorWallet,
+      status,
     );
+    await tx.wait();
+    return tx;
   }
 
   async toggleFreeze(investorWallet: string, shouldFreeze: boolean) {
-    return await this.executeTx((nonce) =>
-      this.registryContract.toggleFreeze(investorWallet, shouldFreeze, {
-        nonce,
-      }),
+    const tx = await this.registryContract.toggleFreeze(
+      investorWallet,
+      shouldFreeze,
     );
+    await tx.wait();
+    return tx;
   }
 
   async transferFromVault(
@@ -291,14 +312,26 @@ export class BlockchainService implements OnModuleInit {
   ) {
     const tokenContract = new ethers.Contract(
       tokenAddress,
-      ['function transfer(address, uint256) returns (bool)'],
-      this.wallet,
+      [
+        'function transfer(address, uint256) returns (bool)',
+        'function paused() view returns (bool)',
+      ],
+      this.managedSigner,
     );
-    return await this.executeTx((nonce) =>
-      tokenContract.transfer(to, ethers.parseUnits(amount, decimals), {
-        nonce,
-      }),
+
+    const isPaused = await tokenContract.paused();
+    if (isPaused) {
+      throw new Error(
+        'Investment failed: Asset token is paused due to emergency liquidation.',
+      );
+    }
+
+    const tx = await tokenContract.transfer(
+      to,
+      ethers.parseUnits(amount, decimals),
     );
+    await tx.wait();
+    return tx;
   }
 
   async recordYieldOnChain(
@@ -306,17 +339,14 @@ export class BlockchainService implements OnModuleInit {
     propertyAddress: string,
     totalNetYield: string,
   ) {
-    return await this.executeTx((nonce) =>
-      this.yieldNotaryContract.recordYield(
-        ethers.encodeBytes32String(batchId),
-        propertyAddress,
-        ethers.parseUnits(totalNetYield, 18),
-        { nonce },
-      ),
+    const tx = await this.yieldNotaryContract.recordYield(
+      ethers.encodeBytes32String(batchId),
+      propertyAddress,
+      ethers.parseUnits(totalNetYield, 18),
     );
+    await tx.wait();
+    return tx;
   }
-
-  // --- HELPERS ---
 
   getIndexerProvider = () => this.provider;
   getProvider = () => this.provider;
@@ -371,34 +401,39 @@ export class BlockchainService implements OnModuleInit {
   }
 
   async triggerLiquidationOnChain(governanceAddress: string) {
-    // 1. Validation Guard: Check if the address is provided and is a valid format
     if (!governanceAddress || !ethers.isAddress(governanceAddress)) {
-      throw new Error(
-        `Invalid Contract Target: Cannot trigger liquidation. 
-         Received: ${governanceAddress}. Ensure the asset has a deployed governanceAddress.`,
-      );
+      throw new Error(`Invalid governance address: ${governanceAddress}`);
     }
 
-    // PropertyGovernance executes liquidation natively via a "LIQUIDATE" proposal string
-    const governanceAbi = [
-      'function createProposal(string memory _description, uint256 _duration) external',
-    ];
-
-    // 2. Now it is safe to instantiate the contract
+    const governanceAbi = ['function emergencyLiquidate() external'];
     const govContract = new ethers.Contract(
       governanceAddress,
       governanceAbi,
-      this.wallet,
+      this.managedSigner,
     );
 
-    return await this.executeTx((nonce) =>
-      govContract.createProposal('LIQUIDATE', 0, { nonce }),
-    );
+    try {
+      const tx = await govContract.emergencyLiquidate({ gasLimit: 150000 });
+      await tx.wait();
+      return tx;
+    } catch (error: any) {
+      const errorString = JSON.stringify(error);
+      if (
+        error.message?.includes('EnforcedPause') ||
+        error.message?.includes('0xd93c0665') ||
+        error.data === '0xd93c0665' ||
+        errorString.includes('0xd93c0665') ||
+        errorString.includes('EnforcedPause')
+      ) {
+        this.logger.warn(
+          `⚠️ Contract at ${governanceAddress} is already paused/liquidated on-chain.`,
+        );
+        return { hash: '0x_already_liquidated_bypass' };
+      }
+      throw error;
+    }
   }
 
-  /**
-   * Creates a proposal on a specific Asset's governance contract.
-   */
   async createProposalOnChain(
     governanceAddress: string,
     description: string,
@@ -410,17 +445,13 @@ export class BlockchainService implements OnModuleInit {
     const govContract = new ethers.Contract(
       governanceAddress,
       governanceAbi,
-      this.wallet,
+      this.managedSigner,
     );
-
-    return await this.executeTx((nonce) =>
-      govContract.createProposal(description, duration, { nonce }),
-    );
+    const tx = await govContract.createProposal(description, duration);
+    await tx.wait();
+    return tx;
   }
 
-  /**
-   * Executes a proposal (e.g., to trigger liquidation or other actions) after voting.
-   */
   async executeProposalOnChain(governanceAddress: string, proposalId: number) {
     const governanceAbi = [
       'function executeProposal(uint256 _proposalId) external',
@@ -428,17 +459,13 @@ export class BlockchainService implements OnModuleInit {
     const govContract = new ethers.Contract(
       governanceAddress,
       governanceAbi,
-      this.wallet,
+      this.managedSigner,
     );
-
-    return await this.executeTx((nonce) =>
-      govContract.executeProposal(proposalId, { nonce }),
-    );
+    const tx = await govContract.executeProposal(proposalId);
+    await tx.wait();
+    return tx;
   }
 
-  /**
-   * Optional: Read-only helper to check the status of a proposal from the blockchain.
-   */
   async getProposalStatus(governanceAddress: string, proposalId: number) {
     const governanceAbi = [
       'function proposals(uint256) view returns (string description, uint256 voteYes, uint256 voteNo, uint256 deadline, bool executed, bool exists)',
@@ -451,9 +478,6 @@ export class BlockchainService implements OnModuleInit {
     return await govContract.proposals(proposalId);
   }
 
-  /**
-   * Ensures a wallet (such as the Platform Treasury) is registered and clear to trade in the compliance registry.
-   */
   async ensureWalletWhitelisted(walletAddress: string) {
     if (!ethers.isAddress(walletAddress)) {
       throw new Error(`Invalid wallet address format: ${walletAddress}`);
@@ -462,7 +486,7 @@ export class BlockchainService implements OnModuleInit {
     const isClear = await this.registryContract.isClearToTrade(walletAddress);
     if (!isClear) {
       this.logger.warn(
-        `⚠️ Wallet ${walletAddress} is not whitelisted in Identity Registry. Auto-registering...`,
+        `⚠️ Wallet ${walletAddress} is not whitelisted. Auto-registering...`,
       );
       const tx = await this.registerIdentity(walletAddress, true);
       await tx.wait();
