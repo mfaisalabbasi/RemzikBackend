@@ -36,6 +36,7 @@ import { BlockchainService } from 'src/blockchain/blockchain.service';
 import { ChainEventLog } from 'src/blockchain/chain-event-log.entity';
 import { OracleService } from 'src/secondary-market/trade/oracle.service';
 import { Mutex } from 'async-mutex';
+import { RecoveryRequestEntity } from 'src/Recovery/recovery.entity';
 
 @Injectable()
 export class AdminService {
@@ -67,6 +68,8 @@ export class AdminService {
     @InjectRepository(ChainEventLog)
     private readonly chainEventRepo: Repository<ChainEventLog>,
     private readonly oracleService: OracleService,
+    @InjectRepository(RecoveryRequestEntity)
+    private readonly recoveryRequestRepo: Repository<RecoveryRequestEntity>,
   ) {}
   private readonly mutex = new Mutex();
 
@@ -388,10 +391,19 @@ export class AdminService {
   }
 
   async getInvestorDetail(id: string) {
-    const investorProfile = await this.investorRepo.findOne({
+    // 1. Try finding by InvestorProfile primary id first, then fallback to user id
+    let investorProfile = await this.investorRepo.findOne({
       where: { id },
       relations: ['user'],
     });
+
+    if (!investorProfile) {
+      investorProfile = await this.investorRepo.findOne({
+        where: { user: { id } },
+        relations: ['user'],
+      });
+    }
+
     if (!investorProfile || !investorProfile.user)
       throw new BadRequestException(
         'Investor profile or linked user not found',
@@ -399,11 +411,15 @@ export class AdminService {
 
     const mainUserId = investorProfile.user.id;
 
-    const [wallet, history, kyc] = await Promise.all([
+    const [wallet, history, kyc, recoveryRequests] = await Promise.all([
       this.walletRepo.findOne({ where: { userId: mainUserId } }),
       this.ledgerService.findByUser(mainUserId),
       this.kycRepo.findOne({
         where: { user: { id: mainUserId } },
+        order: { createdAt: 'DESC' },
+      }),
+      this.recoveryRequestRepo.find({
+        where: { userId: mainUserId },
         order: { createdAt: 'DESC' },
       }),
     ]);
@@ -457,9 +473,9 @@ export class AdminService {
         },
       ],
       ledger,
+      recoveryRequests: recoveryRequests || [],
     };
   }
-
   async getPartnersList(): Promise<PartnerProfile[]> {
     return this.partnerRepo.find({
       relations: ['user'],

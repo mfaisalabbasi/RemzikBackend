@@ -1,4 +1,4 @@
-import { IsNotEmpty, IsString, Matches } from 'class-validator';
+import { IsNotEmpty, IsOptional, IsString, Matches } from 'class-validator';
 
 export class SyncWalletDto {
   @IsNotEmpty()
@@ -8,4 +8,8 @@ export class SyncWalletDto {
     message: 'Invalid cryptographic wallet address format',
   })
   walletAddress!: string;
+
+  @IsOptional()
+  @IsString()
+  privyUserId?: string;
 }

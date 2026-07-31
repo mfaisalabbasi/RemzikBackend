@@ -4,10 +4,13 @@ import {
   Column,
   CreateDateColumn,
   UpdateDateColumn,
-  OneToOne, // Import this
+  OneToOne,
+  OneToMany, // Import this
 } from 'typeorm';
 import { UserRole } from './enums/user-role.enum';
 import { KycProfile } from '../kyc/kyc.entity'; // Adjust path as needed
+import { RecoveryRequestEntity } from 'src/Recovery/recovery.entity';
+import { InvestorProfile } from 'src/investor/investor.entity';
 
 @Entity('users')
 export class User {
@@ -37,11 +40,21 @@ export class User {
   @OneToOne(() => KycProfile, (kyc) => kyc.user)
   kyc!: KycProfile;
 
+  @OneToOne(() => InvestorProfile, (profile) => profile.user)
+  investorProfile!: InvestorProfile;
+
+  @OneToMany(() => RecoveryRequestEntity, (recovery) => recovery.user)
+  recoveryRequests!: RecoveryRequestEntity[];
+
   @Column({ default: false })
   isVerified!: boolean;
 
   @Column({ default: true })
   isActive!: boolean;
+
+  // src/user/user.entity.ts
+  @Column({ nullable: true, unique: true })
+  privyUserId!: string; // e.g. 'did:privy:cm...'
 
   @Column({ unique: true, nullable: true })
   walletAddress?: string;

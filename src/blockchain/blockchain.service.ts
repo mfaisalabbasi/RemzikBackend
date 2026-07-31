@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { ethers, Wallet, NonceManager } from 'ethers'; // 👈 Import NonceManager
+import { ethers, Wallet, NonceManager } from 'ethers';
+import { PrivyClient } from '@privy-io/node'; // 👈 Official Privy Node SDK
 import * as RemzikIdentityRegistryABI from './abi/RemzikIdentityRegistry.json';
 import * as AssetFactoryABI from './abi/AssetFactory.json';
 import * as YieldNotaryABI from './abi/YieldNotary.json';
@@ -12,11 +13,12 @@ export class BlockchainService implements OnModuleInit {
   private readonly logger = new Logger(BlockchainService.name);
   private provider: ethers.JsonRpcProvider;
   private adminWallet: Wallet;
-  private managedSigner: NonceManager; // 👈 Managed signer handling nonces natively
+  private managedSigner: NonceManager;
   private registryContract: ethers.Contract;
   private factoryContract: ethers.Contract;
   private marketplaceContract: ethers.Contract;
   private yieldNotaryContract: ethers.Contract;
+  private privy: PrivyClient; // 👈 Privy Client Instance
 
   constructor(private configService: ConfigService) {
     const rpcUrl = this.configService.get<string>('BLOCKCHAIN_RPC_URL')!;
@@ -28,11 +30,14 @@ export class BlockchainService implements OnModuleInit {
     });
 
     this.adminWallet = new ethers.Wallet(privateKey, this.provider);
-
-    // 🛡️ THE PERMANENT FIX: NonceManager intercepts and completely automates sequential nonces
     this.managedSigner = new NonceManager(this.adminWallet);
 
-    // Bind all contracts to `this.managedSigner` instead of raw `this.adminWallet`
+    // 🛡️ Initialize Privy using Node SDK credentials from environment variables
+    this.privy = new PrivyClient({
+      appId: this.configService.get<string>('PRIVY_APP_ID') || '',
+      appSecret: this.configService.get<string>('PRIVY_APP_SECRET') || '',
+    });
+
     this.registryContract = new ethers.Contract(
       this.configService.get('COMPLIANCE_CONTRACT_ADDRESS')!,
       (RemzikIdentityRegistryABI as any).abi || RemzikIdentityRegistryABI,
@@ -66,11 +71,92 @@ export class BlockchainService implements OnModuleInit {
 
   async onModuleInit() {
     this.logger.log(
-      'Blockchain Service initialized cleanly using native ethers NonceManager.',
+      'Blockchain Service initialized cleanly using native ethers NonceManager and Privy Node SDK.',
     );
   }
 
-  // --- CONTRACT METHODS (Completely cleaned of manual nonce parameters/locks) ---
+  // --- PHASE 10: RECOVERY HELPER METHODS VIA PRIVY ---
+
+  /**
+   * Provisions a brand-new user-owned embedded recovery wallet securely through Privy Server SDK.
+   * @param privyUserId The unique Privy user identifier (DID) linked to the investor's profile.
+   */
+  async generateEmbeddedWalletForUser(privyUserId: string): Promise<string> {
+    try {
+      this.logger.log(
+        `🔑 Provisioning secure Privy Embedded Recovery Wallet for Privy user ID: ${privyUserId}`,
+      );
+
+      const wallet = await this.privy.wallets().create({
+        chain_type: 'ethereum',
+        owner: {
+          user_id: privyUserId,
+        },
+      });
+
+      if (!wallet || !wallet.address) {
+        throw new Error(
+          'Privy failed to return a valid wallet address during recovery provisioning.',
+        );
+      }
+
+      this.logger.log(
+        `✅ Successfully generated Privy Recovery Wallet: ${wallet.address}`,
+      );
+      return wallet.address;
+    } catch (error: any) {
+      this.logger.error(
+        `⚠️ Privy wallet provisioning failed: ${error.message}`,
+      );
+      throw error;
+    }
+  }
+
+  /**
+   * Executes the on-chain atomic wallet recovery through the RecoveryManager contract.
+   */
+  async executeWalletRecovery(
+    tokenAddress: string,
+    oldWallet: string,
+    newWallet: string,
+    amount: string,
+  ): Promise<string> {
+    const recoveryManagerAddress = this.configService.get<string>(
+      'RECOVERY_MANAGER_CONTRACT_ADDRESS',
+    );
+    if (!recoveryManagerAddress) {
+      throw new Error(
+        'RECOVERY_MANAGER_CONTRACT_ADDRESS is missing in environment variables',
+      );
+    }
+
+    const recoveryManagerAbi = [
+      'function recoverWallet(address tokenAddress, address oldWallet, address newWallet, uint256 amount) external',
+    ];
+
+    const recoveryContract = new ethers.Contract(
+      recoveryManagerAddress,
+      recoveryManagerAbi,
+      this.managedSigner,
+    );
+
+    this.logger.log(
+      `🔄 Executing on-chain recovery from ${oldWallet} to ${newWallet} for token ${tokenAddress}...`,
+    );
+
+    const tx = await recoveryContract.recoverWallet(
+      tokenAddress,
+      oldWallet,
+      newWallet,
+      BigInt(amount),
+    );
+
+    const receipt = await tx.wait();
+    this.logger.log(
+      `✅ Wallet recovery successfully mined on-chain! TxHash: ${receipt.hash}`,
+    );
+    return receipt.hash;
+  }
 
   async settleTrade(
     listingId: string,
@@ -172,7 +258,6 @@ export class BlockchainService implements OnModuleInit {
       [factoryAddress, treasuryAddress, ethers.ZeroAddress, adminWalletAddress],
     );
 
-    // 1. Deploy via Factory (Nonce handled automatically)
     const tx = await this.factoryContract.deployAssetWithBytecode(
       tokenBytecode,
       tokenArgs,
@@ -210,43 +295,12 @@ export class BlockchainService implements OnModuleInit {
       this.managedSigner,
     );
 
-    // 2. Link Token back to Governance
     const linkTx = await govContract.setToken(deployedTokenAddress);
     await linkTx.wait();
 
-    // 3. GRANT GOVERNANCE ROLE
-    const tokenContract = new ethers.Contract(
-      deployedTokenAddress,
-      [
-        'function grantRole(bytes32 role, address account) external',
-        'function GOVERNANCE_ROLE() view returns (bytes32)',
-        'function DEFAULT_ADMIN_ROLE() view returns (bytes32)',
-        'function hasRole(bytes32 role, address account) view returns (bool)',
-      ],
-      this.managedSigner,
+    this.logger.log(
+      `✅ Asset Pod successfully deployed & linked via Factory. Token: ${deployedTokenAddress}, Governance: ${deployedGovAddress}`,
     );
-
-    const govRole = await tokenContract.GOVERNANCE_ROLE();
-    const defaultAdminRole = await tokenContract.DEFAULT_ADMIN_ROLE();
-    const isAdmin = await tokenContract.hasRole(
-      defaultAdminRole,
-      adminWalletAddress,
-    );
-
-    if (isAdmin) {
-      const grantTx = await tokenContract.grantRole(
-        govRole,
-        deployedGovAddress,
-      );
-      await grantTx.wait();
-      this.logger.log(
-        `✅ Governance role granted to contract: ${deployedGovAddress}`,
-      );
-    } else {
-      this.logger.warn(
-        `⚠️ Admin wallet lacks DEFAULT_ADMIN_ROLE on token; skipping manual role grant.`,
-      );
-    }
 
     return {
       tokenAddress: deployedTokenAddress,
@@ -494,5 +548,18 @@ export class BlockchainService implements OnModuleInit {
         `✅ Wallet ${walletAddress} successfully whitelisted on-chain.`,
       );
     }
+  }
+
+  async getAssetTokenBalance(
+    tokenAddress: string,
+    walletAddress: string,
+  ): Promise<string> {
+    const tokenContract = new ethers.Contract(
+      tokenAddress,
+      ['function balanceOf(address account) view returns (uint256)'],
+      this.provider,
+    );
+    const balance = await tokenContract.balanceOf(walletAddress);
+    return balance.toString();
   }
 }

@@ -60,9 +60,13 @@ export class UserController {
     @Body() dto: SyncWalletDto,
     @Req() req: Request & { user?: any },
   ) {
-    // Extract the verified user ID directly from your existing Web2 JWT Guard payload
     const userId = req.user?.userId;
 
-    return this.userService.syncWalletAddress(userId, dto.walletAddress);
+    // 🛡️ Pass both wallet address and Privy DID to the service layer
+    return this.userService.syncWalletAddress(
+      userId,
+      dto.walletAddress,
+      dto.privyUserId,
+    );
   }
 }

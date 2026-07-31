@@ -22,6 +22,7 @@ import { AuditLog } from 'src/audit/audit.entity';
 import { DistributionModule } from 'src/distribution/distribution.module';
 import { ChainEventLog } from 'src/blockchain/chain-event-log.entity';
 import { TradeModule } from 'src/secondary-market/trade/trade.module';
+import { RecoveryRequestEntity } from 'src/Recovery/recovery.entity';
 
 @Module({
   controllers: [AdminController],
@@ -38,6 +39,7 @@ import { TradeModule } from 'src/secondary-market/trade/trade.module';
       Asset,
       AuditLog,
       ChainEventLog, // ✅ Added ChainEventLog to the TypeOrmModule imports
+      RecoveryRequestEntity,
     ]),
     PartnerModule,
     AssetModule,

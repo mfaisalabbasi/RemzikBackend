@@ -32,6 +32,7 @@ import { FinanceModule } from './finance/finance.module';
 import { DisputeModule } from './dispute/dispute.module';
 import { BlockchainModule } from './blockchain/blockchain.module';
 import { GovernanceModule } from './governance/governance.module';
+import { RecoveryModule } from './Recovery/recovery.module';
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
@@ -77,7 +78,8 @@ import { GovernanceModule } from './governance/governance.module';
     FinanceModule,
     DisputeModule,
     BlockchainModule,
-    GovernanceModule, // ✅ Governance module added here
+    GovernanceModule,
+    RecoveryModule, // ✅ Governance module added here
   ],
   controllers: [AppController],
   providers: [AppService],

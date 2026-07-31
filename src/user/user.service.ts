@@ -200,14 +200,16 @@ export class UserService {
     });
   }
 
-  async syncWalletAddress(userId: string, walletAddress: string): Promise<any> {
-    // 1. Fetch the user profile from the database
+  async syncWalletAddress(
+    userId: string,
+    walletAddress: string,
+    privyUserId?: string,
+  ): Promise<any> {
     const user = await this.userRepo.findOne({ where: { id: userId } });
     if (!user) {
       throw new UnauthorizedException('User profile no longer exists');
     }
 
-    // 2. Check if this exact wallet address is already taken by another account
     const existingWalletOwner = await this.userRepo.findOne({
       where: { walletAddress },
     });
@@ -218,13 +220,19 @@ export class UserService {
       );
     }
 
-    // 3. Atomically update the wallet column
+    // 🛡️ Anchor both the cryptographic wallet address and Privy DID
     user.walletAddress = walletAddress;
+    if (privyUserId) {
+      user.privyUserId = privyUserId;
+    }
+
     await this.userRepo.save(user);
 
     return {
-      message: 'Cryptographic wallet anchored to profile successfully',
+      message:
+        'Cryptographic wallet and Privy identity anchored to profile successfully',
       walletAddress: user.walletAddress,
+      privyUserId: user.privyUserId,
     };
   }
 }
