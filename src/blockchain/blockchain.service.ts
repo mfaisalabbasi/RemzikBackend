@@ -54,6 +54,7 @@ export class BlockchainService implements OnModuleInit {
       'function createListing(string calldata listingId, address token, uint256 amount) external',
       'function settleTrade(string calldata listingId, address seller, address buyer, uint256 tradePrice) external',
       'function listings(string) view returns (address seller, address token, uint256 amount, bool active)',
+      'function getListing(string calldata listingId) view returns (address seller, address token, uint256 amount, bool active)', // 👈 Added explicit getter ABI
       'function cancelListing(string calldata listingId) external',
     ];
     this.marketplaceContract = new ethers.Contract(
@@ -415,7 +416,20 @@ export class BlockchainService implements OnModuleInit {
   }
 
   async isListingActive(listingId: string): Promise<boolean> {
-    return (await this.marketplaceContract.listings(listingId)).active === true;
+    try {
+      // Use the explicit getListing function to ensure proper Ethers v6 named & positional result decoding
+      const listing = await this.marketplaceContract.getListing(listingId);
+
+      const isActive = listing.active ?? listing[3];
+      const seller = listing.seller ?? listing[0];
+
+      return Boolean(isActive) && seller !== ethers.ZeroAddress;
+    } catch (error: any) {
+      this.logger.error(
+        `Failed to verify listing on-chain for ${listingId}: ${error.message}`,
+      );
+      return false;
+    }
   }
 
   async verifyApproval(
