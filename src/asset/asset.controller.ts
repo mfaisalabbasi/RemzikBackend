@@ -120,9 +120,6 @@ export class AssetController {
     return this.assetService.getApprovedAssets();
   }
 
-  /**
-   * ✅ UPDATED: Passing security context
-   */
   @Get(':id')
   getAsset(@Req() req, @Param('id') id: string) {
     const userId = req.user?.userId || req.user?.id;

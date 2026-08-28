@@ -36,7 +36,7 @@ export class TokenizationService {
 
   async tokenizeAsset(assetId: string, dto: CreateTokenizationDto) {
     return await this.tokenizationMutex.runExclusive(async () => {
-      // 1. Fetch and Validate (Logic preserved)
+      // 1. Fetch and Validate
       const asset = await this.assetRepo.findOne({
         where: { id: assetId },
         relations: ['partner'],
@@ -51,15 +51,6 @@ export class TokenizationService {
         );
       }
 
-      // 2. BLOCKCHAIN DEPLOYMENT (Updated with Treasury Auto-Whitelisting Guard)
-      const treasury = this.configService.get<string>(
-        'PLATFORM_TREASURY_WALLET',
-      );
-      if (!treasury)
-        throw new InternalServerErrorException(
-          'Treasury wallet not configured',
-        );
-
       const registryAddress = this.configService.get<string>(
         'COMPLIANCE_CONTRACT_ADDRESS',
       );
@@ -67,15 +58,6 @@ export class TokenizationService {
         throw new InternalServerErrorException(
           'Compliance contract address not configured',
         );
-
-      // 🛡️ AUTO-WHITELIST GUARD: Ensure treasury is registered on-chain before minting tokens to it
-      try {
-        await this.blockchainService.ensureWalletWhitelisted(treasury);
-      } catch (err: any) {
-        throw new InternalServerErrorException(
-          `Treasury compliance registration failed: ${err.message}`,
-        );
-      }
 
       this.logger.log(
         `Deploying asset pod (Token, Treasury, Governance) for: ${asset.title}`,
@@ -86,7 +68,7 @@ export class TokenizationService {
         BigInt(10) ** BigInt(18)
       ).toString();
 
-      // Destructure Pod return values
+      // 2. BLOCKCHAIN DEPLOYMENT (Dynamically provisions Token, Vault Proxy, and Governance)
       const { tokenAddress, treasuryAddress, governanceAddress } =
         await this.blockchainService.deployAssetContract(
           asset.title,
@@ -94,14 +76,34 @@ export class TokenizationService {
           totalSharesWei,
           'ipfs://metadata-hash',
           registryAddress,
-          treasury,
+          asset.id, // Pass asset.id as propertyId so the factory binds the vault proxy
         );
 
-      if (!tokenAddress || !governanceAddress) {
-        throw new InternalServerErrorException('Pod deployment failed.');
+      if (!tokenAddress || !governanceAddress || !treasuryAddress) {
+        throw new InternalServerErrorException(
+          'Pod deployment failed or incomplete addresses returned.',
+        );
       }
 
-      // 3. ATOMIC DB TRANSACTION (Stored Governance address)
+      // 🛡️ COMPLIANCE & FUNDING GUARD: Ensure the dynamic vault proxy is whitelisted and funded with fractional tokens
+      try {
+        // Whitelist the dynamic vault proxy on the compliance/identity registry if required
+        await this.blockchainService.ensureWalletWhitelisted(treasuryAddress);
+
+        // Mint or transfer the initial token supply directly into the dynamic Treasury Vault proxy address
+        // so it has tokens to distribute when users deposit.
+        await this.blockchainService.mintTokensToVault(
+          tokenAddress,
+          treasuryAddress,
+          totalSharesWei,
+        );
+      } catch (err: any) {
+        throw new InternalServerErrorException(
+          `Vault setup and funding failed: ${err.message}`,
+        );
+      }
+
+      // 3. ATOMIC DB TRANSACTION (Store Token, Governance, and dynamic Treasury Vault address)
       const finalAsset = await this.assetRepo.manager.transaction(
         async (manager) => {
           const token = manager.create(AssetToken, {
@@ -117,12 +119,13 @@ export class TokenizationService {
 
           asset.tokenAddress = tokenAddress;
           asset.governanceAddress = governanceAddress;
+          asset.treasuryAddress = treasuryAddress; // Saved unique proxy vault address per asset
           asset.status = AssetStatus.APPROVED;
           return await manager.save(asset);
         },
       );
 
-      // 4. GOVERNANCE: ARM THE ORACLE (Existing logic undisturbed)
+      // 4. GOVERNANCE: ARM THE ORACLE
       try {
         await this.delay(1000);
         await this.oracleService.syncAssetPriceToOracle(assetId);
@@ -136,8 +139,10 @@ export class TokenizationService {
       return {
         success: true,
         tokenAddress: finalAsset.tokenAddress,
+        treasuryAddress: finalAsset.treasuryAddress,
         governanceAddress: finalAsset.governanceAddress,
-        message: 'Tokenization complete. Pod deployed and Oracle synced.',
+        message:
+          'Tokenization complete. Pod deployed, vault funded, and Oracle synced.',
       };
     });
   }

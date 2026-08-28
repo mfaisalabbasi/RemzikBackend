@@ -214,6 +214,9 @@ export class Asset {
   @Column({ nullable: true })
   governanceAddress!: string;
 
+  @Column({ nullable: true })
+  treasuryAddress!: string;
+
   /**
    * ✅ NEW: Blockchain Ticker Symbol (e.g., "AYT")
    */

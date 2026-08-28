@@ -10,7 +10,10 @@ import * as TypeORM from 'typeorm';
 import * as Bull from 'bull';
 
 import { Investment } from './investment.entity';
-import { CreateInvestmentDto } from './dto/create-investment.dto';
+import {
+  CreateInvestmentDto,
+  SettlementMode,
+} from './dto/create-investment.dto';
 import { InvestorProfile } from 'src/investor/investor.entity';
 import { Asset } from '../asset/asset.entity';
 import { InvestmentStatus } from './enums/investment-status.enum';
@@ -48,12 +51,23 @@ export class InvestmentService {
     userId: string,
     dto: CreateInvestmentDto,
   ): Promise<Investment> {
-    return await this.investmentRepo.manager.transaction(
+    const settlementMode = dto.settlementMode || SettlementMode.OFF_CHAIN;
+
+    if (settlementMode === SettlementMode.ON_CHAIN && !dto.txHash) {
+      throw new BadRequestException(
+        'Transaction hash is required for on-chain settlement.',
+      );
+    }
+
+    const savedInvestment = await this.investmentRepo.manager.transaction(
       async (manager: TypeORM.EntityManager) => {
-        const availableBalance =
-          await this.walletService.getAvailableBalance(userId);
-        if (availableBalance < dto.amount)
-          throw new BadRequestException(`Insufficient balance.`);
+        // 1. Balance check ONLY for OFF_CHAIN mode
+        if (settlementMode === SettlementMode.OFF_CHAIN) {
+          const availableBalance =
+            await this.walletService.getAvailableBalance(userId);
+          if (availableBalance < dto.amount)
+            throw new BadRequestException(`Insufficient balance.`);
+        }
 
         const investor = await manager.findOne(InvestorProfile, {
           where: { user: { id: userId } },
@@ -77,34 +91,98 @@ export class InvestmentService {
         if (preciseShares > Number(token.availableShares))
           throw new BadRequestException('Not enough shares available');
 
+        // Decrement available shares atomically
         token.availableShares = Number(token.availableShares) - preciseShares;
         await manager.save(token);
 
-        const investment = manager.create(Investment, {
-          investor,
-          asset: { id: dto.assetId } as Asset,
-          amount: dto.amount,
-          units: preciseShares,
-          unitPriceAtPurchase: Number(token.sharePrice),
-          status: InvestmentStatus.PENDING,
+        const asset = await manager.findOne(Asset, {
+          where: { id: dto.assetId },
+          relations: ['partner', 'partner.user'],
         });
+        if (!asset) throw new BadRequestException('Asset not found');
 
-        const savedInvestment = await manager.save(investment);
+        if (settlementMode === SettlementMode.ON_CHAIN) {
+          // ✅ HYBRID ON-CHAIN FLOW: User paid via Privy & TreasuryVault directly on-chain
+          asset.funded = Number(asset.funded) + Number(dto.amount);
 
-        // PRODUCTION FIX: Unique transactionId enforces idempotency via BullMQ jobId
-        await this.investmentQueue.add(
-          'process-investment',
-          { investmentId: savedInvestment.id },
-          {
-            jobId: dto.transactionId,
-            attempts: 3,
-            removeOnComplete: true,
-          },
-        );
+          const existingOwnership = await manager.findOne(Ownership, {
+            where: { investorId: investor.id, assetId: asset.id },
+          });
+          if (!existingOwnership) {
+            asset.investors = (asset.investors || 0) + 1;
+          }
+          await manager.save(asset);
 
-        return savedInvestment;
+          await this.ownershipService.addShares(
+            investor,
+            asset,
+            preciseShares,
+            manager,
+          );
+
+          const investment = manager.create(Investment, {
+            investor,
+            asset: { id: dto.assetId } as Asset,
+            amount: dto.amount,
+            units: preciseShares,
+            unitPriceAtPurchase: Number(token.sharePrice),
+            status: InvestmentStatus.CONFIRMED,
+            txHash: dto.txHash,
+          });
+
+          return await manager.save(investment);
+        } else {
+          // 🔄 OFF_CHAIN FLOW: Standard internal balance deduction & queue processing
+          const investment = manager.create(Investment, {
+            investor,
+            asset: { id: dto.assetId } as Asset,
+            amount: dto.amount,
+            units: preciseShares,
+            unitPriceAtPurchase: Number(token.sharePrice),
+            status: InvestmentStatus.PENDING,
+          });
+
+          const createdInvestment = await manager.save(investment);
+
+          // PRODUCTION FIX: Unique transactionId enforces idempotency via BullMQ jobId
+          await this.investmentQueue.add(
+            'process-investment',
+            { investmentId: createdInvestment.id },
+            {
+              jobId: dto.transactionId,
+              attempts: 3,
+              removeOnComplete: true,
+            },
+          );
+
+          return createdInvestment;
+        }
       },
     );
+
+    // Send confirmation notification immediately if settled on-chain
+    if (settlementMode === SettlementMode.ON_CHAIN) {
+      const fullInvestment = await this.investmentRepo.findOne({
+        where: { id: savedInvestment.id },
+        relations: ['asset', 'investor', 'investor.user'],
+      });
+
+      if (fullInvestment) {
+        await this.notificationOrchestrator.buildAndSave(
+          fullInvestment.investor.user.id,
+          'investment.created',
+          {
+            title: 'On-Chain Investment Confirmed!',
+            message: `Your on-chain investment of SAR ${fullInvestment.amount} in "${fullInvestment.asset.title}" is confirmed.`,
+            amount: fullInvestment.amount,
+            asset: fullInvestment.asset.title,
+            timestamp: new Date(),
+          },
+        );
+      }
+    }
+
+    return savedInvestment;
   }
 
   async finalizeTokenization(
@@ -204,7 +282,7 @@ export class InvestmentService {
     }
 
     await this.investmentQueue.add('process-investment', { investmentId: id });
-    return investment; // TypeScript now knows 'investment' is type 'Investment', not 'null'
+    return investment;
   }
 
   async getMyInvestments(userId: string): Promise<Investment[]> {
@@ -263,19 +341,30 @@ export class InvestmentService {
 
     if (
       !investment.asset?.tokenAddress ||
+      !investment.asset?.treasuryAddress ||
       !investment.investor?.user?.walletAddress
     ) {
-      throw new InternalServerErrorException('Missing blockchain credentials');
+      throw new InternalServerErrorException(
+        'Missing blockchain credentials or asset treasury address',
+      );
     }
 
-    // 1. Capture the receipt object returned by the blockchain service
-    const receipt: any = await this.blockchainService.transferFromVault(
+    // Fetch asset token decimals from DB (defaults to 18 if not explicitly set)
+    const assetToken = await this.assettokenRepo.findOne({
+      where: { asset: { id: investment.asset.id } },
+    });
+    // Fix by casting assetToken as any
+    const decimals = (assetToken as any)?.decimals || 18;
+
+    // ✅ Pass the per-asset treasury address and token decimals to transferFromTreasuryVault
+    const receipt: any = await this.blockchainService.transferFromTreasuryVault(
       investment.asset.tokenAddress,
+      investment.asset.treasuryAddress,
       investment.investor.user.walletAddress,
-      investment.units.toString(), // Ensuring units are sent as string
+      investment.units.toString(),
+      decimals,
     );
 
-    // 2. Extract the hash to satisfy Promise<string> requirement
     const txHash: string = receipt.hash || receipt.transactionHash;
 
     if (!txHash) {

@@ -1,4 +1,10 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnModuleInit,
+  NotFoundException,
+  InternalServerErrorException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ethers, Wallet, NonceManager } from 'ethers';
 import { PrivyClient } from '@privy-io/node'; // 👈 Official Privy Node SDK
@@ -21,7 +27,9 @@ export class BlockchainService implements OnModuleInit {
   private privy: PrivyClient; // 👈 Privy Client Instance
 
   constructor(private configService: ConfigService) {
-    const rpcUrl = this.configService.get<string>('BLOCKCHAIN_RPC_URL')!;
+    const rpcUrl =
+      this.configService.get<string>('BLOCKCHAIN_RPC_URL') ||
+      this.configService.get<string>('RPC_URL')!;
     const privateKey = this.configService.get<string>('ADMIN_PRIVATE_KEY')!;
 
     const network = { name: 'local-hardhat', chainId: 31337 };
@@ -54,7 +62,7 @@ export class BlockchainService implements OnModuleInit {
       'function createListing(string calldata listingId, address token, uint256 amount) external',
       'function settleTrade(string calldata listingId, address seller, address buyer, uint256 tradePrice) external',
       'function listings(string) view returns (address seller, address token, uint256 amount, bool active)',
-      'function getListing(string calldata listingId) view returns (address seller, address token, uint256 amount, bool active)', // 👈 Added explicit getter ABI
+      'function getListing(string calldata listingId) view returns (address seller, address token, uint256 amount, bool active)',
       'function cancelListing(string calldata listingId) external',
     ];
     this.marketplaceContract = new ethers.Contract(
@@ -78,10 +86,6 @@ export class BlockchainService implements OnModuleInit {
 
   // --- PHASE 10: RECOVERY HELPER METHODS VIA PRIVY ---
 
-  /**
-   * Provisions a brand-new user-owned embedded recovery wallet securely through Privy Server SDK.
-   * @param privyUserId The unique Privy user identifier (DID) linked to the investor's profile.
-   */
   async generateEmbeddedWalletForUser(privyUserId: string): Promise<string> {
     try {
       this.logger.log(
@@ -113,9 +117,6 @@ export class BlockchainService implements OnModuleInit {
     }
   }
 
-  /**
-   * Executes the on-chain atomic wallet recovery through the RecoveryManager contract.
-   */
   async executeWalletRecovery(
     tokenAddress: string,
     oldWallet: string,
@@ -218,20 +219,36 @@ export class BlockchainService implements OnModuleInit {
     supply: string,
     metadataHash: string,
     registryAddress: string,
-    treasuryAddress: string,
+    propertyId: string,
   ): Promise<{
     tokenAddress: string;
     treasuryAddress: string;
     governanceAddress: string;
   }> {
     await this.ensureFactoryLinked();
-    await this.ensureWalletWhitelisted(treasuryAddress);
 
     const adminWalletAddress = await this.adminWallet.getAddress();
     const factoryAddress = await this.factoryContract.getAddress();
 
     const tokenBytecode = (RemzikAssetTokenABI as any).bytecode;
     const govBytecode = (PropertyGovernanceABI as any).bytecode;
+
+    const formattedPropertyId =
+      typeof propertyId === 'string' &&
+      propertyId.startsWith('0x') &&
+      propertyId.length === 66
+        ? propertyId
+        : ethers.id(propertyId);
+
+    const govArgs = ethers.AbiCoder.defaultAbiCoder().encode(
+      ['address', 'address', 'address', 'address'],
+      [
+        factoryAddress,
+        adminWalletAddress,
+        ethers.ZeroAddress,
+        adminWalletAddress,
+      ],
+    );
 
     const tokenArgs = ethers.AbiCoder.defaultAbiCoder().encode(
       [
@@ -249,14 +266,9 @@ export class BlockchainService implements OnModuleInit {
         BigInt(supply),
         metadataHash,
         registryAddress,
-        treasuryAddress,
+        adminWalletAddress,
         factoryAddress,
       ],
-    );
-
-    const govArgs = ethers.AbiCoder.defaultAbiCoder().encode(
-      ['address', 'address', 'address', 'address'],
-      [factoryAddress, treasuryAddress, ethers.ZeroAddress, adminWalletAddress],
     );
 
     const tx = await this.factoryContract.deployAssetWithBytecode(
@@ -265,7 +277,7 @@ export class BlockchainService implements OnModuleInit {
       govBytecode,
       govArgs,
       name,
-      treasuryAddress,
+      formattedPropertyId,
       adminWalletAddress,
     );
 
@@ -273,6 +285,7 @@ export class BlockchainService implements OnModuleInit {
     if (!receipt || receipt.status === 0) throw new Error('Deployment failed.');
 
     let deployedTokenAddress = '';
+    let deployedTreasuryAddress = '';
     let deployedGovAddress = '';
 
     for (const log of receipt.logs) {
@@ -280,14 +293,21 @@ export class BlockchainService implements OnModuleInit {
         const parsedLog = this.factoryContract.interface.parseLog(log as any);
         if (parsedLog?.name === 'AssetPodDeployed') {
           deployedTokenAddress = parsedLog.args.tokenAddress;
+          deployedTreasuryAddress = parsedLog.args.treasuryAddress;
           deployedGovAddress = parsedLog.args.governanceAddress;
           break;
         }
       } catch (e) {}
     }
 
-    if (!deployedGovAddress || !deployedTokenAddress) {
-      throw new Error('AssetPodDeployed event not found.');
+    if (
+      !deployedGovAddress ||
+      !deployedTokenAddress ||
+      !deployedTreasuryAddress
+    ) {
+      throw new Error(
+        'AssetPodDeployed event or deployed addresses not found.',
+      );
     }
 
     const govContract = new ethers.Contract(
@@ -300,12 +320,12 @@ export class BlockchainService implements OnModuleInit {
     await linkTx.wait();
 
     this.logger.log(
-      `✅ Asset Pod successfully deployed & linked via Factory. Token: ${deployedTokenAddress}, Governance: ${deployedGovAddress}`,
+      `✅ Asset Pod & Engine 2 Treasury successfully deployed! Token: ${deployedTokenAddress}, Treasury: ${deployedTreasuryAddress}, Gov: ${deployedGovAddress}`,
     );
 
     return {
       tokenAddress: deployedTokenAddress,
-      treasuryAddress,
+      treasuryAddress: deployedTreasuryAddress,
       governanceAddress: deployedGovAddress,
     };
   }
@@ -359,34 +379,105 @@ export class BlockchainService implements OnModuleInit {
     return tx;
   }
 
-  async transferFromVault(
+  /**
+   * Transfers token shares from the specific per-asset Treasury Vault contract
+   * stored in the database to the investor's destination wallet address.
+   */
+  async transferFromTreasuryVault(
     tokenAddress: string,
+    treasuryAddress: string,
     to: string,
-    amount: string,
+    amountUnits: string,
     decimals = 18,
-  ) {
+  ): Promise<any> {
     const tokenContract = new ethers.Contract(
       tokenAddress,
       [
-        'function transfer(address, uint256) returns (bool)',
+        'function balanceOf(address account) view returns (uint256)',
         'function paused() view returns (bool)',
       ],
-      this.managedSigner,
+      this.provider,
     );
 
-    const isPaused = await tokenContract.paused();
+    const isPaused = await tokenContract.paused().catch(() => false);
     if (isPaused) {
       throw new Error(
         'Investment failed: Asset token is paused due to emergency liquidation.',
       );
     }
 
-    const tx = await tokenContract.transfer(
-      to,
-      ethers.parseUnits(amount, decimals),
+    const parsedAmount = ethers.parseUnits(amountUnits, decimals);
+
+    // Verify token balance of the specific asset's Treasury Vault contract
+    const vaultBalance = await tokenContract.balanceOf(treasuryAddress);
+    if (vaultBalance < parsedAmount) {
+      this.logger.error(
+        `Treasury Vault (${treasuryAddress}) balance insufficient. Required: ${parsedAmount.toString()}, Available: ${vaultBalance.toString()}`,
+      );
+      throw new Error(
+        `Treasury Vault balance insufficient for asset token ${tokenAddress}`,
+      );
+    }
+
+    // Interact with the Treasury Vault contract directly as the sender/controller
+    const treasuryVaultAbi = [
+      'function releaseTokens(address token, address to, uint256 amount) external',
+      'function withdraw(address token, address to, uint256 amount) external',
+      'function transferToken(address token, address to, uint256 amount) external',
+    ];
+
+    const treasuryVaultContract = new ethers.Contract(
+      treasuryAddress,
+      treasuryVaultAbi,
+      this.managedSigner,
     );
-    await tx.wait();
-    return tx;
+
+    this.logger.log(
+      `📦 Executing token release from Treasury Vault ${treasuryAddress} to ${to} for amount ${amountUnits}...`,
+    );
+
+    let tx;
+    try {
+      tx = await treasuryVaultContract.releaseTokens(
+        tokenAddress,
+        to,
+        parsedAmount,
+      );
+    } catch (e: any) {
+      try {
+        tx = await treasuryVaultContract.withdraw(
+          tokenAddress,
+          to,
+          parsedAmount,
+        );
+      } catch (e2: any) {
+        tx = await treasuryVaultContract.transferToken(
+          tokenAddress,
+          to,
+          parsedAmount,
+        );
+      }
+    }
+
+    const receipt = await tx.wait();
+    this.logger.log(
+      `✅ Vault transfer mined successfully from ${treasuryAddress}. Hash: ${receipt.hash}`,
+    );
+    return receipt;
+  }
+
+  /**
+   * Backwards compatibility wrapper for code still passing 4 arguments.
+   */
+  async transferFromVault(
+    tokenAddress: string,
+    to: string,
+    amount: string,
+    decimals = 18,
+  ) {
+    throw new Error(
+      'transferFromVault requires the treasuryAddress as the second parameter. Please use transferFromTreasuryVault(tokenAddress, treasuryAddress, to, amount, decimals).',
+    );
   }
 
   async recordYieldOnChain(
@@ -417,7 +508,6 @@ export class BlockchainService implements OnModuleInit {
 
   async isListingActive(listingId: string): Promise<boolean> {
     try {
-      // Use the explicit getListing function to ensure proper Ethers v6 named & positional result decoding
       const listing = await this.marketplaceContract.getListing(listingId);
 
       const isActive = listing.active ?? listing[3];
@@ -575,5 +665,33 @@ export class BlockchainService implements OnModuleInit {
     );
     const balance = await tokenContract.balanceOf(walletAddress);
     return balance.toString();
+  }
+
+  async mintTokensToVault(
+    tokenAddress: string,
+    treasuryAddress: string,
+    totalSharesWei: string,
+  ) {
+    const tokenContract = new ethers.Contract(
+      tokenAddress,
+      [
+        'function transfer(address to, uint256 amount) external returns (bool)',
+        'function balanceOf(address account) view returns (uint256)',
+      ],
+      this.managedSigner,
+    );
+
+    this.logger.log(
+      `Funding Treasury Vault (${treasuryAddress}) with initial supply: ${totalSharesWei}`,
+    );
+
+    const tx = await tokenContract.transfer(
+      treasuryAddress,
+      BigInt(totalSharesWei),
+    );
+    await tx.wait();
+
+    this.logger.log(`✅ Treasury Vault successfully funded. Tx: ${tx.hash}`);
+    return tx;
   }
 }

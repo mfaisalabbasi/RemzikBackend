@@ -5,7 +5,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, EntityManager } from 'typeorm';
+import { Repository } from 'typeorm';
 import { Asset } from './asset.entity';
 import { CreateAssetDto } from './dto/create-asset.dto';
 import { PartnerProfile } from 'src/partner/partner.entity';
@@ -14,7 +14,7 @@ import { StorageService } from '../storage/storage.service';
 import { Investment } from 'src/investment/investment.entity';
 import { InvestmentStatus } from 'src/investment/enums/investment-status.enum';
 import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
-import { AssetToken } from 'src/tokenization/entities/asset-token.entity';
+import { BlockchainService } from 'src/blockchain/blockchain.service'; // 👈 Added Blockchain Service import
 
 @Injectable()
 export class AssetService {
@@ -29,6 +29,7 @@ export class AssetService {
     private readonly investmentRepo: Repository<Investment>,
     private readonly storageService: StorageService,
     private readonly notificationOrchestrator: NotificationOrchestrator,
+    private readonly blockchainService: BlockchainService, // 👈 Injected for on-chain deployment
   ) {}
 
   // --- PRIVATE UTILITIES ---
@@ -67,9 +68,6 @@ export class AssetService {
 
   // --- CORE MUTATIONS ---
 
-  /**
-   * ✅ FIXED: Flexible math allows any investment amount/entry.
-   */
   async createAsset(
     userId: string,
     dto: CreateAssetDto,
@@ -80,7 +78,6 @@ export class AssetService {
       relations: ['user'],
     });
 
-    // 🛡️ SECURITY FIREWALL
     if (!partner) throw new BadRequestException('Partner profile required');
     if (partner.user?.isActive === false || partner.status === 'FROZEN') {
       throw new BadRequestException(
@@ -88,7 +85,6 @@ export class AssetService {
       );
     }
 
-    // 🛡️ REVERTED TO STRICT TOKEN MATH
     const totalValue = Number(dto.totalValue);
     const tokenSupply = Number(dto.tokenSupply || 0);
 
@@ -96,11 +92,9 @@ export class AssetService {
       throw new BadRequestException('Token supply must be greater than 0');
     }
 
-    // Calculate unit price and round to 2 decimals for clean currency display
     const rawUnitPrice = totalValue / tokenSupply;
     const unitPrice = Math.round(rawUnitPrice * 100) / 100;
 
-    // Integrity check: ensures (Unit Price * Supply) equals Total Value
     const calculatedTotal = unitPrice * tokenSupply;
     const difference = Math.abs(totalValue - calculatedTotal);
 
@@ -135,7 +129,7 @@ export class AssetService {
       const asset = this.assetRepo.create({
         ...dto,
         totalValue,
-        unitPrice, // Using the rounded unit price
+        unitPrice,
         tokenSupply,
         partner,
         galleryImages,
@@ -607,9 +601,6 @@ export class AssetService {
 
   // --- DOCUMENTS & ADMINISTRATIVE ---
 
-  /**
-   * ✅ FIXED: Used destructuring to avoid the 'delete' TypeScript error.
-   */
   async getAssetById(
     assetId: string,
     requesterId?: string,
@@ -631,7 +622,6 @@ export class AssetService {
       .andWhere('inv.status != :pending', { pending: InvestmentStatus.PENDING })
       .getRawOne();
 
-    // 🛡️ SECURITY CHECK
     const isPartnerOwner = requesterId === asset.partner.user.id;
     const isInvestor = requesterId
       ? await this.investmentRepo.findOne({
@@ -674,7 +664,6 @@ export class AssetService {
       ],
     };
 
-    // ✅ REPLACED 'DELETE' WITH DESTRUCTURING FOR COMPLIANCE
     if (!hasAccess) {
       const {
         legalDocuments: _l,
@@ -748,7 +737,7 @@ export class AssetService {
   }
 
   /**
-   * ✅ UPDATED: Atomic Approval & Tokenization
+   * ✅ UPDATED: Atomic Admin Approval & On-Chain Deployment of Token, Governance, and TreasuryVault Proxy
    */
   async approve(assetId: string): Promise<Asset> {
     const asset = await this.assetRepo.findOne({
@@ -758,7 +747,44 @@ export class AssetService {
 
     if (!asset) throw new NotFoundException('Asset not found');
 
-    // Simple status update - go back to how you had your tokenization triggered
+    // 🔗 Execute on-chain deployment if addresses are not yet generated
+    if (
+      !asset.tokenAddress ||
+      !asset.governanceAddress ||
+      !asset.treasuryAddress
+    ) {
+      try {
+        this.logger.log(
+          `🚀 Deploying on-chain asset pod for asset: ${asset.id}`,
+        );
+
+        const deploymentResult =
+          await this.blockchainService.deployAssetContract(
+            asset.title,
+            asset.symbol || 'REMZ',
+            String(asset.tokenSupply ?? 0), // 👈 Fixed TypeScript null-safety error
+            asset.metadataHash || 'ipfs://default-metadata',
+            this.blockchainService.getRegistryAddress(),
+            asset.id, // 👈 Uses asset ID as unique property identifier for the dynamic TreasuryVault proxy
+          );
+
+        asset.tokenAddress = deploymentResult.tokenAddress;
+        asset.governanceAddress = deploymentResult.governanceAddress;
+        asset.treasuryAddress = deploymentResult.treasuryAddress; // 👈 Automatically saved to DB
+
+        this.logger.log(
+          `✅ On-chain deployment synced successfully for asset: ${asset.id}`,
+        );
+      } catch (err: any) {
+        this.logger.error(
+          `❌ On-chain deployment failed for asset ${asset.id}: ${err.message}`,
+        );
+        throw new BadRequestException(
+          `Blockchain deployment failed: ${err.message}`,
+        );
+      }
+    }
+
     asset.status = AssetStatus.APPROVED;
     const updatedAsset = await this.assetRepo.save(asset);
 
