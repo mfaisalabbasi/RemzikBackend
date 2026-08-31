@@ -13,6 +13,11 @@ import { Asset } from '../../asset/asset.entity';
 import { TradeStatus } from './enums/trade-status.enum';
 import { SecondaryMarketListing } from '../listing/listing.entity';
 
+export enum SettlementMode {
+  OFF_CHAIN = 'OFF_CHAIN',
+  ON_CHAIN = 'ON_CHAIN',
+}
+
 @Entity('trades')
 export class Trade {
   @PrimaryGeneratedColumn('uuid')
@@ -58,6 +63,13 @@ export class Trade {
 
   @Column({ nullable: true })
   txHash: string;
+
+  @Column({
+    type: 'enum',
+    enum: SettlementMode,
+    default: SettlementMode.OFF_CHAIN,
+  })
+  settlementMode: SettlementMode;
 
   @CreateDateColumn()
   createdAt: Date;

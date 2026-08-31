@@ -1,4 +1,8 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  BadRequestException,
+  NotFoundException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, EntityManager } from 'typeorm';
 import { ethers } from 'ethers';
@@ -18,6 +22,7 @@ import { Escrow } from 'src/escrow/escrow.entity';
 import { SecondaryMarketListing } from '../listing/listing.entity';
 import { BlockchainService } from 'src/blockchain/blockchain.service';
 import { Mutex } from 'async-mutex';
+import { ConfigService } from '@nestjs/config';
 
 @Injectable()
 export class TradeService {
@@ -31,6 +36,7 @@ export class TradeService {
     private readonly auditService: AuditService,
     private readonly escrowService: EscrowService,
     private readonly blockchainService: BlockchainService,
+    private readonly configService: ConfigService,
   ) {}
 
   async createTrade(
@@ -62,6 +68,7 @@ export class TradeService {
   async executeTrade(
     listingId: string,
     buyer: InvestorProfile,
+    settlementMode: 'OFF_CHAIN' | 'ON_CHAIN' = 'OFF_CHAIN', // Default to off-chain for backwards compatibility
   ): Promise<Trade> {
     if (!this.tradeLockService.lock(listingId)) {
       throw new BadRequestException('Transaction in progress...');
@@ -82,44 +89,127 @@ export class TradeService {
 
           const totalPrice =
             Number(listing.unitsForSale) * Number(listing.pricePerUnit);
-          const buyerBalance = await this.walletService.getAvailableBalance(
-            buyer.user.id,
-          );
-
-          if (Number(buyerBalance) < totalPrice) {
-            throw new BadRequestException('Insufficient balance.');
-          }
 
           const sellerProfile = await this.ownershipService.getInvestorByUserId(
             listing.sellerId,
           );
-          const trade = manager.create(Trade, {
-            buyer,
-            seller: sellerProfile,
-            listingId: listing.id,
-            asset: { id: listing.assetId } as any,
-            units: Number(listing.unitsForSale),
-            pricePerUnit: listing.pricePerUnit,
-            totalPrice,
-            status: TradeStatus.LOCKED,
-            executedAt: new Date(),
-          });
 
-          const savedTrade = await manager.save(trade);
-          await this.escrowService.createEscrow(
-            {
-              tradeId: savedTrade.id,
-              buyerId: buyer.user.id,
-              sellerId: listing.sellerId,
-              amount: totalPrice,
-              lockDays: 3,
-            },
-            manager,
-          );
+          if (settlementMode === 'ON_CHAIN') {
+            // --- ON-CHAIN ATOMIC PATH ---
+            // 1. Verify buyer has enough token allowance for MockUSDC and is whitelisted
+            const asset = await manager.findOne(Asset, {
+              where: { id: listing.assetId },
+            });
+            if (!asset) throw new NotFoundException('Asset not found');
 
-          listing.status = ListingStatus.PENDING;
-          await manager.save(listing);
-          return savedTrade;
+            const stablecoinAddress = this.configService.get<string>(
+              'NEXT_PUBLIC_STABLECOIN_ADDRESS',
+            )!;
+            const marketplaceAddress =
+              this.blockchainService.getMarketplaceAddress();
+
+            // Check buyer's MockUSDC allowance towards Marketplace
+            const buyerAllowance = await this.blockchainService.getAllowance(
+              stablecoinAddress,
+              buyer.user.walletAddress!,
+              marketplaceAddress,
+            );
+
+            if (buyerAllowance < BigInt(totalPrice)) {
+              throw new BadRequestException(
+                'Insufficient MockUSDC allowance. Please approve the marketplace first.',
+              );
+            }
+
+            // 2. Execute directly on-chain via Smart Contract (passing listingId, stablecoinAddress, and total price in wei)
+            const receipt = await this.blockchainService.executeOnChainTrade(
+              listingId,
+              stablecoinAddress,
+              ethers.parseUnits(totalPrice.toString(), 18).toString(),
+            );
+
+            // 3. Record completed Trade in DB immediately since settlement is atomic on-chain
+            const trade = manager.create(Trade, {
+              buyer,
+              seller: sellerProfile,
+              listingId: listing.id,
+              asset: { id: listing.assetId } as any,
+              units: Number(listing.unitsForSale),
+              pricePerUnit: listing.pricePerUnit,
+              totalPrice,
+              status: TradeStatus.COMPLETED,
+              txHash: receipt.hash,
+              executedAt: new Date(),
+            });
+
+            const savedTrade = await manager.save(trade);
+
+            // 4. Mirror state change in internal off-chain ledger/ownership tables for UI consistency
+            await this.ownershipService.removeUnits(
+              sellerProfile.id,
+              listing.assetId,
+              Number(listing.unitsForSale),
+              manager,
+            );
+            await this.ownershipService.addUnits(
+              buyer,
+              listing.assetId,
+              Number(listing.unitsForSale),
+              manager,
+            );
+
+            listing.status = ListingStatus.SOLD;
+            await manager.save(listing);
+
+            await this.auditService.log(
+              {
+                adminId: buyer.user.id,
+                targetId: savedTrade.id,
+                action: AdminAction.TRADE_COMPLETED,
+                reason: `On-chain atomic trade settled successfully (TX: ${receipt.hash})`,
+              },
+              manager,
+            );
+
+            return savedTrade;
+          } else {
+            // --- EXISTING OFF-CHAIN ESCROW PATH (Untouched) ---
+            const buyerBalance = await this.walletService.getAvailableBalance(
+              buyer.user.id,
+            );
+
+            if (Number(buyerBalance) < totalPrice) {
+              throw new BadRequestException('Insufficient balance.');
+            }
+
+            const trade = manager.create(Trade, {
+              buyer,
+              seller: sellerProfile,
+              listingId: listing.id,
+              asset: { id: listing.assetId } as any,
+              units: Number(listing.unitsForSale),
+              pricePerUnit: listing.pricePerUnit,
+              totalPrice,
+              status: TradeStatus.LOCKED,
+              executedAt: new Date(),
+            });
+
+            const savedTrade = await manager.save(trade);
+            await this.escrowService.createEscrow(
+              {
+                tradeId: savedTrade.id,
+                buyerId: buyer.user.id,
+                sellerId: listing.sellerId,
+                amount: totalPrice,
+                lockDays: 3,
+              },
+              manager,
+            );
+
+            listing.status = ListingStatus.PENDING;
+            await manager.save(listing);
+            return savedTrade;
+          }
         },
       );
     } finally {
@@ -143,17 +233,13 @@ export class TradeService {
         );
 
       // 2. PRE-FLIGHT ALLOWANCE CHECK
-      // This stops the process if the seller hasn't approved the marketplace,
-      // preventing the "ERC20InsufficientAllowance" revert on-chain.
       const marketplaceAddress = this.blockchainService.getMarketplaceAddress();
       const currentAllowance = await this.blockchainService.getAllowance(
-        trade.asset.tokenAddress, // Ensure this exists on your Asset entity
+        trade.asset.tokenAddress,
         trade.seller.user.walletAddress!,
         marketplaceAddress,
       );
 
-      // We compare against the units being traded.
-      // If you are using Infinite Approval, this will pass.
       if (currentAllowance < BigInt(trade.units)) {
         throw new BadRequestException(
           'Seller allowance insufficient. Trade aborted.',
@@ -267,5 +353,83 @@ export class TradeService {
     if (trade.status !== TradeStatus.LOCKED)
       throw new BadRequestException('Only LOCKED trades can be disputed.');
     return trade;
+  }
+
+  async syncOnChainTrade(
+    listingId: string,
+    buyer: InvestorProfile,
+    txHash: string,
+  ): Promise<Trade> {
+    return await this.tradeRepo.manager.transaction(
+      async (manager: EntityManager) => {
+        // 1. Fetch and lock the listing
+        const listing = await manager
+          .getRepository(SecondaryMarketListing)
+          .createQueryBuilder('listing')
+          .setLock('pessimistic_write')
+          .where('listing.id = :listingId', { listingId })
+          .getOne();
+
+        if (!listing || listing.status !== ListingStatus.ACTIVE) {
+          throw new BadRequestException(
+            'Listing is no longer active or already processed',
+          );
+        }
+
+        const totalPrice =
+          Number(listing.unitsForSale) * Number(listing.pricePerUnit);
+        const sellerProfile = await this.ownershipService.getInvestorByUserId(
+          listing.sellerId,
+        );
+
+        // 2. Create the completed Trade record with the frontend's txHash
+        const trade = manager.create(Trade, {
+          buyer,
+          seller: sellerProfile,
+          listingId: listing.id,
+          asset: { id: listing.assetId } as any,
+          units: Number(listing.unitsForSale),
+          pricePerUnit: listing.pricePerUnit,
+          totalPrice,
+          status: TradeStatus.COMPLETED,
+          txHash: txHash,
+          executedAt: new Date(),
+        });
+
+        const savedTrade = await manager.save(trade);
+
+        // 3. Mirror the blockchain state change in your internal database tables
+        await this.ownershipService.removeUnits(
+          sellerProfile.id,
+          listing.assetId,
+          Number(listing.unitsForSale),
+          manager,
+        );
+
+        await this.ownershipService.addUnits(
+          buyer,
+          listing.assetId,
+          Number(listing.unitsForSale),
+          manager,
+        );
+
+        // 4. Mark listing as SOLD
+        listing.status = ListingStatus.SOLD;
+        await manager.save(listing);
+
+        // 5. Audit log
+        await this.auditService.log(
+          {
+            adminId: buyer.user.id,
+            targetId: savedTrade.id,
+            action: AdminAction.TRADE_COMPLETED,
+            reason: `On-chain atomic trade synced successfully via frontend (TX: ${txHash})`,
+          },
+          manager,
+        );
+
+        return savedTrade;
+      },
+    );
   }
 }

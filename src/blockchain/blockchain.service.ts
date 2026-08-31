@@ -61,6 +61,7 @@ export class BlockchainService implements OnModuleInit {
     const marketplaceAbi = [
       'function createListing(string calldata listingId, address token, uint256 amount) external',
       'function settleTrade(string calldata listingId, address seller, address buyer, uint256 tradePrice) external',
+      'function executeOnChainTrade(string calldata listingId, uint256 unitsToBuy) external', // 👈 Added
       'function listings(string) view returns (address seller, address token, uint256 amount, bool active)',
       'function getListing(string calldata listingId) view returns (address seller, address token, uint256 amount, bool active)',
       'function cancelListing(string calldata listingId) external',
@@ -693,5 +694,22 @@ export class BlockchainService implements OnModuleInit {
 
     this.logger.log(`✅ Treasury Vault successfully funded. Tx: ${tx.hash}`);
     return tx;
+  }
+
+  async executeOnChainTrade(
+    listingId: string,
+    paymentToken: string,
+    paymentAmountWei: string,
+  ) {
+    const tx = await this.marketplaceContract.executeOnChainTrade(
+      listingId,
+      paymentToken,
+      BigInt(paymentAmountWei),
+    );
+    const receipt = await tx.wait();
+    this.logger.log(
+      `On-chain trade executed successfully! TxHash: ${receipt.hash}`,
+    );
+    return receipt;
   }
 }

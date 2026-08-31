@@ -42,10 +42,15 @@ export class TradeController {
     return this.tradeService.createTrade(sellerProfile, dto);
   }
 
-  @Post('execute/:tradeId')
+  @Post('execute/:listingId')
   async execute(
     @CurrentUser('userId') userId: string,
-    @Param('tradeId') tradeId: string,
+    @Param('listingId') listingId: string,
+    @Body()
+    body: {
+      settlementMode?: 'OFF_CHAIN' | 'ON_CHAIN';
+      txHash?: string;
+    },
   ) {
     if (!userId) throw new BadRequestException('Invalid user session');
 
@@ -57,7 +62,23 @@ export class TradeController {
     if (!buyerProfile)
       throw new BadRequestException('Investor profile for buyer not found');
 
-    return this.tradeService.executeTrade(tradeId, buyerProfile);
+    const mode = body?.settlementMode || 'OFF_CHAIN';
+
+    if (mode === 'ON_CHAIN') {
+      if (!body?.txHash) {
+        throw new BadRequestException(
+          'Transaction hash is required for on-chain sync',
+        );
+      }
+      return this.tradeService.syncOnChainTrade(
+        listingId,
+        buyerProfile,
+        body.txHash,
+      );
+    }
+
+    // Fallback to existing off-chain escrow execution flow
+    return this.tradeService.executeTrade(listingId, buyerProfile, mode);
   }
 
   @Get()
