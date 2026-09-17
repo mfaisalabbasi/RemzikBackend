@@ -3,6 +3,7 @@ import {
   BadRequestException,
   NotFoundException,
   InternalServerErrorException,
+  Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { InjectQueue } from '@nestjs/bull';
@@ -24,15 +25,21 @@ import { LedgerSource } from 'src/ledger/enums/ledger-source.enum';
 import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
 import { Ownership } from 'src/ownership/ownership.entity';
 import { BlockchainService } from 'src/blockchain/blockchain.service';
+import { Distribution } from '../distribution/distribution.entity';
 
 @Injectable()
 export class InvestmentService {
+  private readonly logger = new Logger(InvestmentService.name);
+
   constructor(
     @InjectRepository(Investment)
     private readonly investmentRepo: TypeORM.Repository<Investment>,
 
     @InjectRepository(AssetToken)
     private readonly assettokenRepo: TypeORM.Repository<AssetToken>,
+
+    @InjectRepository(Distribution)
+    private readonly distributionRepo: TypeORM.Repository<Distribution>,
 
     @InjectQueue('investment-queue')
     private readonly investmentQueue: Bull.Queue,
@@ -61,7 +68,6 @@ export class InvestmentService {
 
     const savedInvestment = await this.investmentRepo.manager.transaction(
       async (manager: TypeORM.EntityManager) => {
-        // 1. Balance check ONLY for OFF_CHAIN mode
         if (settlementMode === SettlementMode.OFF_CHAIN) {
           const availableBalance =
             await this.walletService.getAvailableBalance(userId);
@@ -91,7 +97,6 @@ export class InvestmentService {
         if (preciseShares > Number(token.availableShares))
           throw new BadRequestException('Not enough shares available');
 
-        // Decrement available shares atomically
         token.availableShares = Number(token.availableShares) - preciseShares;
         await manager.save(token);
 
@@ -102,7 +107,6 @@ export class InvestmentService {
         if (!asset) throw new BadRequestException('Asset not found');
 
         if (settlementMode === SettlementMode.ON_CHAIN) {
-          // ✅ HYBRID ON-CHAIN FLOW: User paid via Privy & TreasuryVault directly on-chain
           asset.funded = Number(asset.funded) + Number(dto.amount);
 
           const existingOwnership = await manager.findOne(Ownership, {
@@ -120,19 +124,47 @@ export class InvestmentService {
             manager,
           );
 
-          const investment = manager.create(Investment, {
-            investor,
-            asset: { id: dto.assetId } as Asset,
-            amount: dto.amount,
-            units: preciseShares,
-            unitPriceAtPurchase: Number(token.sharePrice),
-            status: InvestmentStatus.CONFIRMED,
-            txHash: dto.txHash,
-          });
+          let investment: Investment;
+          try {
+            const existingInvestment = await manager.findOne(Investment, {
+              where: { txHash: dto.txHash },
+            });
 
-          return await manager.save(investment);
+            if (existingInvestment) {
+              existingInvestment.status = InvestmentStatus.CONFIRMED;
+              investment = await manager.save(existingInvestment);
+            } else {
+              investment = manager.create(Investment, {
+                investor,
+                asset: { id: dto.assetId } as Asset,
+                amount: dto.amount,
+                units: preciseShares,
+                unitPriceAtPurchase: Number(token.sharePrice),
+                status: InvestmentStatus.CONFIRMED,
+                txHash: dto.txHash,
+              });
+              investment = await manager.save(investment);
+            }
+          } catch (err: any) {
+            if (
+              err.code === '23505' ||
+              err.message?.includes('unique constraint')
+            ) {
+              this.logger.warn(
+                `⚠️ Concurrent write detected for txHash ${dto.txHash}. Fetching existing record.`,
+              );
+              const concurrentExisting = await manager.findOne(Investment, {
+                where: { txHash: dto.txHash },
+              });
+              if (!concurrentExisting) throw err;
+              investment = concurrentExisting;
+            } else {
+              throw err;
+            }
+          }
+
+          return investment;
         } else {
-          // 🔄 OFF_CHAIN FLOW: Standard internal balance deduction & queue processing
           const investment = manager.create(Investment, {
             investor,
             asset: { id: dto.assetId } as Asset,
@@ -144,7 +176,6 @@ export class InvestmentService {
 
           const createdInvestment = await manager.save(investment);
 
-          // PRODUCTION FIX: Unique transactionId enforces idempotency via BullMQ jobId
           await this.investmentQueue.add(
             'process-investment',
             { investmentId: createdInvestment.id },
@@ -160,7 +191,6 @@ export class InvestmentService {
       },
     );
 
-    // Send confirmation notification immediately if settled on-chain
     if (settlementMode === SettlementMode.ON_CHAIN) {
       const fullInvestment = await this.investmentRepo.findOne({
         where: { id: savedInvestment.id },
@@ -193,6 +223,14 @@ export class InvestmentService {
       async (manager) => {
         const investment = await manager.findOne(Investment, {
           where: { id: investmentId },
+          lock: { mode: 'pessimistic_write' },
+        });
+
+        if (!investment || investment.status === InvestmentStatus.CONFIRMED)
+          return null;
+
+        const fullInvestment = await manager.findOne(Investment, {
+          where: { id: investmentId },
           relations: [
             'asset',
             'asset.partner',
@@ -202,51 +240,57 @@ export class InvestmentService {
           ],
         });
 
-        if (!investment || investment.status === InvestmentStatus.CONFIRMED)
-          return null;
+        if (!fullInvestment) return null;
 
-        const asset = investment.asset;
+        const asset = fullInvestment.asset;
         await this.walletService.transfer(
-          investment.investor.user.id,
+          fullInvestment.investor.user.id,
           asset.partner.user.id,
-          investment.amount,
+          fullInvestment.amount,
           LedgerSource.ASSET_INVESTMENT,
           `Investment Finalized: ${asset.title}`,
           manager,
         );
 
-        asset.funded = Number(asset.funded) + Number(investment.amount);
+        asset.funded = Number(asset.funded) + Number(fullInvestment.amount);
         const existingOwnership = await manager.findOne(Ownership, {
-          where: { investorId: investment.investor.id, assetId: asset.id },
+          where: { investorId: fullInvestment.investor.id, assetId: asset.id },
         });
         if (!existingOwnership) asset.investors = (asset.investors || 0) + 1;
         await manager.save(asset);
 
         await this.ownershipService.addShares(
-          investment.investor,
+          fullInvestment.investor,
           asset,
-          investment.units,
+          fullInvestment.units,
           manager,
         );
 
-        investment.status = InvestmentStatus.CONFIRMED;
-        investment.txHash = txHash;
-        return await manager.save(investment);
+        fullInvestment.status = InvestmentStatus.CONFIRMED;
+        fullInvestment.txHash = txHash;
+        return await manager.save(fullInvestment);
       },
     );
 
     if (confirmedInvestment) {
-      await this.notificationOrchestrator.buildAndSave(
-        confirmedInvestment.investor.user.id,
-        'investment.created',
-        {
-          title: 'Investment Confirmed!',
-          message: `Your investment of SAR ${confirmedInvestment.amount} in "${confirmedInvestment.asset.title}" is now finalized.`,
-          amount: confirmedInvestment.amount,
-          asset: confirmedInvestment.asset.title,
-          timestamp: new Date(),
-        },
-      );
+      const reloaded = await this.investmentRepo.findOne({
+        where: { id: confirmedInvestment.id },
+        relations: ['asset', 'investor', 'investor.user'],
+      });
+
+      if (reloaded) {
+        await this.notificationOrchestrator.buildAndSave(
+          reloaded.investor.user.id,
+          'investment.created',
+          {
+            title: 'Investment Confirmed!',
+            message: `Your investment of SAR ${reloaded.amount} in "${reloaded.asset.title}" is now finalized.`,
+            amount: reloaded.amount,
+            asset: reloaded.asset.title,
+            timestamp: new Date(),
+          },
+        );
+      }
     }
   }
 
@@ -257,16 +301,24 @@ export class InvestmentService {
     await this.investmentRepo.manager.transaction(async (manager) => {
       const investment = await manager.findOne(Investment, {
         where: { id: investmentId },
-        relations: ['investor', 'investor.user', 'asset'],
+        lock: { mode: 'pessimistic_write' },
       });
+
       if (investment && investment.status !== InvestmentStatus.FAILED) {
-        const token = await manager.findOne(AssetToken, {
-          where: { asset: { id: investment.asset.id } },
+        const fullInvestment = await manager.findOne(Investment, {
+          where: { id: investmentId },
+          relations: ['investor', 'investor.user', 'asset'],
         });
-        if (token) {
-          token.availableShares =
-            Number(token.availableShares) + Number(investment.units);
-          await manager.save(token);
+
+        if (fullInvestment && fullInvestment.asset) {
+          const token = await manager.findOne(AssetToken, {
+            where: { asset: { id: fullInvestment.asset.id } },
+          });
+          if (token) {
+            token.availableShares =
+              Number(token.availableShares) + Number(fullInvestment.units);
+            await manager.save(token);
+          }
         }
         investment.status = InvestmentStatus.FAILED;
         await manager.save(investment);
@@ -285,12 +337,67 @@ export class InvestmentService {
     return investment;
   }
 
-  async getMyInvestments(userId: string): Promise<Investment[]> {
-    return this.investmentRepo.find({
+  async getMyInvestments(userId: string): Promise<any[]> {
+    const investments = await this.investmentRepo.find({
       where: { investor: { user: { id: userId } } },
-      relations: ['asset'],
+      relations: ['asset', 'investor', 'investor.user'],
       order: { createdAt: 'DESC' },
     });
+
+    return Promise.all(
+      investments.map(async (inv) => {
+        this.logger.debug(
+          `🔍 Checking distributions for assetId: ${inv.asset?.id}, investorId: ${inv.investor?.id}`,
+        );
+
+        // Match latest distribution record with populated proof or fallback to latest by date
+        const activeDist =
+          inv.asset?.id && inv.investor?.id
+            ? await this.distributionRepo.findOne({
+                where: {
+                  asset: { id: inv.asset.id },
+                  investor: { id: inv.investor.id },
+                },
+                order: { createdAt: 'DESC' },
+              })
+            : null;
+
+        this.logger.debug(`📦 Query result: ${JSON.stringify(activeDist)}`);
+
+        // Ensure merkleProof deserializes properly from JSON/JSONB
+        const merkleProof = Array.isArray(activeDist?.merkleProof)
+          ? activeDist.merkleProof
+          : typeof activeDist?.merkleProof === 'string'
+            ? JSON.parse(activeDist.merkleProof)
+            : [];
+
+        // Structured distribution object so frontend receives nested state cleanly
+        const distributionObj = activeDist
+          ? {
+              batchId: activeDist.batchId || null,
+              distributionMode: activeDist.distributionMode || 'ON_CHAIN',
+              merkleProof,
+              status: activeDist.status,
+            }
+          : undefined;
+
+        return {
+          ...inv,
+          assetTitle: inv.asset?.title,
+          amountInvested: inv.amount,
+          roi: (inv.asset as any)?.targetRoi || 12.5,
+          image: (inv.asset as any)?.imageUrl,
+          distributionMode:
+            activeDist?.distributionMode ||
+            (inv.investor as any)?.distributionMode ||
+            'ON_CHAIN',
+          batchId: activeDist?.batchId || null,
+          status: inv.status, // 🔒 Strict raw investment status preservation
+          merkleProof,
+          distribution: distributionObj,
+        };
+      }),
+    );
   }
 
   async getByUser(userId: string): Promise<Investment[]> {
@@ -349,14 +456,11 @@ export class InvestmentService {
       );
     }
 
-    // Fetch asset token decimals from DB (defaults to 18 if not explicitly set)
     const assetToken = await this.assettokenRepo.findOne({
       where: { asset: { id: investment.asset.id } },
     });
-    // Fix by casting assetToken as any
     const decimals = (assetToken as any)?.decimals || 18;
 
-    // ✅ Pass the per-asset treasury address and token decimals to transferFromTreasuryVault
     const receipt: any = await this.blockchainService.transferFromTreasuryVault(
       investment.asset.tokenAddress,
       investment.asset.treasuryAddress,
@@ -374,5 +478,18 @@ export class InvestmentService {
     }
 
     return txHash;
+  }
+
+  async getLiveStatus(id: string) {
+    const investment = await this.investmentRepo.findOne({
+      where: { id },
+      select: ['id', 'status'],
+    });
+
+    if (!investment) {
+      throw new NotFoundException(`Investment with ID ${id} not found`);
+    }
+
+    return investment;
   }
 }

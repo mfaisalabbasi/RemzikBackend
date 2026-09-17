@@ -33,6 +33,7 @@
     "@nestjs/schedule": "^6.1.0",
     "@nestjs/typeorm": "^11.0.0",
     "@nestjs/websockets": "^11.1.18",
+    "@openzeppelin/merkle-tree": "^1.0.8",
     "@privy-io/node": "^0.28.0",
     "@privy-io/server-auth": "^1.32.5",
     "async-mutex": "^0.5.0",

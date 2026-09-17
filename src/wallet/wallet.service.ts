@@ -58,22 +58,55 @@ export class WalletService {
       : await this.walletRepo.manager.transaction(work);
   }
 
+  /**
+   * 🛡️ FIXED: Added pessimistic write-locking (`FOR UPDATE`) when operating inside a transaction
+   * to completely prevent balance-check race conditions.
+   */
   private async getOrCreateWallet(
     userId: string,
     manager?: EntityManager,
   ): Promise<Wallet> {
     const repo = this.getRepo(manager);
-    let wallet = await repo.findOne({ where: { userId } });
+
+    let wallet: Wallet | null = null;
+    if (manager) {
+      wallet = await repo
+        .createQueryBuilder('wallet')
+        .setLock('pessimistic_write')
+        .where('wallet.userId = :userId', { userId })
+        .getOne();
+    } else {
+      wallet = await repo.findOne({ where: { userId } });
+    }
+
     if (!wallet) {
-      wallet = repo.create({
+      const created = repo.create({
         userId,
         availableBalance: 0,
         lockedBalance: 0,
         pendingBalance: 0,
         totalEarned: 0,
       });
-      await repo.save(wallet);
+      await repo.save(created);
+
+      // Re-fetch with pessimistic write lock if inside a transaction
+      if (manager) {
+        wallet = await repo
+          .createQueryBuilder('wallet')
+          .setLock('pessimistic_write')
+          .where('wallet.userId = :userId', { userId })
+          .getOne();
+      } else {
+        wallet = created;
+      }
     }
+
+    if (!wallet) {
+      throw new NotFoundException(
+        `Failed to create or retrieve wallet for user ${userId}`,
+      );
+    }
+
     return wallet;
   }
 
@@ -265,10 +298,6 @@ export class WalletService {
     );
   }
 
-  /**
-   * ✅ NEW: SYSTEM-WIDE ATOMIC TRANSFER
-   * Moves money from one user to another and creates two ledger entries.
-   */
   async transfer(
     fromUserId: string,
     toUserId: string,
@@ -277,7 +306,6 @@ export class WalletService {
     note: string,
     manager: EntityManager,
   ): Promise<void> {
-    // 1. Debit Source
     await this.debitAvailable(fromUserId, amount, manager);
     await this.ledgerService.createEntry(
       fromUserId,
@@ -288,7 +316,6 @@ export class WalletService {
       manager,
     );
 
-    // 2. Credit Destination
     await this.creditAvailable(toUserId, amount, manager);
     await this.ledgerService.createEntry(
       toUserId,
@@ -320,31 +347,19 @@ export class WalletService {
       amount,
     );
 
-    const buyerWallet = await manager.findOne(Wallet, {
-      where: { userId: buyerId },
-    });
-    if (buyerWallet && Number(buyerWallet.lockedBalance) < 0) {
+    const buyerWallet = await this.getOrCreateWallet(buyerId, manager);
+    if (Number(buyerWallet.lockedBalance) < 0) {
       throw new BadRequestException('Insufficient escrowed funds for transfer');
     }
   }
-  /**
-   * Refund method: Reverses a balance deduction in the event of an
-   * on-chain execution failure.
-   */
+
   async refund(
     userId: string,
     amount: number,
     manager: EntityManager,
   ): Promise<void> {
-    const wallet = await manager.findOne(Wallet, {
-      where: { userId: userId },
-    });
-    if (!wallet) throw new NotFoundException('Wallet not found for refund');
-
+    const wallet = await this.getOrCreateWallet(userId, manager);
     wallet.availableBalance = Number(wallet.availableBalance) + Number(amount);
     await manager.save(wallet);
-
-    // Optional: Add a ledger entry for the refund for audit trails
-    // await this.ledgerService.record(userId, amount, LedgerType.REFUND, manager);
   }
 }

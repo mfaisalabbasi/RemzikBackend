@@ -67,4 +67,9 @@ export class InvestmentController {
   getMy(@Req() req: any) {
     return this.investmentService.getMyInvestments(req.user.userId);
   }
+
+  @Get(':id/db-status')
+  async getLiveInvestmentStatus(@Param('id') id: string) {
+    return this.investmentService.getLiveStatus(id);
+  }
 }

@@ -30,7 +30,6 @@ export class InvestorController {
     return this.investorService.getMyProfile(req.user.userId);
   }
 
-  // ✅ FIXED: Added for Secondary Market Frontend
   @Get('my-positions')
   @Roles(UserRole.INVESTOR)
   getMyPositions(@Req() req) {
@@ -43,6 +42,7 @@ export class InvestorController {
     return this.investorService.getProfileData(req.user.userId);
   }
 
+  // ✅ Handles updating name, email, and distributionMode dynamically
   @Patch('profile')
   @Roles(UserRole.INVESTOR)
   updateProfile(@Req() req, @Body() body) {

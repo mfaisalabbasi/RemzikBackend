@@ -8,6 +8,10 @@ import { Repository, EntityManager } from 'typeorm';
 import { InvestorProfile } from './investor.entity';
 import { User } from '../user/user.entity';
 import { Ownership } from '../ownership/ownership.entity';
+import {
+  Distribution,
+  DistributionMode,
+} from '../distribution/distribution.entity';
 import { WalletService } from 'src/wallet/wallet.service';
 import { InvestmentService } from 'src/investment/investment.service';
 import { InvestmentStatus } from 'src/investment/enums/investment-status.enum';
@@ -22,6 +26,9 @@ export class InvestorService {
 
     @InjectRepository(Ownership)
     private readonly ownershipRepo: Repository<Ownership>,
+
+    @InjectRepository(Distribution)
+    private readonly distributionRepo: Repository<Distribution>,
 
     private readonly walletService: WalletService,
     private readonly investmentService: InvestmentService,
@@ -83,12 +90,22 @@ export class InvestorService {
     return profile;
   }
 
-  // ✅ UPDATED: Include both PENDING and CONFIRMED investments
+  // ✅ UPDATED: Strict admin batchId check, structured distribution sync & explicit distStatus exposure
   async getProfileData(userId: string) {
     const profile = await this.getMyProfile(userId);
     const investments = await this.investmentService.getMyInvestments(userId);
+    const profileRecord = await this.investorRepo.findOne({
+      where: { user: { id: userId } },
+    });
 
-    // Only count CONFIRMED investments for financial totals
+    const distRecords = profileRecord
+      ? await this.distributionRepo.find({
+          where: { investor: { id: profileRecord.id } },
+          relations: ['asset'],
+          order: { createdAt: 'DESC' },
+        })
+      : [];
+
     const confirmed = investments.filter(
       (inv) => inv.status === InvestmentStatus.CONFIRMED,
     );
@@ -102,26 +119,80 @@ export class InvestorService {
       id: profile.user.id,
       name: profile.user.name,
       email: profile.user.email,
+      distributionMode: profile.distributionMode || 'OFF_CHAIN',
       totalInvested,
       portfolioValue: totalInvested,
-      activeInvestments: investments.length, // Total count including pending
-      investments: investments.map((inv) => ({
-        id: inv.id,
-        assetTitle: inv.asset?.title || 'Asset',
-        amountInvested: Number(inv.amount),
-        status: inv.status, // Now includes "PENDING" and "CONFIRMED"
-      })),
+      activeInvestments: investments.length,
+      investments: investments.map((inv) => {
+        const invAssetId = inv.asset?.id || inv.assetId;
+        const matchingDist = distRecords.find(
+          (d) =>
+            d.distributionMode === 'ON_CHAIN' &&
+            d.status !== 'PAID' &&
+            ((invAssetId && d.asset?.id === invAssetId) ||
+              (inv.batchId && d.batchId === inv.batchId) ||
+              (inv.distribution?.batchId &&
+                d.batchId === inv.distribution.batchId)),
+        );
+
+        const effectiveDist = matchingDist
+          ? {
+              batchId: matchingDist.batchId || inv.distribution?.batchId,
+              distributionMode: matchingDist.distributionMode || 'ON_CHAIN',
+              merkleProof:
+                matchingDist.merkleProof || inv.distribution?.merkleProof || [],
+              status: matchingDist.status,
+            }
+          : inv.distribution;
+
+        const resolvedStatus = effectiveDist?.status || inv.status;
+
+        return {
+          id: inv.id,
+          assetTitle: inv.assetTitle || inv.asset?.title || 'Asset',
+          amountInvested: Number(inv.amount),
+          status: resolvedStatus,
+          distStatus: resolvedStatus, // Explicitly exposed for frontend destructuring
+          image: inv.image || inv.asset?.imageUrl || '/slider/real-estate.jpg',
+          roi: inv.roi,
+          batchId: effectiveDist?.batchId || inv.batchId || undefined,
+          distributionMode:
+            effectiveDist?.distributionMode ||
+            profile.distributionMode ||
+            inv.distributionMode ||
+            'OFF_CHAIN',
+          merkleProof: effectiveDist?.merkleProof || inv.merkleProof || [],
+          distribution: effectiveDist,
+        };
+      }),
     };
   }
 
-  async updateProfile(userId: string, data: { name?: string; email?: string }) {
+  async updateProfile(
+    userId: string,
+    data: { name?: string; email?: string; distributionMode?: string },
+  ) {
     const userRepo = this.investorRepo.manager.getRepository(User);
     const user = await userRepo.findOne({ where: { id: userId } });
     if (!user) throw new NotFoundException('User not found');
+
     if (data.name) user.name = data.name;
     if (data.email) user.email = data.email;
     await userRepo.save(user);
-    return { message: 'Profile updated' };
+
+    const profile = await this.investorRepo.findOne({
+      where: { user: { id: userId } },
+    });
+
+    if (profile && data.distributionMode) {
+      profile.distributionMode = data.distributionMode as any;
+      await this.investorRepo.save(profile);
+    }
+
+    return {
+      message: 'Profile updated',
+      distributionMode: profile?.distributionMode,
+    };
   }
 
   async getDashboard(userId: string) {

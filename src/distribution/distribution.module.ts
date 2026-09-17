@@ -20,6 +20,9 @@ import { WalletModule } from 'src/wallet/wallet.module';
   ],
   controllers: [DistributionController],
   providers: [DistributionService],
-  exports: [DistributionService],
+  exports: [
+    DistributionService,
+    TypeOrmModule.forFeature([Distribution]), // 👈 exports repository if other modules need it directly
+  ],
 })
 export class DistributionModule {}

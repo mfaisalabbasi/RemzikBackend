@@ -4,12 +4,14 @@ import {
   Column,
   ManyToOne,
   CreateDateColumn,
+  Index,
 } from 'typeorm';
 import { InvestorProfile } from '../investor/investor.entity';
 import { Asset } from '../asset/asset.entity';
 import { InvestmentStatus } from './enums/investment-status.enum';
 
 @Entity('investments')
+@Index(['txHash'], { unique: true, where: '"txHash" IS NOT NULL' }) // 🛡️ Industry-standard guard: Prevents duplicate txHash entries at the DB level
 export class Investment {
   @PrimaryGeneratedColumn('uuid')
   id: string;

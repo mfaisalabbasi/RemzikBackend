@@ -7,7 +7,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ethers, Wallet, NonceManager } from 'ethers';
-import { PrivyClient } from '@privy-io/node'; // 👈 Official Privy Node SDK
+import { PrivyClient } from '@privy-io/node';
 import * as RemzikIdentityRegistryABI from './abi/RemzikIdentityRegistry.json';
 import * as AssetFactoryABI from './abi/AssetFactory.json';
 import * as YieldNotaryABI from './abi/YieldNotary.json';
@@ -24,7 +24,7 @@ export class BlockchainService implements OnModuleInit {
   private factoryContract: ethers.Contract;
   private marketplaceContract: ethers.Contract;
   private yieldNotaryContract: ethers.Contract;
-  private privy: PrivyClient; // 👈 Privy Client Instance
+  private privy: PrivyClient;
 
   constructor(private configService: ConfigService) {
     const rpcUrl =
@@ -40,7 +40,6 @@ export class BlockchainService implements OnModuleInit {
     this.adminWallet = new ethers.Wallet(privateKey, this.provider);
     this.managedSigner = new NonceManager(this.adminWallet);
 
-    // 🛡️ Initialize Privy using Node SDK credentials from environment variables
     this.privy = new PrivyClient({
       appId: this.configService.get<string>('PRIVY_APP_ID') || '',
       appSecret: this.configService.get<string>('PRIVY_APP_SECRET') || '',
@@ -61,7 +60,7 @@ export class BlockchainService implements OnModuleInit {
     const marketplaceAbi = [
       'function createListing(string calldata listingId, address token, uint256 amount) external',
       'function settleTrade(string calldata listingId, address seller, address buyer, uint256 tradePrice) external',
-      'function executeOnChainTrade(string calldata listingId, uint256 unitsToBuy) external', // 👈 Added
+      'function executeOnChainTrade(string calldata listingId, uint256 unitsToBuy) external',
       'function listings(string) view returns (address seller, address token, uint256 amount, bool active)',
       'function getListing(string calldata listingId) view returns (address seller, address token, uint256 amount, bool active)',
       'function cancelListing(string calldata listingId) external',
@@ -85,7 +84,14 @@ export class BlockchainService implements OnModuleInit {
     );
   }
 
-  // --- PHASE 10: RECOVERY HELPER METHODS VIA PRIVY ---
+  // Helper method to deterministically format batchId to bytes32 (with whitespace/newline trim safety)
+  private formatBatchIdToBytes32(batchId: string): string {
+    const cleanId = batchId.trim();
+    if (cleanId.startsWith('0x') && cleanId.length === 66) {
+      return cleanId;
+    }
+    return ethers.id(cleanId);
+  }
 
   async generateEmbeddedWalletForUser(privyUserId: string): Promise<string> {
     try {
@@ -227,6 +233,10 @@ export class BlockchainService implements OnModuleInit {
     governanceAddress: string;
   }> {
     await this.ensureFactoryLinked();
+    const backendWalletAddress = await this.adminWallet.getAddress();
+    this.logger.log(
+      `🚨 NestJS Backend Admin Wallet Address: ${backendWalletAddress}`,
+    );
 
     const adminWalletAddress = await this.adminWallet.getAddress();
     const factoryAddress = await this.factoryContract.getAddress();
@@ -252,19 +262,10 @@ export class BlockchainService implements OnModuleInit {
     );
 
     const tokenArgs = ethers.AbiCoder.defaultAbiCoder().encode(
-      [
-        'string',
-        'string',
-        'uint256',
-        'string',
-        'address',
-        'address',
-        'address',
-      ],
+      ['string', 'string', 'string', 'address', 'address', 'address'],
       [
         name,
         symbol,
-        BigInt(supply),
         metadataHash,
         registryAddress,
         adminWalletAddress,
@@ -278,8 +279,10 @@ export class BlockchainService implements OnModuleInit {
       govBytecode,
       govArgs,
       name,
+      BigInt(supply),
       formattedPropertyId,
       adminWalletAddress,
+      { gasLimit: 5000000 },
     );
 
     const receipt = await tx.wait();
@@ -313,15 +316,24 @@ export class BlockchainService implements OnModuleInit {
 
     const govContract = new ethers.Contract(
       deployedGovAddress,
-      ['function setToken(address _token) external'],
+      [
+        'function setToken(address _token) external',
+        'function token() view returns (address)',
+      ],
       this.managedSigner,
     );
 
-    const linkTx = await govContract.setToken(deployedTokenAddress);
-    await linkTx.wait();
+    const existingToken = await govContract.token();
+    if (existingToken === ethers.ZeroAddress) {
+      const linkTx = await govContract.setToken(deployedTokenAddress);
+      await linkTx.wait();
+      this.logger.log(`✅ Token linked to Governance successfully!`);
+    } else {
+      this.logger.log(`ℹ️ Token already linked, skipping manual link.`);
+    }
 
     this.logger.log(
-      `✅ Asset Pod & Engine 2 Treasury successfully deployed! Token: ${deployedTokenAddress}, Treasury: ${deployedTreasuryAddress}, Gov: ${deployedGovAddress}`,
+      `✅ Asset Pod & Treasury Vault successfully deployed & funded! Token: ${deployedTokenAddress}, Treasury: ${deployedTreasuryAddress}, Gov: ${deployedGovAddress}`,
     );
 
     return {
@@ -380,10 +392,6 @@ export class BlockchainService implements OnModuleInit {
     return tx;
   }
 
-  /**
-   * Transfers token shares from the specific per-asset Treasury Vault contract
-   * stored in the database to the investor's destination wallet address.
-   */
   async transferFromTreasuryVault(
     tokenAddress: string,
     treasuryAddress: string,
@@ -409,7 +417,6 @@ export class BlockchainService implements OnModuleInit {
 
     const parsedAmount = ethers.parseUnits(amountUnits, decimals);
 
-    // Verify token balance of the specific asset's Treasury Vault contract
     const vaultBalance = await tokenContract.balanceOf(treasuryAddress);
     if (vaultBalance < parsedAmount) {
       this.logger.error(
@@ -420,11 +427,8 @@ export class BlockchainService implements OnModuleInit {
       );
     }
 
-    // Interact with the Treasury Vault contract directly as the sender/controller
     const treasuryVaultAbi = [
       'function releaseTokens(address token, address to, uint256 amount) external',
-      'function withdraw(address token, address to, uint256 amount) external',
-      'function transferToken(address token, address to, uint256 amount) external',
     ];
 
     const treasuryVaultContract = new ethers.Contract(
@@ -437,28 +441,11 @@ export class BlockchainService implements OnModuleInit {
       `📦 Executing token release from Treasury Vault ${treasuryAddress} to ${to} for amount ${amountUnits}...`,
     );
 
-    let tx;
-    try {
-      tx = await treasuryVaultContract.releaseTokens(
-        tokenAddress,
-        to,
-        parsedAmount,
-      );
-    } catch (e: any) {
-      try {
-        tx = await treasuryVaultContract.withdraw(
-          tokenAddress,
-          to,
-          parsedAmount,
-        );
-      } catch (e2: any) {
-        tx = await treasuryVaultContract.transferToken(
-          tokenAddress,
-          to,
-          parsedAmount,
-        );
-      }
-    }
+    const tx = await treasuryVaultContract.releaseTokens(
+      tokenAddress,
+      to,
+      parsedAmount,
+    );
 
     const receipt = await tx.wait();
     this.logger.log(
@@ -467,9 +454,6 @@ export class BlockchainService implements OnModuleInit {
     return receipt;
   }
 
-  /**
-   * Backwards compatibility wrapper for code still passing 4 arguments.
-   */
   async transferFromVault(
     tokenAddress: string,
     to: string,
@@ -484,15 +468,50 @@ export class BlockchainService implements OnModuleInit {
   async recordYieldOnChain(
     batchId: string,
     propertyAddress: string,
-    totalNetYield: string,
+    totalNetYieldWei: string,
   ) {
+    const hashedBatchId = this.formatBatchIdToBytes32(batchId);
+
     const tx = await this.yieldNotaryContract.recordYield(
-      ethers.encodeBytes32String(batchId),
+      hashedBatchId,
       propertyAddress,
-      ethers.parseUnits(totalNetYield, 18),
+      BigInt(totalNetYieldWei),
     );
     await tx.wait();
     return tx;
+  }
+
+  async recordYieldWithMerkleOnChain(
+    batchId: string,
+    propertyAddress: string,
+    merkleRoot: string,
+    totalOnChainAmountWei: string,
+  ) {
+    this.logger.log(
+      `🔗 Anchoring Merkle root ${merkleRoot} for batch ${batchId} on YieldNotary...`,
+    );
+
+    const hashedBatchId = this.formatBatchIdToBytes32(batchId);
+
+    const tx = await this.yieldNotaryContract.recordYieldWithMerkle(
+      hashedBatchId,
+      propertyAddress,
+      merkleRoot,
+      BigInt(totalOnChainAmountWei),
+      { gasLimit: 300000 },
+    );
+
+    const receipt = await tx.wait();
+    if (!receipt || receipt.status === 0) {
+      throw new InternalServerErrorException(
+        `YieldNotary.recordYieldWithMerkle reverted on-chain for batch ${batchId}`,
+      );
+    }
+
+    this.logger.log(
+      `✅ Merkle root successfully anchored on-chain! Hash: ${receipt.hash}`,
+    );
+    return receipt;
   }
 
   getIndexerProvider = () => this.provider;
@@ -666,34 +685,6 @@ export class BlockchainService implements OnModuleInit {
     );
     const balance = await tokenContract.balanceOf(walletAddress);
     return balance.toString();
-  }
-
-  async mintTokensToVault(
-    tokenAddress: string,
-    treasuryAddress: string,
-    totalSharesWei: string,
-  ) {
-    const tokenContract = new ethers.Contract(
-      tokenAddress,
-      [
-        'function transfer(address to, uint256 amount) external returns (bool)',
-        'function balanceOf(address account) view returns (uint256)',
-      ],
-      this.managedSigner,
-    );
-
-    this.logger.log(
-      `Funding Treasury Vault (${treasuryAddress}) with initial supply: ${totalSharesWei}`,
-    );
-
-    const tx = await tokenContract.transfer(
-      treasuryAddress,
-      BigInt(totalSharesWei),
-    );
-    await tx.wait();
-
-    this.logger.log(`✅ Treasury Vault successfully funded. Tx: ${tx.hash}`);
-    return tx;
   }
 
   async executeOnChainTrade(

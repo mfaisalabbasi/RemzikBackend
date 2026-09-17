@@ -8,10 +8,15 @@ import { InvestmentModule } from 'src/investment/investment.module';
 import { LedgerModule } from 'src/ledger/ledger.module';
 import { Ownership } from 'src/ownership/ownership.entity';
 import { TradeModule } from 'src/secondary-market/trade/trade.module';
+import { Distribution } from 'src/distribution/distribution.entity'; // or import DistributionModule
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([InvestorProfile, Ownership]),
+    TypeOrmModule.forFeature([
+      InvestorProfile,
+      Ownership,
+      Distribution, // 👈 wrapped properly in forFeature
+    ]),
     WalletModule,
     InvestmentModule,
     LedgerModule,

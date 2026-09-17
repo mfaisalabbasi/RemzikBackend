@@ -68,7 +68,7 @@ export class TokenizationService {
         BigInt(10) ** BigInt(18)
       ).toString();
 
-      // 2. BLOCKCHAIN DEPLOYMENT (Dynamically provisions Token, Vault Proxy, and Governance)
+      // 2. BLOCKCHAIN DEPLOYMENT (Dynamically provisions Token, Vault Proxy, Governance, & Atomically Mints Supply)
       const { tokenAddress, treasuryAddress, governanceAddress } =
         await this.blockchainService.deployAssetContract(
           asset.title,
@@ -85,21 +85,12 @@ export class TokenizationService {
         );
       }
 
-      // 🛡️ COMPLIANCE & FUNDING GUARD: Ensure the dynamic vault proxy is whitelisted and funded with fractional tokens
+      // 🛡️ COMPLIANCE GUARD: Ensure the dynamic vault proxy is whitelisted on the identity registry
       try {
-        // Whitelist the dynamic vault proxy on the compliance/identity registry if required
         await this.blockchainService.ensureWalletWhitelisted(treasuryAddress);
-
-        // Mint or transfer the initial token supply directly into the dynamic Treasury Vault proxy address
-        // so it has tokens to distribute when users deposit.
-        await this.blockchainService.mintTokensToVault(
-          tokenAddress,
-          treasuryAddress,
-          totalSharesWei,
-        );
       } catch (err: any) {
         throw new InternalServerErrorException(
-          `Vault setup and funding failed: ${err.message}`,
+          `Vault compliance whitelisting failed: ${err.message}`,
         );
       }
 
@@ -142,7 +133,7 @@ export class TokenizationService {
         treasuryAddress: finalAsset.treasuryAddress,
         governanceAddress: finalAsset.governanceAddress,
         message:
-          'Tokenization complete. Pod deployed, vault funded, and Oracle synced.',
+          'Tokenization complete. Pod deployed, vault atomically funded, and Oracle synced.',
       };
     });
   }

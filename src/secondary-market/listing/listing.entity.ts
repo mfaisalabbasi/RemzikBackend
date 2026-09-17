@@ -25,6 +25,8 @@ export class SecondaryMarketListing {
   @JoinColumn({ name: 'assetId' })
   asset: Asset;
 
+  @Column({ nullable: true })
+  txHash: string;
   @Index()
   @Column()
   sellerId: string;

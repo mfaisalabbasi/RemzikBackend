@@ -14,11 +14,18 @@ import { OwnershipModule } from 'src/ownership/ownership.module';
 import { WalletModule } from 'src/wallet/wallet.module';
 import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
 import { NotificationsModule } from 'src/notifications/notifications.module';
+import { Distribution } from 'src/distribution/distribution.entity';
 
 @Module({
   imports: [
     KycModule,
-    TypeOrmModule.forFeature([Investment, InvestorProfile, Asset, AssetToken]),
+    TypeOrmModule.forFeature([
+      Investment,
+      InvestorProfile,
+      Asset,
+      AssetToken,
+      Distribution,
+    ]),
     OwnershipModule,
     WalletModule,
     EventEmitterModule.forRoot(),

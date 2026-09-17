@@ -121,11 +121,11 @@ export class TradeService {
               );
             }
 
-            // 2. Execute directly on-chain via Smart Contract (passing listingId, stablecoinAddress, and total price in wei)
+            // 2. Execute directly on-chain via Smart Contract (passing 6 decimals for MockUSDC)
             const receipt = await this.blockchainService.executeOnChainTrade(
               listingId,
               stablecoinAddress,
-              ethers.parseUnits(totalPrice.toString(), 18).toString(),
+              ethers.parseUnits(totalPrice.toString(), 6).toString(),
             );
 
             // 3. Record completed Trade in DB immediately since settlement is atomic on-chain
@@ -246,16 +246,16 @@ export class TradeService {
         );
       }
 
-      // 3. Perform Blockchain Settlement
-      const priceInWei = ethers
-        .parseUnits(trade.totalPrice.toString(), 18)
+      // 3. Perform Blockchain Settlement (passing 6 decimals for MockUSDC)
+      const priceInUnits = ethers
+        .parseUnits(trade.totalPrice.toString(), 6)
         .toString();
 
       const receipt = await this.blockchainService.settleTrade(
         trade.listingId,
         trade.seller.user.walletAddress!,
         trade.buyer.user.walletAddress!,
-        priceInWei,
+        priceInUnits,
       );
 
       // 4. Atomic Database Update
