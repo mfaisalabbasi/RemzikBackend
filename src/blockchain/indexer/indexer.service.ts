@@ -84,32 +84,40 @@ export class IndexerService implements OnModuleInit {
       select: ['tokenAddress', 'treasuryAddress', 'governanceAddress'],
     });
 
-    // Build a lookup dictionary for human-readable contract labels
+    // Build lookup dictionary and tracked address array for efficient RPC filtering
     const contractLabels: Record<string, string> = {};
-    if (registryAddress)
-      contractLabels[registryAddress.toLowerCase()] = 'IdentityRegistry';
-    if (factoryAddress)
-      contractLabels[factoryAddress.toLowerCase()] = 'AssetFactory';
-    if (marketplaceAddress)
-      contractLabels[marketplaceAddress.toLowerCase()] = 'Marketplace';
-    if (yieldNotaryAddress)
-      contractLabels[yieldNotaryAddress.toLowerCase()] = 'YieldNotary';
+    const trackedAddresses: string[] = [];
+
+    const trackAddress = (addr: string | undefined, label: string) => {
+      if (addr && ethers.isAddress(addr)) {
+        const lower = addr.toLowerCase();
+        contractLabels[lower] = label;
+        if (!trackedAddresses.includes(addr)) {
+          trackedAddresses.push(addr);
+        }
+      }
+    };
+
+    trackAddress(registryAddress, 'IdentityRegistry');
+    trackAddress(factoryAddress, 'AssetFactory');
+    trackAddress(marketplaceAddress, 'Marketplace');
+    trackAddress(yieldNotaryAddress, 'YieldNotary');
 
     activeAssets.forEach((a) => {
-      if (a.tokenAddress)
-        contractLabels[a.tokenAddress.toLowerCase()] = 'AssetToken';
-      if (a.treasuryAddress)
-        contractLabels[a.treasuryAddress.toLowerCase()] = 'TreasuryVault';
-      if (a.governanceAddress)
-        contractLabels[a.governanceAddress.toLowerCase()] =
-          'PropertyGovernance';
+      trackAddress(a.tokenAddress, 'AssetToken');
+      trackAddress(a.treasuryAddress, 'TreasuryVault');
+      trackAddress(a.governanceAddress, 'PropertyGovernance');
     });
 
-    // Fetch all logs universally within the chunked block range so nothing gets bypassed
-    const logs = await this.provider.getLogs({
-      fromBlock: startBlock,
-      toBlock: toBlock,
-    });
+    // Fetch logs filtered strictly to Remzik protocol contracts to protect node performance
+    const logs =
+      trackedAddresses.length > 0
+        ? await this.provider.getLogs({
+            fromBlock: startBlock,
+            toBlock: toBlock,
+            address: trackedAddresses,
+          })
+        : [];
 
     for (const log of logs) {
       // 🛡️ Optimized Idempotency Check using first-class columns (`txHash` + `logIndex`)

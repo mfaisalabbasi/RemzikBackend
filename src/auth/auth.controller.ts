@@ -6,9 +6,10 @@ import {
   UseGuards,
   Get,
   Req,
-  UnauthorizedException,
   HttpCode,
   HttpStatus,
+  BadRequestException,
+  UnauthorizedException,
 } from '@nestjs/common';
 import type { Response, Request } from 'express';
 import { AuthService } from './auth.service';
@@ -16,12 +17,15 @@ import { LoginDto } from './dto/login.dto';
 import { JwtAuthGuard } from './guards/jwt.gaurd';
 import { UserService } from '../user/user.service';
 import * as crypto from 'crypto';
+import { WalletProvisionService } from './wallet-provision.service';
+import { ethers } from 'ethers';
 
 @Controller('auth')
 export class AuthController {
   constructor(
     private readonly authService: AuthService,
     private readonly userService: UserService,
+    private readonly walletProvisionService: WalletProvisionService,
   ) {}
 
   /**
@@ -78,6 +82,7 @@ export class AuthController {
     });
 
     return {
+      accessToken: result.accessToken, // 👈 Included so mobile app/WebView can extract & store it
       user: result.user,
       message: 'Login successful',
     };
@@ -124,6 +129,43 @@ export class AuthController {
     return {
       privyCustomToken: token,
       jwk: null,
+    };
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('sync-wallet')
+  async syncWallet(
+    @Req() req: Request & { user?: any },
+    @Body()
+    body: {
+      walletAddress: string;
+      privyUserId: string;
+    },
+  ) {
+    const userId = req.user?.userId;
+
+    if (!userId) {
+      throw new UnauthorizedException('Authenticated user not found.');
+    }
+
+    if (!body?.walletAddress || !ethers.isAddress(body.walletAddress)) {
+      throw new BadRequestException('Invalid wallet address.');
+    }
+
+    if (!body?.privyUserId) {
+      throw new BadRequestException('Privy user ID is required.');
+    }
+
+    const result = await this.walletProvisionService.syncPrivyWallet(
+      userId,
+      body.walletAddress,
+      body.privyUserId,
+    );
+
+    return {
+      success: true,
+      walletAddress: result.walletAddress,
+      privyUserId: result.privyUserId,
     };
   }
 }

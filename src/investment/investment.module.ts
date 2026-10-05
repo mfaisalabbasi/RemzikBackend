@@ -15,6 +15,7 @@ import { WalletModule } from 'src/wallet/wallet.module';
 import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
 import { NotificationsModule } from 'src/notifications/notifications.module';
 import { Distribution } from 'src/distribution/distribution.entity';
+import { TransactionIntent } from './transaction-intent.entity';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { Distribution } from 'src/distribution/distribution.entity';
       Asset,
       AssetToken,
       Distribution,
+      TransactionIntent,
     ]),
     OwnershipModule,
     WalletModule,

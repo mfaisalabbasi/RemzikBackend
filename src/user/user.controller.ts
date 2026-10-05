@@ -1,3 +1,4 @@
+// src/user/user.controller.ts (or wherever it's located)
 import {
   Controller,
   Post,
@@ -17,7 +18,7 @@ import { RegisterWithKycDto } from './dto/register-with-kyc.dto';
 import { JwtAuthGuard } from 'src/auth/guards/jwt.gaurd';
 import { SyncWalletDto } from './dto/sync-wallet.dto';
 
-@Controller('auth')
+@Controller('users') // 👈 CHANGED from 'auth' to 'users' to avoid collision
 export class UserController {
   constructor(private readonly userService: UserService) {}
 
@@ -38,7 +39,7 @@ export class UserController {
       ],
       {
         storage: memoryStorage(),
-        limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+        limits: { fileSize: 5 * 1024 * 1024 },
       },
     ),
   )
@@ -61,8 +62,6 @@ export class UserController {
     @Req() req: Request & { user?: any },
   ) {
     const userId = req.user?.userId;
-
-    // 🛡️ Pass both wallet address and Privy DID to the service layer
     return this.userService.syncWalletAddress(
       userId,
       dto.walletAddress,

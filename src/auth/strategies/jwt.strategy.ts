@@ -4,10 +4,21 @@ import { ExtractJwt, Strategy } from 'passport-jwt';
 import { ConfigService } from '@nestjs/config';
 import type { Request } from 'express';
 
-const cookieExtractor = (req: Request): string | null => {
-  if (req && req.cookies) {
-    return req.cookies['accessToken'] || null;
+const cookieOrHeaderExtractor = (req: Request): string | null => {
+  // 1. Check for token in cookies (used by Web)
+  if (req && req.cookies && req.cookies['accessToken']) {
+    return req.cookies['accessToken'];
   }
+
+  // 2. Fallback: Check for token in Authorization Bearer header (used by Mobile App)
+  const authHeader = req?.headers?.authorization;
+  if (authHeader) {
+    const [type, token] = authHeader.split(' ');
+    if (type === 'Bearer' && token) {
+      return token;
+    }
+  }
+
   return null;
 };
 
@@ -15,7 +26,7 @@ const cookieExtractor = (req: Request): string | null => {
 export class JwtStrategy extends PassportStrategy(Strategy) {
   constructor(private readonly config: ConfigService) {
     super({
-      jwtFromRequest: ExtractJwt.fromExtractors([cookieExtractor]),
+      jwtFromRequest: ExtractJwt.fromExtractors([cookieOrHeaderExtractor]),
       ignoreExpiration: false,
       secretOrKey: config.getOrThrow<string>('JWT_SECRET'),
       passReqToCallback: false,

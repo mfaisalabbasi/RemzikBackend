@@ -9,28 +9,20 @@ import {
 import { InvestorProfile } from '../investor/investor.entity';
 import { Asset } from '../asset/asset.entity';
 import { InvestmentStatus } from './enums/investment-status.enum';
+import { SettlementMode } from './dto/create-investment.dto'; // Adjust import path if needed
 
 @Entity('investments')
-@Index(['txHash'], { unique: true, where: '"txHash" IS NOT NULL' }) // 🛡️ Industry-standard guard: Prevents duplicate txHash entries at the DB level
+@Index(['txHash'], { unique: true, where: '"txHash" IS NOT NULL' })
 export class Investment {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  /**
-   * Who invested
-   */
   @ManyToOne(() => InvestorProfile, { nullable: false })
   investor: InvestorProfile;
 
-  /**
-   * What asset
-   */
   @ManyToOne(() => Asset, { nullable: false })
   asset: Asset;
 
-  /**
-   * Amount invested in currency (e.g., SAR)
-   */
   @Column({
     type: 'decimal',
     precision: 15,
@@ -42,9 +34,6 @@ export class Investment {
   })
   amount: number;
 
-  /**
-   * ✅ FIXED: Changed from 'int' to 'decimal' to accurately store fractional shares/units (4 decimal precision)
-   */
   @Column({
     type: 'decimal',
     precision: 12,
@@ -57,10 +46,6 @@ export class Investment {
   })
   units: number;
 
-  /**
-   * ✅ Snapshot of the unit price at the time of purchase
-   * Essential for historical audits and ROI calculations.
-   */
   @Column({
     type: 'decimal',
     precision: 15,
@@ -74,8 +59,42 @@ export class Investment {
   unitPriceAtPurchase: number;
 
   /**
-   * Payment lifecycle
+   * ✅ NEW: Settlement Mode (OFF_CHAIN or ON_CHAIN)
    */
+  @Column({
+    type: 'enum',
+    enum: SettlementMode,
+    default: SettlementMode.OFF_CHAIN,
+  })
+  settlementMode: SettlementMode;
+
+  /**
+   * ✅ NEW: Web3 Intent Security Snapshots (Immutable audit trail)
+   */
+  @Column({ nullable: true })
+  expectedWalletAddress: string;
+
+  @Column({ nullable: true })
+  expectedVaultAddress: string;
+
+  @Column({ nullable: true })
+  expectedStablecoinAddress: string;
+
+  @Column({ type: 'varchar', nullable: true })
+  expectedStablecoinAmount: string;
+
+  @Column({ type: 'varchar', nullable: true })
+  expectedTokenAmount: string;
+
+  @Column({ type: 'text', nullable: true })
+  expectedCalldata: string;
+
+  @Column({ type: 'bigint', nullable: true })
+  expectedChainId: string;
+
+  @Column({ type: 'timestamp', nullable: true })
+  intentExpiresAt: Date;
+
   @Column({
     type: 'enum',
     enum: InvestmentStatus,
@@ -85,6 +104,54 @@ export class Investment {
 
   @Column({ nullable: true })
   txHash: string;
+
+  @Column({
+    type: 'varchar',
+
+    nullable: true,
+  })
+  walletAddress?: string;
+
+  @Column({
+    type: 'bigint',
+
+    nullable: true,
+  })
+  blockNumber?: string;
+
+  @Column({
+    type: 'varchar',
+
+    nullable: true,
+  })
+  blockHash?: string;
+
+  @Column({
+    type: 'text',
+
+    nullable: true,
+  })
+  failureReason?: string;
+  @Column({
+    type: 'timestamp',
+
+    nullable: true,
+  })
+  confirmedAt?: Date;
+
+  @Column({
+    type: 'timestamp',
+
+    nullable: true,
+  })
+  failedAt?: Date;
+
+  @Column({
+    type: 'varchar',
+
+    nullable: true,
+  })
+  expectedTokenAddress?: string;
 
   @CreateDateColumn()
   createdAt: Date;

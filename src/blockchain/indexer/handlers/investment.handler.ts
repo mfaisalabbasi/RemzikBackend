@@ -28,18 +28,23 @@ export class InvestmentHandler {
     txHash: string;
     blockNumber: number;
   }): Promise<void> {
-    const { tokenAddress, recipientWallet, amountUnits, txHash, blockNumber } =
-      eventData;
+    const {
+      tokenAddress,
+      treasuryAddress,
+      recipientWallet,
+      amountUnits,
+      txHash,
+      blockNumber,
+    } = eventData;
 
     await this.dataSource.transaction(async (manager: EntityManager) => {
-      // 1. Idempotency guard via txHash with pessimistic write lock to prevent race conditions with API
-      const existingInvestment = await manager.findOne(Investment, {
+      // 1. First, check if this specific txHash was already recorded (Idempotency guard)
+      let existingInvestment = await manager.findOne(Investment, {
         where: { txHash },
         lock: { mode: 'pessimistic_write' },
       });
 
       if (existingInvestment) {
-        // If API already wrote it, ensure it's marked CONFIRMED and exit safely without double-counting
         if (existingInvestment.status !== InvestmentStatus.CONFIRMED) {
           existingInvestment.status = InvestmentStatus.CONFIRMED;
           await manager.save(existingInvestment);
@@ -50,7 +55,7 @@ export class InvestmentHandler {
         return;
       }
 
-      // 2. Self-Healing Path: API missed the event or user transacted directly on-chain
+      // 2. Resolve Investor Profile
       const investor = await manager.findOne(InvestorProfile, {
         where: { user: { walletAddress: recipientWallet } },
         relations: ['user'],
@@ -80,43 +85,74 @@ export class InvestmentHandler {
       const parsedUnits = Number(amountUnits);
       const totalCost = parsedUnits * Number(token.sharePrice);
 
-      // 4. Safely decrement available shares atomically on token for self-healing scenarios
-      const lockedToken = await manager
-        .getRepository(AssetToken)
-        .createQueryBuilder('token')
-        .setLock('pessimistic_write')
-        .where('token.id = :id', { id: token.id })
-        .getOne();
+      // Helper function to execute token lock down, funding updates, ownership allocation, and saving
+      const processAssetMutationAndAllocation = async () => {
+        // Decrement available shares atomically
+        const lockedToken = await manager
+          .getRepository(AssetToken)
+          .createQueryBuilder('token')
+          .setLock('pessimistic_write')
+          .where('token.id = :id', { id: token.id })
+          .getOne();
 
-      if (lockedToken) {
-        lockedToken.availableShares = Math.max(
-          0,
-          Number(lockedToken.availableShares) - parsedUnits,
+        if (lockedToken) {
+          lockedToken.availableShares = Math.max(
+            0,
+            Number(lockedToken.availableShares) - parsedUnits,
+          );
+          await manager.save(lockedToken);
+        }
+
+        // Update Asset Funding Pool metrics
+        asset.funded = Number(asset.funded) + totalCost;
+
+        const existingOwnership = await manager.findOne(Ownership, {
+          where: { investorId: investor.id, assetId: asset.id },
+        });
+
+        if (!existingOwnership) {
+          asset.investors = (asset.investors || 0) + 1;
+        }
+        await manager.save(asset);
+
+        // Allocate shares via OwnershipService atomically
+        await this.ownershipService.addShares(
+          investor,
+          asset,
+          parsedUnits,
+          manager,
         );
-        await manager.save(lockedToken);
-      }
+      };
 
-      // 5. Update Asset Funding Pool metrics
-      asset.funded = Number(asset.funded) + totalCost;
-
-      const existingOwnership = await manager.findOne(Ownership, {
-        where: { investorId: investor.id, assetId: asset.id },
+      // 4. Check if there is a PENDING investment intent created by the API for this user/vault
+      const pendingInvestment = await manager.findOne(Investment, {
+        where: {
+          investor: { id: investor.id },
+          expectedVaultAddress: treasuryAddress,
+          status: InvestmentStatus.PENDING,
+        },
+        lock: { mode: 'pessimistic_write' },
       });
 
-      if (!existingOwnership) {
-        asset.investors = (asset.investors || 0) + 1;
+      if (pendingInvestment) {
+        // Link txHash and confirm existing pending intent
+        pendingInvestment.txHash = txHash;
+        pendingInvestment.status = InvestmentStatus.CONFIRMED;
+        await manager.save(pendingInvestment);
+
+        // Execute shared asset reduction and share allocation logic
+        await processAssetMutationAndAllocation();
+
+        this.logger.log(
+          `✅ [InvestmentIndexer] Confirmed pending investment intent ${pendingInvestment.id} | Shares Allocated | Tx: ${txHash}`,
+        );
+        return;
       }
-      await manager.save(asset);
 
-      // 6. Allocate shares via OwnershipService atomically
-      await this.ownershipService.addShares(
-        investor,
-        asset,
-        parsedUnits,
-        manager,
-      );
+      // 5, 6, 7. Self-Healing Path: No API intent found, execute mutations
+      await processAssetMutationAndAllocation();
 
-      // 7. Save Confirmed Investment Record (Self-Healed)
+      // 8. Save Confirmed Investment Record (Self-Healed)
       const newInvestment = manager.create(Investment, {
         investor,
         asset: { id: asset.id } as Asset,

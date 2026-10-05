@@ -1,11 +1,11 @@
 import {
+  IsEnum,
   IsNotEmpty,
   IsNumber,
+  IsOptional,
+  IsString,
   IsUUID,
   Min,
-  IsEnum,
-  IsString,
-  IsOptional,
 } from 'class-validator';
 
 export enum SettlementMode {
@@ -18,27 +18,21 @@ export class CreateInvestmentDto {
   @IsNotEmpty()
   assetId!: string;
 
-  @IsNumber()
+  @IsNumber({ maxDecimalPlaces: 2 })
   @Min(1)
   amount!: number;
 
-  @IsNotEmpty()
+  /**
+   * Required only for OFF_CHAIN settlement.
+   *
+   * This is an application-level idempotency/reference ID.
+   * It is NOT a blockchain transaction hash.
+   */
   @IsUUID()
+  @IsNotEmpty()
   transactionId!: string;
 
-  /**
-   * ✅ PHASE 3: Optional settlement mode selector
-   * Defaults to OFF_CHAIN for existing internal balance flows
-   */
   @IsOptional()
   @IsEnum(SettlementMode)
   settlementMode?: SettlementMode = SettlementMode.OFF_CHAIN;
-
-  /**
-   * ✅ PHASE 3: On-chain transaction hash from TreasuryVault.deposit()
-   * Required if settlementMode is ON_CHAIN
-   */
-  @IsOptional()
-  @IsString()
-  txHash?: string;
 }

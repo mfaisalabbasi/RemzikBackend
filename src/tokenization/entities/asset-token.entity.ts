@@ -46,6 +46,12 @@ export class AssetToken {
   @Column({ type: 'decimal', precision: 20, scale: 4, default: 0 })
   availableShares: number;
 
+  /**
+   * ✅ TOKEN DECIMALS: Number of decimals the token uses (e.g., 18 or 6)
+   */
+  @Column({ type: 'int', default: 18 })
+  decimals: number;
+
   @CreateDateColumn()
   createdAt: Date;
 
