@@ -113,4 +113,14 @@ export class DistributionController {
     const userId = req.user?.userId;
     return await this.distributionService.confirmOnChainClaim(batchId, userId);
   }
+
+  /**
+   * 📱 INVESTOR: Get logged-in investor's distributions list for mobile frontend sync
+   */
+  @UseGuards(JwtAuthGuard)
+  @Get('my-distributions')
+  async getMyDistributions(@Request() req) {
+    const userId = req.user?.userId;
+    return await this.distributionService.getUserDistributions(userId);
+  }
 }

@@ -512,14 +512,18 @@ export class DistributionService {
 
   async confirmOnChainClaim(batchId: string, userId: string) {
     const cleanBatchId = batchId.trim();
+
     return await this.dataSource.transaction(async (manager) => {
+      // 1. Find the investor profile tied to the authenticated user
       const investor = await manager.findOne(InvestorProfile, {
         where: { user: { id: userId } },
       });
+
       if (!investor) {
         throw new NotFoundException('Investor profile not found for user.');
       }
 
+      // 2. Fetch the specific distribution row matching BOTH batchId and investorId
       const distRows = await manager.query(
         `SELECT id, status, "investorId" FROM distributions WHERE "batchId" = $1 AND "investorId" = $2 LIMIT 1`,
         [cleanBatchId, investor.id],
@@ -531,12 +535,30 @@ export class DistributionService {
         );
       }
 
+      // 3. Update ONLY this specific user's record status to PAID
       await manager.query(
         `UPDATE distributions SET status = 'PAID', "updatedAt" = NOW() WHERE id = $1`,
         [distRows[0].id],
       );
 
       return { success: true, status: 'PAID' };
+    });
+  }
+  async getUserDistributions(userId: string) {
+    const investor = await this.dataSource
+      .getRepository(InvestorProfile)
+      .findOne({
+        where: { user: { id: userId } },
+      });
+
+    if (!investor) {
+      return [];
+    }
+
+    return await this.distributionRepo.find({
+      where: { investor: { id: investor.id } },
+      relations: ['asset'],
+      order: { createdAt: 'DESC' },
     });
   }
 }
