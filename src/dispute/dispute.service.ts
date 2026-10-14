@@ -95,7 +95,6 @@ export class DisputeService {
     adminId: string,
     dto: ResolveDisputeDto,
   ) {
-    // Lock critical resolution path to prevent concurrent non-deterministic states
     return await this.disputeMutex.runExclusive(async () => {
       const dispute = await this.disputeRepo.findOne({
         where: { id: disputeId },
@@ -115,6 +114,7 @@ export class DisputeService {
       }
 
       return await this.dataSource.transaction(async (manager) => {
+        let txReceipt: ethers.TransactionReceipt | null = null;
         let txHash: string | null = null;
 
         if (
@@ -142,29 +142,55 @@ export class DisputeService {
             );
           }
 
-          const priceString = ethers
-            .parseUnits(trade!.totalPrice.toString(), 18)
-            .toString();
-
-          const receipt = await this.blockchainService.settleTrade(
-            String(trade!.listingId),
-            sellerAddr,
-            buyerAddr,
-            priceString,
+          const tokenAmount = trade!.units.toString();
+          this.logger.log(
+            `Initiating on-chain settlement for listingId=${trade!.listingId}, tokenAmount=${tokenAmount}`,
           );
-          txHash = receipt.hash;
+
+          try {
+            txReceipt = await this.blockchainService.settleTrade(
+              String(trade!.listingId),
+              sellerAddr,
+              buyerAddr,
+              tokenAmount,
+            );
+            txHash = txReceipt!.hash;
+            this.logger.log(`On-chain settlement succeeded. TX: ${txHash}`);
+          } catch (blockchainErr: any) {
+            this.logger.error(
+              'RAW BLOCKCHAIN SETTLEMENT ERROR:',
+              blockchainErr,
+            );
+            throw new BadRequestException(
+              `On-chain release failed: ${blockchainErr.reason || blockchainErr.message}`,
+            );
+          }
         }
 
         if (
           dispute.type === DisputeType.TRADE ||
           dispute.type === DisputeType.SECONDARY_TRADE
         ) {
-          await this.handleFinancialResolution(
-            dispute.referenceId,
-            dto.status,
-            manager,
-            txHash || undefined,
-          );
+          if (dto.status === DisputeStatus.RESOLVED_FAVOR_SELLER) {
+            if (!txReceipt) {
+              throw new BadRequestException(
+                'Missing blockchain transaction receipt.',
+              );
+            }
+            await this.handleFinancialResolution(
+              dispute.referenceId,
+              dto.status,
+              manager,
+              txReceipt,
+            );
+          } else {
+            await this.handleFinancialResolution(
+              dispute.referenceId,
+              dto.status,
+              manager,
+              undefined,
+            );
+          }
         }
 
         dispute.status = dto.status;
@@ -202,7 +228,7 @@ export class DisputeService {
     referenceId: string,
     targetStatus: DisputeStatus,
     manager: EntityManager,
-    txHash?: string,
+    receipt?: ethers.TransactionReceipt,
   ) {
     const trade = await manager.getRepository(Trade).findOne({
       where: { id: referenceId },
@@ -221,36 +247,41 @@ export class DisputeService {
         break;
 
       case DisputeStatus.RESOLVED_FAVOR_SELLER:
-        if (!txHash)
-          throw new BadRequestException('Missing blockchain transaction hash.');
-
-        const receipt = await this.blockchainService
-          .getProvider()
-          .getTransactionReceipt(txHash);
         if (!receipt || receipt.status !== 1) {
-          throw new InternalServerErrorException(
-            'Transaction not found or failed on-chain.',
+          throw new BadRequestException(
+            'Missing or failed blockchain transaction receipt.',
           );
         }
 
-        await this.escrowService.releaseEscrowByTradeId(referenceId, manager);
-        await this.ownershipService.removeUnits(
-          trade.seller.id,
-          trade.asset.id,
-          trade.units,
-          manager,
-        );
-        await this.ownershipService.addUnits(
-          trade.buyer.id,
-          trade.asset.id,
-          trade.units,
-          manager,
-        );
+        try {
+          this.logger.log(
+            'Executing local escrow release and ownership updates...',
+          );
+          await this.escrowService.releaseEscrowByTradeId(referenceId, manager);
+          await this.ownershipService.removeUnits(
+            trade.seller.id,
+            trade.asset.id,
+            trade.units,
+            manager,
+          );
+          await this.ownershipService.addUnits(
+            trade.buyer, // 👈 Passed InvestorProfile object directly
+            trade.asset.id,
+            trade.units,
+            manager,
+          );
 
-        await manager.update(Trade, referenceId, {
-          txHash,
-          status: TradeStatus.COMPLETED,
-        });
+          await manager.update(Trade, referenceId, {
+            txHash: receipt.hash,
+            status: TradeStatus.COMPLETED,
+          });
+          this.logger.log('Local financial resolution completed successfully.');
+        } catch (dbErr: any) {
+          this.logger.error('DB FINANCIAL RESOLUTION ERROR:', dbErr);
+          throw new InternalServerErrorException(
+            `Database update failed: ${dbErr.message}`,
+          );
+        }
         break;
 
       default:

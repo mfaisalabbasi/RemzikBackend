@@ -42,6 +42,63 @@ export class TradeController {
     return this.tradeService.createTrade(sellerProfile, dto);
   }
 
+  // =========================================================
+  // ON-CHAIN TRADE INTENT
+  // =========================================================
+
+  @Post('intent')
+  async createIntent(
+    @CurrentUser('userId') userId: string,
+    @Body()
+    body: {
+      listingId: string;
+      settlementMode?: 'OFF_CHAIN' | 'ON_CHAIN';
+    },
+  ) {
+    if (!userId) throw new BadRequestException('Invalid user session');
+
+    const buyerProfile = await this.investorRepo.findOne({
+      where: { user: { id: userId } },
+      relations: ['user'],
+    });
+
+    if (!buyerProfile)
+      throw new BadRequestException('Investor profile for buyer not found');
+
+    return this.tradeService.createTradeIntent(
+      body.listingId,
+      buyerProfile,
+      body?.settlementMode || 'ON_CHAIN',
+    );
+  }
+
+  // =========================================================
+  // SUBMIT INVESTOR-SIGNED ON-CHAIN TX
+  // =========================================================
+
+  @Post(':id/submit-tx')
+  async submitTransaction(
+    @CurrentUser('userId') userId: string,
+    @Param('id') tradeId: string,
+    @Body() body: { txHash: string },
+  ) {
+    if (!userId) throw new BadRequestException('Invalid user session');
+
+    // 1. Save and bind the transaction hash to the trade intent record
+    await this.tradeService.submitOnChainTransaction(
+      userId,
+      tradeId,
+      body.txHash,
+    );
+
+    // 2. Immediately trigger on-chain verification pipeline & final settlement
+    return this.tradeService.verifyOnChainTrade(tradeId, body.txHash);
+  }
+
+  // =========================================================
+  // LEGACY EXECUTE ROUTE (Supports both Off-Chain Escrow & On-Chain Sync)
+  // =========================================================
+
   @Post('execute/:listingId')
   async execute(
     @CurrentUser('userId') userId: string,
@@ -79,6 +136,30 @@ export class TradeController {
 
     // Fallback to existing off-chain escrow execution flow
     return this.tradeService.executeTrade(listingId, buyerProfile, mode);
+  }
+
+  // =========================================================
+  // LIVE TRADE STATUS & AUTO-VERIFICATION
+  // =========================================================
+
+  @Get(':id/db-status')
+  async getLiveTradeStatus(
+    @CurrentUser('userId') userId: string,
+    @Param('id') id: string,
+  ) {
+    // 1. If PENDING and a transaction hash exists, auto-trigger on-chain verification check
+    try {
+      const current = await this.tradeService.getLiveStatus(id, userId);
+
+      if (current && current.status === ('PENDING' as any) && current.txHash) {
+        await this.tradeService.verifyOnChainTrade(id, current.txHash);
+      }
+    } catch (error: any) {
+      console.log('Trade auto-verification check warning:', error?.message);
+    }
+
+    // 2. Return freshest state from DB
+    return this.tradeService.getLiveStatus(id, userId);
   }
 
   @Get()

@@ -8,7 +8,7 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, EntityManager } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
-import { Mutex } from 'async-mutex'; // Import the lock
+import { Mutex } from 'async-mutex';
 import { SecondaryMarketListing } from './listing.entity';
 import { CreateListingDto } from './dto/create-listing.dto';
 import { OwnershipService } from '../../ownership/ownership.service';
@@ -22,7 +22,7 @@ import { User } from 'src/user/user.entity';
 @Injectable()
 export class ListingService {
   private readonly logger = new Logger(ListingService.name);
-  private readonly listingMutex = new Mutex(); // Central lock for listing operations
+  private readonly listingMutex = new Mutex();
 
   constructor(
     @InjectRepository(SecondaryMarketListing)
@@ -42,11 +42,10 @@ export class ListingService {
       where: {
         sellerId: userId,
         assetId: assetId,
-        status: ListingStatus.ACTIVE, // or PENDING
+        status: ListingStatus.ACTIVE,
       },
     });
 
-    // Sum up all units currently held in listings by this user
     return activeListings.reduce((sum, l) => sum + Number(l.unitsForSale), 0);
   }
 
@@ -57,7 +56,6 @@ export class ListingService {
     listingId: string,
   ): Promise<SecondaryMarketListing> {
     return await this.listingMutex.runExclusive(async () => {
-      // 1. Verify existence on-chain
       const isActive = await this.blockchainService.isListingActive(listingId);
       if (!isActive) {
         throw new BadRequestException(
@@ -70,7 +68,6 @@ export class ListingService {
       });
       if (!asset) throw new NotFoundException('Asset not found.');
 
-      // 2. Perform Atomic Database Transaction
       return await this.listingRepo.manager.transaction(
         async (manager: EntityManager) => {
           const listing = manager.create(SecondaryMarketListing, {
@@ -105,51 +102,71 @@ export class ListingService {
     sellerId: string,
     dto: CreateListingDto,
   ): Promise<string> {
-    // 1. Wrap in Mutex to ensure the check-and-save happens atomically
     return await this.listingMutex.runExclusive(async () => {
-      // 2. Get total owned units
-      const ownedUnits = await this.ownershipService.getUserUnitsForAsset(
-        sellerId,
-        dto.assetId,
-      );
+      return await this.listingRepo.manager.transaction(async (manager) => {
+        // 🛡️ Clean up stale PENDING listings older than 10 minutes, safely excluding those referenced in trades
+        await manager
+          .createQueryBuilder()
+          .delete()
+          .from(SecondaryMarketListing)
+          .where(
+            'sellerId = :sellerId AND assetId = :assetId AND status = :status AND createdAt < :threshold',
+            {
+              sellerId,
+              assetId: dto.assetId,
+              status: ListingStatus.PENDING,
+              threshold: new Date(Date.now() - 10 * 60 * 1000),
+            },
+          )
+          .andWhere('id NOT IN (SELECT "listingId" FROM "trades")')
+          .execute();
 
-      // 3. Get units already tied up in existing listings (Active or Pending)
-      const existingListings = await this.listingRepo.find({
-        where: {
-          sellerId: sellerId,
-          assetId: dto.assetId,
-          status: ListingStatus.ACTIVE, // Or PENDING if you consider those 'locked'
-        },
-      });
-
-      const reservedUnits = existingListings.reduce(
-        (sum, l) => sum + Number(l.unitsForSale),
-        0,
-      );
-
-      // 4. Calculate actual available units
-      const availableUnits = Number(ownedUnits) - reservedUnits;
-
-      if (Number(dto.unitsForSale) > availableUnits) {
-        throw new BadRequestException(
-          `Insufficient available units. You own ${ownedUnits}, but have ${reservedUnits} units already listed.`,
+        const ownedUnits = await this.ownershipService.getUserUnitsForAsset(
+          sellerId,
+          dto.assetId,
         );
-      }
 
-      // 5. Proceed with creation
-      const listingId = crypto.randomUUID();
-      const listing = this.listingRepo.create({
-        id: listingId,
-        sellerId,
-        assetId: dto.assetId,
-        unitsForSale: dto.unitsForSale,
-        pricePerUnit: dto.pricePerUnit,
-        status: ListingStatus.PENDING,
-        blockchainStatus: 'PENDING',
+        const existingListings = await manager.find(SecondaryMarketListing, {
+          where: [
+            { sellerId, assetId: dto.assetId, status: ListingStatus.ACTIVE },
+            { sellerId, assetId: dto.assetId, status: ListingStatus.PENDING },
+          ],
+          lock: { mode: 'pessimistic_write' },
+        });
+
+        const reservedUnits = existingListings.reduce(
+          (sum, l) => sum + Number(l.unitsForSale),
+          0,
+        );
+
+        const availableUnits = Number(ownedUnits) - reservedUnits;
+
+        if (Number(dto.unitsForSale) <= 0) {
+          throw new BadRequestException(
+            'Units for sale must be greater than zero.',
+          );
+        }
+
+        if (Number(dto.unitsForSale) > availableUnits) {
+          throw new BadRequestException(
+            `Insufficient available units. You own ${ownedUnits}, but have ${reservedUnits} units already listed or pending.`,
+          );
+        }
+
+        const listingId = crypto.randomUUID();
+        const listing = manager.create(SecondaryMarketListing, {
+          id: listingId,
+          sellerId,
+          assetId: dto.assetId,
+          unitsForSale: dto.unitsForSale,
+          pricePerUnit: dto.pricePerUnit,
+          status: ListingStatus.PENDING,
+          blockchainStatus: 'PENDING',
+        });
+
+        await manager.save(listing);
+        return listingId;
       });
-
-      await this.listingRepo.save(listing);
-      return listingId;
     });
   }
 
@@ -173,7 +190,6 @@ export class ListingService {
     });
   }
 
-  // --- HELPER METHODS (Unchanged) ---
   async getActiveListingsByAsset(
     assetId: string,
   ): Promise<SecondaryMarketListing[]> {

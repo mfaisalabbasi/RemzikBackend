@@ -1,5 +1,3 @@
-// src/services/blockchain.service.ts
-
 import {
   Injectable,
   Logger,
@@ -33,17 +31,11 @@ export class BlockchainService implements OnModuleInit {
 
   private chainId: number;
 
-  /**
-   * TreasuryVault.deposit(...)
-   */
   private readonly treasuryVaultInterface = new ethers.Interface([
     'function deposit(address stablecoin, uint256 amount) external',
     'event StablecoinDeposited(address indexed investor, bytes32 indexed propertyId, address indexed stablecoin, uint256 amount, uint256 timestamp)',
   ]);
 
-  /**
-   * ERC20 events / read methods.
-   */
   private readonly erc20Interface = new ethers.Interface([
     'event Transfer(address indexed from, address indexed to, uint256 value)',
     'function decimals() view returns (uint8)',
@@ -73,14 +65,6 @@ export class BlockchainService implements OnModuleInit {
       throw new Error(`Invalid CHAIN_ID: ${this.chainId}`);
     }
 
-    /**
-     * IMPORTANT:
-     *
-     * Do not use "base-mainnet" as the network name when running
-     * Hardhat/local development.
-     *
-     * The chainId is authoritative.
-     */
     const networkName =
       this.configService.get<string>('BLOCKCHAIN_NETWORK_NAME') ||
       `remzik-${this.chainId}`;
@@ -95,14 +79,6 @@ export class BlockchainService implements OnModuleInit {
     });
 
     this.adminWallet = new ethers.Wallet(privateKey, this.provider);
-
-    /**
-     * IMPORTANT:
-     *
-     * This signer is ONLY for backend/platform/admin operations.
-     *
-     * It must NEVER be used to sign an investor's primary investment.
-     */
     this.managedSigner = new NonceManager(this.adminWallet);
 
     this.privy = new PrivyClient({
@@ -113,34 +89,24 @@ export class BlockchainService implements OnModuleInit {
     const registryAddress = this.configService.get<string>(
       'COMPLIANCE_CONTRACT_ADDRESS',
     );
-
     const factoryAddress = this.configService.get<string>(
       'ASSET_FACTORY_CONTRACT_ADDRESS',
     );
-
     const marketplaceAddress = this.configService.get<string>(
       'MARKETPLACE_CONTRACT_ADDRESS',
     );
-
     const yieldNotaryAddress = this.configService.get<string>(
       'YIELD_NOTARY_ADDRESS',
     );
 
-    if (!registryAddress) {
+    if (!registryAddress)
       throw new Error('COMPLIANCE_CONTRACT_ADDRESS is missing.');
-    }
-
-    if (!factoryAddress) {
+    if (!factoryAddress)
       throw new Error('ASSET_FACTORY_CONTRACT_ADDRESS is missing.');
-    }
-
-    if (!marketplaceAddress) {
+    if (!marketplaceAddress)
       throw new Error('MARKETPLACE_CONTRACT_ADDRESS is missing.');
-    }
-
-    if (!yieldNotaryAddress) {
+    if (!yieldNotaryAddress)
       throw new Error('YIELD_NOTARY_ADDRESS is missing.');
-    }
 
     this.registryContract = new ethers.Contract(
       registryAddress,
@@ -155,11 +121,11 @@ export class BlockchainService implements OnModuleInit {
     );
 
     const marketplaceAbi = [
-      'function createListing(string calldata listingId, address token, uint256 amount) external',
+      'function createListing(string calldata listingId, address token, address paymentToken, uint256 amount, uint256 pricePerUnit) external',
       'function settleTrade(string calldata listingId, address seller, address buyer, uint256 tradePrice) external',
-      'function executeOnChainTrade(string calldata listingId, address paymentToken, uint256 paymentAmountWei) external',
-      'function listings(string) view returns (address seller, address token, uint256 amount, bool active)',
-      'function getListing(string calldata listingId) view returns (address seller, address token, uint256 amount, bool active)',
+      'function executeOnChainTrade(string calldata listingId, uint256 purchaseAmount) external',
+      'function releaseOffChainEscrowTrade(string calldata listingId, address buyer, uint256 tokenAmount) external',
+      'function getListing(string calldata listingId) view returns (address seller, address token, address paymentToken, uint256 amount, uint256 pricePerUnit, bool active)',
       'function cancelListing(string calldata listingId) external',
     ];
 
@@ -176,10 +142,6 @@ export class BlockchainService implements OnModuleInit {
     );
   }
 
-  // ============================================================
-  // MODULE
-  // ============================================================
-
   async onModuleInit(): Promise<void> {
     const network = await this.provider.getNetwork();
 
@@ -195,10 +157,6 @@ export class BlockchainService implements OnModuleInit {
       `Blockchain Service initialized. chainId=${this.chainId}, admin=${adminAddress}`,
     );
   }
-
-  // ============================================================
-  // BASIC HELPERS
-  // ============================================================
 
   getChainId(): number {
     return this.chainId;
@@ -260,18 +218,6 @@ export class BlockchainService implements OnModuleInit {
     return ethers.id(cleanId);
   }
 
-  // ============================================================
-  // INVESTOR-SIGNED PRIMARY INVESTMENT
-  // ============================================================
-
-  /**
-   * Builds the exact calldata that the INVESTOR's Privy wallet
-   * must sign.
-   *
-   * IMPORTANT:
-   *
-   * This method DOES NOT send the transaction.
-   */
   async buildInvestmentCalldata(params: {
     treasuryVaultAddress: string;
     stablecoinAddress?: string;
@@ -332,11 +278,6 @@ export class BlockchainService implements OnModuleInit {
     };
   }
 
-  /**
-   * Reads ERC20 decimals directly from the token contract.
-   *
-   * Do not hardcode 6/18 when the actual contract can be queried.
-   */
   async getTokenDecimals(tokenAddress: string): Promise<number> {
     const normalized = this.normalizeAddress(tokenAddress, 'tokenAddress');
 
@@ -351,22 +292,13 @@ export class BlockchainService implements OnModuleInit {
     return Number(decimals);
   }
 
-  /**
-   * Reads an investor's stablecoin allowance.
-   *
-   * IMPORTANT:
-   *
-   * This checks the INVESTOR wallet, not adminWallet.
-   */
   async getTokenAllowance(
     tokenAddress: string,
     ownerAddress: string,
     spenderAddress: string,
   ): Promise<bigint> {
     const token = this.normalizeAddress(tokenAddress, 'tokenAddress');
-
     const owner = this.normalizeAddress(ownerAddress, 'ownerAddress');
-
     const spender = this.normalizeAddress(spenderAddress, 'spenderAddress');
 
     const tokenContract = new ethers.Contract(
@@ -380,12 +312,6 @@ export class BlockchainService implements OnModuleInit {
     return BigInt(await tokenContract.allowance(owner, spender));
   }
 
-  /**
-   * Checks whether the investor has enough allowance for
-   * TreasuryVault.deposit().
-   *
-   * This does NOT approve anything.
-   */
   async hasInvestorTokenAllowance(params: {
     tokenAddress: string;
     investorAddress: string;
@@ -401,15 +327,11 @@ export class BlockchainService implements OnModuleInit {
     return allowance >= params.amountWei;
   }
 
-  /**
-   * Reads ERC20 balance.
-   */
   async getTokenBalance(
     tokenAddress: string,
     walletAddress: string,
   ): Promise<bigint> {
     const token = this.normalizeAddress(tokenAddress, 'tokenAddress');
-
     const wallet = this.normalizeAddress(walletAddress, 'walletAddress');
 
     const tokenContract = new ethers.Contract(
@@ -421,14 +343,6 @@ export class BlockchainService implements OnModuleInit {
     return BigInt(await tokenContract.balanceOf(wallet));
   }
 
-  /**
-   * SECURITY-CRITICAL:
-   *
-   * This method verifies the ACTUAL blockchain transaction
-   * submitted by the investor's Privy wallet.
-   *
-   * The backend never signs the transaction.
-   */
   async verifyInvestmentTransaction(params: {
     txHash: string;
     expectedSender: string;
@@ -441,9 +355,7 @@ export class BlockchainService implements OnModuleInit {
   }): Promise<{
     success: boolean;
     status: 'NOT_FOUND' | 'PENDING' | 'FAILED' | 'INVALID' | 'CONFIRMED';
-
     reason?: string;
-
     txHash: string;
     sender?: string;
     target?: string;
@@ -451,17 +363,14 @@ export class BlockchainService implements OnModuleInit {
     tokenAmountWei?: bigint;
   }> {
     const txHash = this.normalizeTxHash(params.txHash);
-
     const expectedSender = this.normalizeAddress(
       params.expectedSender,
       'expectedSender',
     );
-
     const expectedTarget = this.normalizeAddress(
       params.expectedTarget,
       'expectedTarget',
     );
-
     const expectedStablecoin = this.normalizeAddress(
       params.expectedStablecoin,
       'expectedStablecoin',
@@ -479,9 +388,6 @@ export class BlockchainService implements OnModuleInit {
       };
     }
 
-    /**
-     * Verify network.
-     */
     const network = await this.provider.getNetwork();
 
     if (Number(network.chainId) !== this.chainId) {
@@ -490,9 +396,6 @@ export class BlockchainService implements OnModuleInit {
       );
     }
 
-    /**
-     * Verify sender.
-     */
     if (tx.from.toLowerCase() !== expectedSender.toLowerCase()) {
       return {
         success: false,
@@ -504,9 +407,6 @@ export class BlockchainService implements OnModuleInit {
       };
     }
 
-    /**
-     * Verify target.
-     */
     if (!tx.to || tx.to.toLowerCase() !== expectedTarget.toLowerCase()) {
       return {
         success: false,
@@ -518,11 +418,6 @@ export class BlockchainService implements OnModuleInit {
       };
     }
 
-    /**
-     * Verify native value.
-     *
-     * TreasuryVault.deposit() should not receive ETH/native currency.
-     */
     if (tx.value !== 0n) {
       return {
         success: false,
@@ -535,14 +430,6 @@ export class BlockchainService implements OnModuleInit {
       };
     }
 
-    /**
-     * Verify exact calldata.
-     *
-     * This protects against:
-     *
-     * investor signs transaction to correct vault
-     * but calls different deposit parameters.
-     */
     if (tx.data.toLowerCase() !== params.expectedCalldata.toLowerCase()) {
       return {
         success: false,
@@ -556,9 +443,6 @@ export class BlockchainService implements OnModuleInit {
 
     const receipt = await this.provider.getTransactionReceipt(txHash);
 
-    /**
-     * Transaction broadcast but not mined yet.
-     */
     if (!receipt) {
       return {
         success: false,
@@ -570,9 +454,6 @@ export class BlockchainService implements OnModuleInit {
       };
     }
 
-    /**
-     * EVM execution reverted.
-     */
     if (receipt.status !== 1) {
       return {
         success: false,
@@ -583,10 +464,6 @@ export class BlockchainService implements OnModuleInit {
         target: tx.to,
       };
     }
-
-    // ----------------------------------------------------------
-    // Decode deposit calldata
-    // ----------------------------------------------------------
 
     let decodedDeposit: readonly any[];
 
@@ -637,12 +514,7 @@ export class BlockchainService implements OnModuleInit {
       };
     }
 
-    // ----------------------------------------------------------
-    // Verify StablecoinDeposited event
-    // ----------------------------------------------------------
-
     let depositEventFound = false;
-
     let actualStablecoinAmount: bigint | undefined;
 
     for (const log of receipt.logs) {
@@ -657,12 +529,10 @@ export class BlockchainService implements OnModuleInit {
             parsed.args[0],
             'deposit investor',
           );
-
           const stablecoin = this.normalizeAddress(
             parsed.args[2],
             'deposit stablecoin',
           );
-
           const amount = BigInt(parsed.args[3]);
 
           if (
@@ -675,9 +545,7 @@ export class BlockchainService implements OnModuleInit {
           }
         }
       } catch {
-        /**
-         * Not a TreasuryVault event.
-         */
+        // Not a TreasuryVault event.
       }
     }
 
@@ -693,10 +561,6 @@ export class BlockchainService implements OnModuleInit {
       };
     }
 
-    // ----------------------------------------------------------
-    // Verify stablecoin Transfer investor -> vault
-    // ----------------------------------------------------------
-
     let stablecoinTransferFound = false;
 
     for (const log of receipt.logs) {
@@ -711,12 +575,10 @@ export class BlockchainService implements OnModuleInit {
             parsed.args[0],
             'stablecoin transfer from',
           );
-
           const to = this.normalizeAddress(
             parsed.args[1],
             'stablecoin transfer to',
           );
-
           const amount = BigInt(parsed.args[2]);
 
           if (
@@ -729,9 +591,7 @@ export class BlockchainService implements OnModuleInit {
           }
         }
       } catch {
-        /**
-         * Not an ERC20 Transfer event we need.
-         */
+        // Not an ERC20 Transfer event.
       }
     }
 
@@ -748,19 +608,10 @@ export class BlockchainService implements OnModuleInit {
       };
     }
 
-    // ----------------------------------------------------------
-    // Verify AssetToken Transfer vault -> investor
-    // ----------------------------------------------------------
-
     let tokenTransferFound = false;
     let actualTokenAmount: bigint | undefined;
 
     if (params.expectedTokenAddress) {
-      const expectedToken = this.normalizeAddress(
-        params.expectedTokenAddress,
-        'expectedTokenAddress',
-      );
-
       for (const log of receipt.logs) {
         try {
           const parsed = this.erc20Interface.parseLog({
@@ -773,12 +624,10 @@ export class BlockchainService implements OnModuleInit {
               parsed.args[0],
               'asset token transfer from',
             );
-
             const to = this.normalizeAddress(
               parsed.args[1],
               'asset token transfer to',
             );
-
             const amount = BigInt(parsed.args[2]);
 
             if (
@@ -798,9 +647,7 @@ export class BlockchainService implements OnModuleInit {
             }
           }
         } catch {
-          /**
-           * Ignore unrelated logs.
-           */
+          // Ignore unrelated logs.
         }
       }
 
@@ -829,11 +676,6 @@ export class BlockchainService implements OnModuleInit {
     };
   }
 
-  /**
-   * Generic anti-spoofing transaction check.
-   *
-   * Kept for other blockchain workflows.
-   */
   async verifyOnChainIntent(params: {
     txHash: string;
     expectedSender: string;
@@ -846,14 +688,10 @@ export class BlockchainService implements OnModuleInit {
   }> {
     try {
       const txHash = this.normalizeTxHash(params.txHash);
-
       const tx = await this.provider.getTransaction(txHash);
 
       if (!tx) {
-        return {
-          success: false,
-          reason: 'Transaction not found on-chain.',
-        };
+        return { success: false, reason: 'Transaction not found on-chain.' };
       }
 
       const receipt = await this.provider.getTransactionReceipt(txHash);
@@ -866,68 +704,38 @@ export class BlockchainService implements OnModuleInit {
       }
 
       if (receipt.status !== 1) {
-        return {
-          success: false,
-          reason: 'Transaction reverted on-chain.',
-        };
+        return { success: false, reason: 'Transaction reverted on-chain.' };
       }
 
       if (tx.from.toLowerCase() !== params.expectedSender.toLowerCase()) {
-        return {
-          success: false,
-          reason: 'Transaction sender mismatch.',
-        };
+        return { success: false, reason: 'Transaction sender mismatch.' };
       }
 
       if (
         !tx.to ||
         tx.to.toLowerCase() !== params.expectedTarget.toLowerCase()
       ) {
-        return {
-          success: false,
-          reason: 'Transaction target mismatch.',
-        };
+        return { success: false, reason: 'Transaction target mismatch.' };
       }
 
       if (tx.data.toLowerCase() !== params.expectedCalldata.toLowerCase()) {
-        return {
-          success: false,
-          reason: 'Transaction calldata mismatch.',
-        };
+        return { success: false, reason: 'Transaction calldata mismatch.' };
       }
 
       if (
         params.expectedValue !== undefined &&
         tx.value !== BigInt(params.expectedValue)
       ) {
-        return {
-          success: false,
-          reason: 'Transaction native value mismatch.',
-        };
+        return { success: false, reason: 'Transaction native value mismatch.' };
       }
 
       return { success: true };
     } catch (error: any) {
       this.logger.error(`Error verifying on-chain intent: ${error.message}`);
-
-      return {
-        success: false,
-        reason: error.message,
-      };
+      return { success: false, reason: error.message };
     }
   }
 
-  // ============================================================
-  // PRIVY
-  // ============================================================
-
-  /**
-   * IMPORTANT:
-   *
-   * This method is retained for recovery/admin workflows only.
-   *
-   * It must NOT be used as the investor signer for investments.
-   */
   async generateEmbeddedWalletForUser(privyUserId: string): Promise<string> {
     try {
       this.logger.log(
@@ -936,9 +744,7 @@ export class BlockchainService implements OnModuleInit {
 
       const wallet = await this.privy.wallets().create({
         chain_type: 'ethereum',
-        owner: {
-          user_id: privyUserId,
-        },
+        owner: { user_id: privyUserId },
       });
 
       if (!wallet || !wallet.address) {
@@ -946,47 +752,26 @@ export class BlockchainService implements OnModuleInit {
       }
 
       this.logger.log(`Privy recovery wallet created: ${wallet.address}`);
-
       return wallet.address;
     } catch (error: any) {
       this.logger.error(`Privy wallet provisioning failed: ${error.message}`);
-
       throw error;
     }
   }
 
-  /**
-   * SECURITY:
-   *
-   * Never return adminWallet.address for an investor.
-   *
-   * This legacy method is deliberately disabled.
-   */
   async getWalletIdForUser(_privyUserId: string): Promise<string> {
     throw new Error(
       'getWalletIdForUser() cannot return the backend admin signer. Investor transactions must be signed by the investor Privy wallet.',
     );
   }
 
-  // ============================================================
-  // ADMIN STABLECOIN ALLOWANCE
-  // ============================================================
-
-  /**
-   * This method operates on ADMIN wallet funds.
-   *
-   * It must NOT be used to satisfy investor TreasuryVault
-   * approval requirements.
-   */
   async ensureTokenAllowance(
     tokenAddress: string,
     spenderAddress: string,
     amountWei: bigint,
   ): Promise<void> {
     const ownerAddress = await this.adminWallet.getAddress();
-
     const token = this.normalizeAddress(tokenAddress, 'tokenAddress');
-
     const spender = this.normalizeAddress(spenderAddress, 'spenderAddress');
 
     const tokenContract = new ethers.Contract(
@@ -1002,16 +787,13 @@ export class BlockchainService implements OnModuleInit {
       await tokenContract.allowance(ownerAddress, spender),
     );
 
-    if (currentAllowance >= amountWei) {
-      return;
-    }
+    if (currentAllowance >= amountWei) return;
 
     this.logger.warn(
       `Admin stablecoin allowance too low. Approving ${spender}.`,
     );
 
     const tx = await tokenContract.approve(spender, ethers.MaxUint256);
-
     const receipt = await tx.wait();
 
     if (!receipt || receipt.status !== 1) {
@@ -1021,15 +803,6 @@ export class BlockchainService implements OnModuleInit {
     this.logger.log(`Admin stablecoin approval confirmed: ${tx.hash}`);
   }
 
-  // ============================================================
-  // ADMIN SERVER-SIDE TRANSACTIONS
-  // ============================================================
-
-  /**
-   * Backend/admin transaction execution.
-   *
-   * NEVER use this for investor primary investment signing.
-   */
   async executeServerSideTransaction(params: {
     targetContract: string;
     encodedData: string;
@@ -1069,16 +842,11 @@ export class BlockchainService implements OnModuleInit {
       return receipt;
     } catch (error: any) {
       this.logger.error(`Admin blockchain execution failed: ${error.message}`);
-
       throw new InternalServerErrorException(
         `Blockchain execution failed: ${error.message}`,
       );
     }
   }
-
-  // ============================================================
-  // WALLET RECOVERY
-  // ============================================================
 
   async executeWalletRecovery(
     tokenAddress: string,
@@ -1116,45 +884,49 @@ export class BlockchainService implements OnModuleInit {
     }
 
     this.logger.log(`Wallet recovery confirmed: ${tx.hash}`);
-
     return tx.hash;
   }
 
   // ============================================================
-  // MARKETPLACE
+  // MARKETPLACE (FINAL PRODUCTION ALIGNED SETTLEMENT)
   // ============================================================
 
   async settleTrade(
     listingId: string,
     sellerAddress: string,
     buyerAddress: string,
-    priceWei: string,
+    purchaseAmount: string | bigint,
   ) {
-    const tx = await this.marketplaceContract.settleTrade(
+    const tx = await this.marketplaceContract.releaseOffChainEscrowTrade(
       listingId,
-      sellerAddress,
       buyerAddress,
-      BigInt(priceWei),
+      BigInt(purchaseAmount),
     );
 
     const receipt = await tx.wait();
 
     if (!receipt || receipt.status !== 1) {
-      throw new Error(`Trade settlement failed for ${listingId}`);
+      throw new Error(`Off-chain trade settlement failed for ${listingId}`);
     }
 
-    return tx;
+    this.logger.log(`Off-chain escrow asset release confirmed: ${tx.hash}`);
+
+    return receipt;
   }
 
   async createListingOnChain(
     listingId: string,
     tokenAddress: string,
-    amount: string,
+    paymentToken: string,
+    amount: string | bigint,
+    pricePerUnit: string | bigint,
   ) {
     const tx = await this.marketplaceContract.createListing(
       listingId,
       tokenAddress,
+      paymentToken,
       BigInt(amount),
+      BigInt(pricePerUnit),
     );
 
     const receipt = await tx.wait();
@@ -1168,13 +940,11 @@ export class BlockchainService implements OnModuleInit {
 
   async executeOnChainTrade(
     listingId: string,
-    paymentToken: string,
-    paymentAmountWei: string | bigint,
+    purchaseAmount: string | bigint,
   ) {
     const tx = await this.marketplaceContract.executeOnChainTrade(
       listingId,
-      paymentToken,
-      BigInt(paymentAmountWei),
+      BigInt(purchaseAmount),
     );
 
     const receipt = await tx.wait();
@@ -1192,8 +962,7 @@ export class BlockchainService implements OnModuleInit {
     try {
       const listing = await this.marketplaceContract.getListing(listingId);
 
-      const isActive = listing.active ?? listing[3];
-
+      const isActive = listing.active ?? listing[5];
       const seller = listing.seller ?? listing[0];
 
       return Boolean(isActive) && seller !== ethers.ZeroAddress;
@@ -1201,7 +970,6 @@ export class BlockchainService implements OnModuleInit {
       this.logger.error(
         `Listing verification failed for ${listingId}: ${error.message}`,
       );
-
       return false;
     }
   }
@@ -1245,7 +1013,6 @@ export class BlockchainService implements OnModuleInit {
     walletAddress: string,
   ): Promise<string> {
     const balance = await this.getTokenBalance(tokenAddress, walletAddress);
-
     return balance.toString();
   }
 
@@ -1255,13 +1022,11 @@ export class BlockchainService implements OnModuleInit {
 
   async ensureFactoryLinked() {
     const tokenDeployer = await this.factoryContract.tokenDeployer();
-
     const govDeployer = await this.factoryContract.govDeployer();
 
     const envTokenDeployer = this.configService.get<string>(
       'TOKEN_DEPLOYER_ADDRESS',
     );
-
     const envGovDeployer = this.configService.get<string>(
       'GOV_DEPLOYER_ADDRESS',
     );
@@ -1312,20 +1077,15 @@ export class BlockchainService implements OnModuleInit {
     await this.ensureFactoryLinked();
 
     const adminWalletAddress = await this.adminWallet.getAddress();
-
     const factoryAddress = await this.factoryContract.getAddress();
 
     const tokenBytecode = (RemzikAssetTokenABI as any).bytecode;
-
     const govBytecode = (PropertyGovernanceABI as any).bytecode;
 
-    if (!tokenBytecode) {
+    if (!tokenBytecode)
       throw new Error('RemzikAssetToken bytecode is missing.');
-    }
-
-    if (!govBytecode) {
+    if (!govBytecode)
       throw new Error('PropertyGovernance bytecode is missing.');
-    }
 
     const formattedPropertyId =
       typeof propertyId === 'string' &&
@@ -1365,9 +1125,7 @@ export class BlockchainService implements OnModuleInit {
       BigInt(supply),
       formattedPropertyId,
       adminWalletAddress,
-      {
-        gasLimit: 5_000_000n,
-      },
+      { gasLimit: 5_000_000n },
     );
 
     const receipt = await tx.wait();
@@ -1386,11 +1144,8 @@ export class BlockchainService implements OnModuleInit {
 
         if (parsedLog?.name === 'AssetPodDeployed') {
           deployedTokenAddress = parsedLog.args.tokenAddress;
-
           deployedTreasuryAddress = parsedLog.args.treasuryAddress;
-
           deployedGovAddress = parsedLog.args.governanceAddress;
-
           break;
         }
       } catch {
@@ -1421,7 +1176,6 @@ export class BlockchainService implements OnModuleInit {
 
     if (existingToken === ethers.ZeroAddress) {
       const linkTx = await govContract.setToken(deployedTokenAddress);
-
       const linkReceipt = await linkTx.wait();
 
       if (!linkReceipt || linkReceipt.status !== 1) {
@@ -1435,10 +1189,6 @@ export class BlockchainService implements OnModuleInit {
       governanceAddress: deployedGovAddress,
     };
   }
-
-  // ============================================================
-  // ADMIN PRICE ORACLE
-  // ============================================================
 
   async updatePriceBandOnChain(tokenAddress: string, min: string, max: string) {
     const oracleAddress = this.configService.get<string>(
@@ -1472,15 +1222,9 @@ export class BlockchainService implements OnModuleInit {
     return tx;
   }
 
-  // ============================================================
-  // COMPLIANCE
-  // ============================================================
-
   async registerIdentity(investorWallet: string, status: boolean) {
     const wallet = this.normalizeAddress(investorWallet, 'investorWallet');
-
     const tx = await this.registryContract.registerIdentity(wallet, status);
-
     const receipt = await tx.wait();
 
     if (!receipt || receipt.status !== 1) {
@@ -1492,9 +1236,7 @@ export class BlockchainService implements OnModuleInit {
 
   async toggleFreeze(investorWallet: string, shouldFreeze: boolean) {
     const wallet = this.normalizeAddress(investorWallet, 'investorWallet');
-
     const tx = await this.registryContract.toggleFreeze(wallet, shouldFreeze);
-
     const receipt = await tx.wait();
 
     if (!receipt || receipt.status !== 1) {
@@ -1506,44 +1248,23 @@ export class BlockchainService implements OnModuleInit {
 
   async isVerified(investorWallet: string): Promise<boolean> {
     const wallet = this.normalizeAddress(investorWallet, 'investorWallet');
-
     return Boolean(await this.registryContract.isClearToTrade(wallet));
   }
 
-  /**
-   * IMPORTANT:
-   *
-   * Automatic KYC registration should only be called from an
-   * explicitly authorized compliance workflow.
-   */
   async ensureWalletWhitelisted(walletAddress: string) {
     const wallet = this.normalizeAddress(walletAddress, 'walletAddress');
-
     const isClear = await this.registryContract.isClearToTrade(wallet);
 
     if (!isClear) {
       this.logger.warn(`Wallet ${wallet} is not whitelisted.`);
-
       const tx = await this.registerIdentity(wallet, true);
-
       this.logger.log(`Wallet ${wallet} registered on-chain: ${tx.hash}`);
-
       return tx;
     }
 
     return undefined;
   }
 
-  // ============================================================
-  // TREASURY TOKEN RELEASE
-  // ============================================================
-
-  /**
-   * LEGACY / ADMIN WORKFLOW.
-   *
-   * This is NOT used by the new investor-signed primary
-   * investment flow.
-   */
   async transferFromTreasuryVault(
     tokenAddress: string,
     treasuryAddress: string,
@@ -1552,9 +1273,7 @@ export class BlockchainService implements OnModuleInit {
     decimals = 18,
   ): Promise<ethers.TransactionReceipt> {
     const token = this.normalizeAddress(tokenAddress, 'tokenAddress');
-
     const treasury = this.normalizeAddress(treasuryAddress, 'treasuryAddress');
-
     const recipient = this.normalizeAddress(to, 'recipient');
 
     const tokenContract = new ethers.Contract(
@@ -1567,13 +1286,9 @@ export class BlockchainService implements OnModuleInit {
     );
 
     const isPaused = await tokenContract.paused().catch(() => false);
-
-    if (isPaused) {
-      throw new Error('Asset token is paused.');
-    }
+    if (isPaused) throw new Error('Asset token is paused.');
 
     const parsedAmount = ethers.parseUnits(amountUnits, decimals);
-
     const vaultBalance = BigInt(await tokenContract.balanceOf(treasury));
 
     if (vaultBalance < parsedAmount) {
@@ -1604,10 +1319,6 @@ export class BlockchainService implements OnModuleInit {
 
     return receipt;
   }
-
-  // ============================================================
-  // YIELD
-  // ============================================================
 
   async recordYieldOnChain(
     batchId: string,
@@ -1646,9 +1357,7 @@ export class BlockchainService implements OnModuleInit {
       propertyAddress,
       merkleRoot,
       BigInt(totalOnChainAmountWei),
-      {
-        gasLimit: 300_000n,
-      },
+      { gasLimit: 300_000n },
     );
 
     const receipt = await tx.wait();
@@ -1660,13 +1369,8 @@ export class BlockchainService implements OnModuleInit {
     }
 
     this.logger.log(`Merkle root anchored: ${tx.hash}`);
-
     return receipt;
   }
-
-  // ============================================================
-  // GOVERNANCE
-  // ============================================================
 
   async triggerLiquidationOnChain(governanceAddress: string) {
     const governance = this.normalizeAddress(
@@ -1693,13 +1397,6 @@ export class BlockchainService implements OnModuleInit {
 
       return tx;
     } catch (error: any) {
-      /**
-       * DO NOT return a fake transaction hash.
-       *
-       * If the contract is already liquidated, the service layer
-       * should explicitly inspect on-chain state and return an
-       * already-liquidated status.
-       */
       if (
         error.message?.includes('EnforcedPause') ||
         error.data === '0xd93c0665'
@@ -1707,7 +1404,6 @@ export class BlockchainService implements OnModuleInit {
         this.logger.warn(
           `Governance contract ${governance} appears to already be paused/liquidated.`,
         );
-
         return {
           alreadyLiquidated: true,
           governanceAddress: governance,
@@ -1732,7 +1428,6 @@ export class BlockchainService implements OnModuleInit {
     );
 
     const tx = await governanceContract.createProposal(description, duration);
-
     const receipt = await tx.wait();
 
     if (!receipt || receipt.status !== 1) {
@@ -1750,7 +1445,6 @@ export class BlockchainService implements OnModuleInit {
     );
 
     const tx = await governanceContract.executeProposal(proposalId);
-
     const receipt = await tx.wait();
 
     if (!receipt || receipt.status !== 1) {
@@ -1772,11 +1466,14 @@ export class BlockchainService implements OnModuleInit {
     return governanceContract.proposals(proposalId);
   }
 
-  // ============================================================
-  // ON-CHAIN MARKET / GOVERNANCE HELPERS
-  // ============================================================
-
   async updatePriceBand(tokenAddress: string, min: string, max: string) {
     return this.updatePriceBandOnChain(tokenAddress, min, max);
+  }
+
+  async getTransactionReceipt(
+    txHash: string,
+  ): Promise<ethers.TransactionReceipt | null> {
+    const cleanHash = this.normalizeTxHash(txHash);
+    return await this.provider.getTransactionReceipt(cleanHash);
   }
 }

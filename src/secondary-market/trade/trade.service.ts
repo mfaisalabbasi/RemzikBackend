@@ -2,11 +2,14 @@ import {
   Injectable,
   BadRequestException,
   NotFoundException,
+  ForbiddenException,
+  ConflictException,
+  InternalServerErrorException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, EntityManager } from 'typeorm';
 import { ethers } from 'ethers';
-import { Trade } from './trade.entity';
+import { Trade, SettlementMode } from './trade.entity';
 import { TradeStatus } from './enums/trade-status.enum';
 import { TradeLockService } from './trade-lock.service';
 import { OwnershipService } from 'src/ownership/ownership.service';
@@ -27,6 +30,7 @@ import { ConfigService } from '@nestjs/config';
 @Injectable()
 export class TradeService {
   private readonly settlementMutex = new Mutex();
+
   constructor(
     @InjectRepository(Trade)
     private readonly tradeRepo: Repository<Trade>,
@@ -60,15 +64,283 @@ export class TradeService {
       pricePerUnit: dto.pricePerUnit,
       totalPrice: Number(dto.units) * Number(dto.pricePerUnit),
       status: TradeStatus.PENDING,
+      settlementMode: SettlementMode.OFF_CHAIN,
     });
 
     return this.tradeRepo.save(trade);
   }
 
+  // =========================================================
+  // 1. CREATE ON-CHAIN TRADE INTENT (PENDING STATUS)
+  // =========================================================
+  async createTradeIntent(
+    listingId: string,
+    buyer: InvestorProfile,
+    settlementMode: 'OFF_CHAIN' | 'ON_CHAIN' = 'ON_CHAIN',
+  ) {
+    if (!this.tradeLockService.lock(listingId)) {
+      throw new BadRequestException('Transaction in progress...');
+    }
+
+    try {
+      return await this.tradeRepo.manager.transaction(
+        async (manager: EntityManager) => {
+          const listing = await manager
+            .getRepository(SecondaryMarketListing)
+            .createQueryBuilder('listing')
+            .setLock('pessimistic_write')
+            .where('listing.id = :listingId', { listingId })
+            .getOne();
+
+          if (!listing || listing.status !== ListingStatus.ACTIVE) {
+            throw new BadRequestException('Listing is no longer active.');
+          }
+
+          const sellerProfile = await this.ownershipService.getInvestorByUserId(
+            listing.sellerId,
+          );
+
+          const totalPrice =
+            Number(listing.unitsForSale) * Number(listing.pricePerUnit);
+
+          const databaseWallet = buyer.user?.walletAddress;
+          if (!databaseWallet || !ethers.isAddress(databaseWallet)) {
+            throw new BadRequestException('Buyer wallet is not configured.');
+          }
+
+          const trade = manager.create(Trade, {
+            buyer,
+            seller: sellerProfile,
+            listingId: listing.id,
+            asset: { id: listing.assetId } as Asset,
+            units: Number(listing.unitsForSale),
+            pricePerUnit: listing.pricePerUnit,
+            totalPrice,
+            status: TradeStatus.PENDING,
+            settlementMode:
+              settlementMode === 'ON_CHAIN'
+                ? SettlementMode.ON_CHAIN
+                : SettlementMode.OFF_CHAIN,
+            executedAt: new Date(),
+          });
+
+          const savedTrade = await manager.save(Trade, trade);
+
+          listing.status = ListingStatus.PENDING;
+          await manager.save(SecondaryMarketListing, listing);
+
+          return {
+            success: true,
+            tradeId: savedTrade.id,
+            status: TradeStatus.PENDING,
+            settlementMode: savedTrade.settlementMode,
+            listingId: listing.id,
+            totalPrice,
+          };
+        },
+      );
+    } finally {
+      this.tradeLockService.unlock(listingId);
+    }
+  }
+
+  // =========================================================
+  // 2. SUBMIT ON-CHAIN TRANSACTION HASH
+  // =========================================================
+  async submitOnChainTransaction(
+    userId: string,
+    tradeId: string,
+    txHash: string,
+  ) {
+    if (!txHash || !ethers.isHexString(txHash, 32)) {
+      throw new BadRequestException('Invalid transaction hash.');
+    }
+
+    const normalizedHash = txHash.toLowerCase();
+
+    const trade = await this.tradeRepo.findOne({
+      where: { id: tradeId },
+      relations: ['buyer', 'buyer.user'],
+    });
+
+    if (!trade) {
+      throw new NotFoundException('Trade intent record not found.');
+    }
+
+    if (trade.buyer?.user?.id !== userId) {
+      throw new ForbiddenException(
+        'Unauthorized to submit transaction for this trade.',
+      );
+    }
+
+    if (trade.status === TradeStatus.COMPLETED) {
+      if (trade.txHash?.toLowerCase() === normalizedHash) {
+        return {
+          success: true,
+          tradeId,
+          status: TradeStatus.COMPLETED,
+          txHash: trade.txHash,
+        };
+      }
+      throw new ConflictException(
+        'Trade has already been completed with another transaction.',
+      );
+    }
+
+    await this.tradeRepo.manager.transaction(async (manager) => {
+      const locked = await manager.findOne(Trade, {
+        where: { id: tradeId },
+        lock: { mode: 'pessimistic_write' },
+      });
+
+      if (!locked) {
+        throw new NotFoundException('Trade not found.');
+      }
+
+      if (locked.txHash && locked.txHash.toLowerCase() !== normalizedHash) {
+        throw new ConflictException(
+          'A different transaction hash is already linked to this trade.',
+        );
+      }
+
+      locked.txHash = normalizedHash;
+      locked.settlementMode = SettlementMode.ON_CHAIN;
+      await manager.save(Trade, locked);
+    });
+
+    return {
+      success: true,
+      tradeId,
+      status: trade.status,
+      txHash: normalizedHash,
+    };
+  }
+
+  // =========================================================
+  // 3. VERIFY ON-CHAIN TRANSACTION & FINALIZE OWNERSHIP
+  // =========================================================
+  async verifyOnChainTrade(tradeId: string, txHash: string) {
+    const trade = await this.tradeRepo.findOne({
+      where: { id: tradeId },
+      relations: ['buyer', 'buyer.user', 'seller', 'seller.user', 'asset'],
+    });
+
+    if (!trade) {
+      throw new NotFoundException('Trade record not found.');
+    }
+
+    if (trade.status === TradeStatus.COMPLETED) {
+      return {
+        success: true,
+        tradeId,
+        status: TradeStatus.COMPLETED,
+        txHash: trade.txHash,
+      };
+    }
+
+    const provider = this.blockchainService.getProvider();
+    const receipt = await provider.getTransactionReceipt(txHash);
+
+    if (!receipt) {
+      throw new BadRequestException('Transaction not mined yet.');
+    }
+
+    if (receipt.status !== 1) {
+      throw new BadRequestException('On-chain trade transaction reverted.');
+    }
+
+    return await this.tradeRepo.manager.transaction(
+      async (manager: EntityManager) => {
+        const lockedTrade = await manager.findOne(Trade, {
+          where: { id: tradeId },
+          lock: { mode: 'pessimistic_write' },
+        });
+
+        if (!lockedTrade) {
+          throw new NotFoundException('Trade not found.');
+        }
+
+        if (lockedTrade.status === TradeStatus.COMPLETED) {
+          return {
+            success: true,
+            tradeId,
+            status: TradeStatus.COMPLETED,
+            txHash: lockedTrade.txHash,
+          };
+        }
+
+        await this.ownershipService.removeUnits(
+          trade.seller.id,
+          trade.asset.id,
+          trade.units,
+          manager,
+        );
+
+        await this.ownershipService.addUnits(
+          trade.buyer,
+          trade.asset.id,
+          trade.units,
+          manager,
+        );
+
+        lockedTrade.status = TradeStatus.COMPLETED;
+        lockedTrade.txHash = txHash.toLowerCase();
+        lockedTrade.settlementMode = SettlementMode.ON_CHAIN;
+        const savedTrade = await manager.save(Trade, lockedTrade);
+
+        await manager.update(
+          SecondaryMarketListing,
+          { id: trade.listingId },
+          { status: ListingStatus.SOLD },
+        );
+
+        await this.auditService.log(
+          {
+            adminId: trade.buyer.user.id,
+            targetId: savedTrade.id,
+            action: AdminAction.TRADE_COMPLETED,
+            reason: `On-chain atomic trade intent verified successfully (TX: ${txHash})`,
+          },
+          manager,
+        );
+
+        return {
+          success: true,
+          tradeId,
+          status: TradeStatus.COMPLETED,
+          txHash,
+        };
+      },
+    );
+  }
+
+  // =========================================================
+  // 4. LIVE STATUS POLLING
+  // =========================================================
+  async getLiveStatus(tradeId: string, userId: string) {
+    const trade = await this.tradeRepo.findOne({
+      where: { id: tradeId },
+      relations: ['buyer', 'buyer.user', 'seller', 'seller.user', 'asset'],
+    });
+
+    if (!trade) {
+      throw new NotFoundException('Trade record not found.');
+    }
+
+    if (trade.buyer?.user?.id !== userId && trade.seller?.user?.id !== userId) {
+      throw new ForbiddenException('Unauthorized to view this trade status.');
+    }
+
+    return trade;
+  }
+
+  // =========================================================
+  // 5. LEGACY/FALLBACK EXECUTE & INDEXER SYNC METHODS
+  // =========================================================
   async executeTrade(
     listingId: string,
     buyer: InvestorProfile,
-    settlementMode: 'OFF_CHAIN' | 'ON_CHAIN' = 'OFF_CHAIN', // Default to off-chain for backwards compatibility
+    settlementMode: 'OFF_CHAIN' | 'ON_CHAIN' = 'OFF_CHAIN',
   ): Promise<Trade> {
     if (!this.tradeLockService.lock(listingId)) {
       throw new BadRequestException('Transaction in progress...');
@@ -95,8 +367,6 @@ export class TradeService {
           );
 
           if (settlementMode === 'ON_CHAIN') {
-            // --- ON-CHAIN ATOMIC PATH ---
-            // 1. Verify buyer has enough token allowance for MockUSDC and is whitelisted
             const asset = await manager.findOne(Asset, {
               where: { id: listing.assetId },
             });
@@ -108,7 +378,6 @@ export class TradeService {
             const marketplaceAddress =
               this.blockchainService.getMarketplaceAddress();
 
-            // Check buyer's MockUSDC allowance towards Marketplace
             const buyerAllowance = await this.blockchainService.getAllowance(
               stablecoinAddress,
               buyer.user.walletAddress!,
@@ -121,14 +390,6 @@ export class TradeService {
               );
             }
 
-            // 2. Execute directly on-chain via Smart Contract (passing 6 decimals for MockUSDC)
-            const receipt = await this.blockchainService.executeOnChainTrade(
-              listingId,
-              stablecoinAddress,
-              ethers.parseUnits(totalPrice.toString(), 6).toString(),
-            );
-
-            // 3. Record completed Trade in DB immediately since settlement is atomic on-chain
             const trade = manager.create(Trade, {
               buyer,
               seller: sellerProfile,
@@ -137,28 +398,14 @@ export class TradeService {
               units: Number(listing.unitsForSale),
               pricePerUnit: listing.pricePerUnit,
               totalPrice,
-              status: TradeStatus.COMPLETED,
-              txHash: receipt.hash,
+              status: TradeStatus.LOCKED,
+              settlementMode: SettlementMode.ON_CHAIN,
               executedAt: new Date(),
             });
 
             const savedTrade = await manager.save(trade);
 
-            // 4. Mirror state change in internal off-chain ledger/ownership tables for UI consistency
-            await this.ownershipService.removeUnits(
-              sellerProfile.id,
-              listing.assetId,
-              Number(listing.unitsForSale),
-              manager,
-            );
-            await this.ownershipService.addUnits(
-              buyer,
-              listing.assetId,
-              Number(listing.unitsForSale),
-              manager,
-            );
-
-            listing.status = ListingStatus.SOLD;
+            listing.status = ListingStatus.PENDING;
             await manager.save(listing);
 
             await this.auditService.log(
@@ -166,15 +413,14 @@ export class TradeService {
                 adminId: buyer.user.id,
                 targetId: savedTrade.id,
                 action: AdminAction.TRADE_COMPLETED,
-                reason: `On-chain atomic trade settled successfully (TX: ${receipt.hash})`,
+                reason: `On-chain intent trade initialized, awaiting transaction submission.`,
               },
               manager,
             );
 
             return savedTrade;
           } else {
-            // --- EXISTING OFF-CHAIN ESCROW PATH (Untouched) ---
-            const buyerBalance = await this.walletService.getAvailableBalance(
+            const buyerBalance = await this.walletService.getBalance(
               buyer.user.id,
             );
 
@@ -191,6 +437,7 @@ export class TradeService {
               pricePerUnit: listing.pricePerUnit,
               totalPrice,
               status: TradeStatus.LOCKED,
+              settlementMode: SettlementMode.OFF_CHAIN,
               executedAt: new Date(),
             });
 
@@ -217,9 +464,91 @@ export class TradeService {
     }
   }
 
+  async syncOnChainTrade(
+    listingId: string,
+    buyer: InvestorProfile,
+    txHash: string,
+  ): Promise<Trade> {
+    return await this.tradeRepo.manager.transaction(
+      async (manager: EntityManager) => {
+        let trade = await manager.findOne(Trade, {
+          where: { listingId, status: TradeStatus.PENDING },
+          relations: ['seller', 'buyer', 'asset'],
+          lock: { mode: 'pessimistic_write' },
+        });
+
+        const listing = await manager
+          .getRepository(SecondaryMarketListing)
+          .createQueryBuilder('listing')
+          .setLock('pessimistic_write')
+          .where('listing.id = :listingId', { listingId })
+          .getOne();
+
+        if (!listing) {
+          throw new NotFoundException('Listing not found');
+        }
+
+        const totalPrice =
+          Number(listing.unitsForSale) * Number(listing.pricePerUnit);
+        const sellerProfile = await this.ownershipService.getInvestorByUserId(
+          listing.sellerId,
+        );
+
+        if (!trade) {
+          trade = manager.create(Trade, {
+            buyer,
+            seller: sellerProfile,
+            listingId: listing.id,
+            asset: { id: listing.assetId } as any,
+            units: Number(listing.unitsForSale),
+            pricePerUnit: listing.pricePerUnit,
+            totalPrice,
+            status: TradeStatus.PENDING,
+            settlementMode: SettlementMode.ON_CHAIN,
+            executedAt: new Date(),
+          });
+          trade = await manager.save(Trade, trade);
+        }
+
+        trade.status = TradeStatus.COMPLETED;
+        trade.txHash = txHash;
+        trade.settlementMode = SettlementMode.ON_CHAIN;
+        const savedTrade = await manager.save(Trade, trade);
+
+        await this.ownershipService.removeUnits(
+          sellerProfile.id,
+          listing.assetId,
+          Number(listing.unitsForSale),
+          manager,
+        );
+
+        await this.ownershipService.addUnits(
+          buyer,
+          listing.assetId,
+          Number(listing.unitsForSale),
+          manager,
+        );
+
+        listing.status = ListingStatus.SOLD;
+        await manager.save(SecondaryMarketListing, listing);
+
+        await this.auditService.log(
+          {
+            adminId: buyer.user.id,
+            targetId: savedTrade.id,
+            action: AdminAction.TRADE_COMPLETED,
+            reason: `On-chain atomic trade synced successfully via indexer (TX: ${txHash})`,
+          },
+          manager,
+        );
+
+        return savedTrade;
+      },
+    );
+  }
+
   async settleTrade(tradeId: string, currentUserId: string): Promise<Trade> {
     return await this.settlementMutex.runExclusive(async () => {
-      // 1. Fetch record for validation
       const trade = await this.tradeRepo.findOne({
         where: { id: tradeId },
         relations: ['seller', 'seller.user', 'buyer', 'buyer.user', 'asset'],
@@ -227,48 +556,29 @@ export class TradeService {
 
       if (!trade || trade.buyer.user.id !== currentUserId)
         throw new BadRequestException('Unauthorized or trade not found');
-      if (trade.status !== TradeStatus.LOCKED)
+      if (
+        trade.status !== TradeStatus.LOCKED &&
+        trade.status !== TradeStatus.PENDING
+      )
         throw new BadRequestException(
           `Cannot settle trade in ${trade.status} status`,
         );
-
-      // 2. PRE-FLIGHT ALLOWANCE CHECK
-      const marketplaceAddress = this.blockchainService.getMarketplaceAddress();
-      const currentAllowance = await this.blockchainService.getAllowance(
-        trade.asset.tokenAddress,
-        trade.seller.user.walletAddress!,
-        marketplaceAddress,
-      );
-
-      if (currentAllowance < BigInt(trade.units)) {
-        throw new BadRequestException(
-          'Seller allowance insufficient. Trade aborted.',
-        );
-      }
-
-      // 3. Perform Blockchain Settlement (passing 6 decimals for MockUSDC)
-      const priceInUnits = ethers
-        .parseUnits(trade.totalPrice.toString(), 6)
-        .toString();
 
       const receipt = await this.blockchainService.settleTrade(
         trade.listingId,
         trade.seller.user.walletAddress!,
         trade.buyer.user.walletAddress!,
-        priceInUnits,
+        trade.units.toString(),
       );
 
-      // 4. Atomic Database Update
       return await this.tradeRepo.manager.transaction(async (manager) => {
         const txTrade = await manager.findOne(Trade, {
           where: { id: tradeId },
           lock: { mode: 'pessimistic_write' },
         });
 
-        if (!txTrade || txTrade.status !== TradeStatus.LOCKED)
-          throw new Error('Trade already resolved or state mismatch.');
+        if (!txTrade) throw new Error('Trade not found.');
 
-        // Escrow and Wallet logic
         const escrow = await manager.findOne(Escrow, { where: { tradeId } });
         if (escrow) {
           await this.escrowService.releaseEscrow(escrow.id, manager);
@@ -280,7 +590,6 @@ export class TradeService {
           );
         }
 
-        // Ownership and Status Updates
         await this.ownershipService.removeUnits(
           trade.seller.id,
           trade.asset.id,
@@ -296,7 +605,8 @@ export class TradeService {
 
         txTrade.status = TradeStatus.COMPLETED;
         txTrade.txHash = receipt.hash;
-        await manager.save(txTrade);
+        txTrade.settlementMode = SettlementMode.OFF_CHAIN;
+        await manager.save(Trade, txTrade);
 
         await manager.update(
           SecondaryMarketListing,
@@ -309,7 +619,7 @@ export class TradeService {
             adminId: currentUserId,
             targetId: trade.id,
             action: AdminAction.TRADE_COMPLETED,
-            reason: `Settlement finalized on-chain (TX: ${receipt.hash}).`,
+            reason: `Off-chain trade escrow settlement finalized on-chain (TX: ${receipt.hash}).`,
           },
           manager,
         );
@@ -331,6 +641,8 @@ export class TradeService {
       where: [
         { buyer: { user: { id: userId } }, status: TradeStatus.LOCKED },
         { seller: { user: { id: userId } }, status: TradeStatus.LOCKED },
+        { buyer: { user: { id: userId } }, status: TradeStatus.PENDING },
+        { seller: { user: { id: userId } }, status: TradeStatus.PENDING },
       ],
       relations: [
         'seller',
@@ -350,86 +662,13 @@ export class TradeService {
       relations: ['buyer', 'seller', 'buyer.user', 'seller.user'],
     });
     if (!trade) throw new BadRequestException('Trade record not found');
-    if (trade.status !== TradeStatus.LOCKED)
-      throw new BadRequestException('Only LOCKED trades can be disputed.');
+    if (
+      trade.status !== TradeStatus.LOCKED &&
+      trade.status !== TradeStatus.PENDING
+    )
+      throw new BadRequestException(
+        'Only LOCKED or PENDING trades can be disputed.',
+      );
     return trade;
-  }
-
-  async syncOnChainTrade(
-    listingId: string,
-    buyer: InvestorProfile,
-    txHash: string,
-  ): Promise<Trade> {
-    return await this.tradeRepo.manager.transaction(
-      async (manager: EntityManager) => {
-        // 1. Fetch and lock the listing
-        const listing = await manager
-          .getRepository(SecondaryMarketListing)
-          .createQueryBuilder('listing')
-          .setLock('pessimistic_write')
-          .where('listing.id = :listingId', { listingId })
-          .getOne();
-
-        if (!listing || listing.status !== ListingStatus.ACTIVE) {
-          throw new BadRequestException(
-            'Listing is no longer active or already processed',
-          );
-        }
-
-        const totalPrice =
-          Number(listing.unitsForSale) * Number(listing.pricePerUnit);
-        const sellerProfile = await this.ownershipService.getInvestorByUserId(
-          listing.sellerId,
-        );
-
-        // 2. Create the completed Trade record with the frontend's txHash
-        const trade = manager.create(Trade, {
-          buyer,
-          seller: sellerProfile,
-          listingId: listing.id,
-          asset: { id: listing.assetId } as any,
-          units: Number(listing.unitsForSale),
-          pricePerUnit: listing.pricePerUnit,
-          totalPrice,
-          status: TradeStatus.COMPLETED,
-          txHash: txHash,
-          executedAt: new Date(),
-        });
-
-        const savedTrade = await manager.save(trade);
-
-        // 3. Mirror the blockchain state change in your internal database tables
-        await this.ownershipService.removeUnits(
-          sellerProfile.id,
-          listing.assetId,
-          Number(listing.unitsForSale),
-          manager,
-        );
-
-        await this.ownershipService.addUnits(
-          buyer,
-          listing.assetId,
-          Number(listing.unitsForSale),
-          manager,
-        );
-
-        // 4. Mark listing as SOLD
-        listing.status = ListingStatus.SOLD;
-        await manager.save(listing);
-
-        // 5. Audit log
-        await this.auditService.log(
-          {
-            adminId: buyer.user.id,
-            targetId: savedTrade.id,
-            action: AdminAction.TRADE_COMPLETED,
-            reason: `On-chain atomic trade synced successfully via frontend (TX: ${txHash})`,
-          },
-          manager,
-        );
-
-        return savedTrade;
-      },
-    );
   }
 }
