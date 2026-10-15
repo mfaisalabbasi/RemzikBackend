@@ -168,4 +168,22 @@ export class AuthController {
       privyUserId: result.privyUserId,
     };
   }
+  @UseGuards(JwtAuthGuard)
+  @Post('provision-wallet')
+  async provisionWallet(@Req() req: Request & { user?: any }) {
+    const userId = req.user?.userId;
+    if (!userId) {
+      throw new UnauthorizedException('Authenticated user not found.');
+    }
+
+    // Automatically checks or provisions the Privy wallet server-side
+    const result =
+      await this.walletProvisionService.provisionMobileWallet(userId);
+
+    return {
+      success: true,
+      walletAddress: result.walletAddress,
+      privyUserId: result.privyUserId,
+    };
+  }
 }

@@ -170,7 +170,10 @@ export class ListingService {
     });
   }
 
-  async confirmListing(listingId: string): Promise<SecondaryMarketListing> {
+  async confirmListing(
+    listingId: string,
+    txHash?: string,
+  ): Promise<SecondaryMarketListing> {
     return await this.listingMutex.runExclusive(async () => {
       const isActive = await this.blockchainService.isListingActive(listingId);
       if (!isActive)
@@ -185,6 +188,9 @@ export class ListingService {
 
       listing.status = ListingStatus.ACTIVE;
       listing.blockchainStatus = 'CONFIRMED';
+      if (txHash) {
+        listing.txHash = txHash;
+      }
 
       return await this.listingRepo.save(listing);
     });

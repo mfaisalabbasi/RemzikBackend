@@ -34,11 +34,14 @@ export class ListingController {
 
   /**
    * PHASE 2: Confirm Listing
-   * Validates on-chain reality and moves record to 'ACTIVE'.
+   * Validates on-chain reality, records txHash, and moves record to 'ACTIVE'.
    */
   @Post('confirm')
-  async confirm(@Body('listingId') listingId: string) {
-    return await this.listingService.confirmListing(listingId);
+  async confirm(
+    @Body('listingId') listingId: string,
+    @Body('txHash') txHash?: string,
+  ) {
+    return await this.listingService.confirmListing(listingId, txHash);
   }
 
   @Get('asset/:assetId')
@@ -66,7 +69,7 @@ export class ListingController {
     @CurrentUser('userId') userId: string,
     @Param('id') listingId: string,
   ) {
-    // This will now execute instantly without blockchain verification delays
+    // This will execute instantly without blockchain verification delays
     await this.listingService.cancelListing(listingId, userId);
     return { success: true };
   }
