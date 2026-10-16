@@ -1,3 +1,4 @@
+// src/auth/auth.service.ts
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { UserService } from '../user/user.service';
 import { JwtService } from '@nestjs/jwt';
@@ -22,13 +23,17 @@ export class AuthService {
 
     const accessToken = this.jwtService.sign(payload);
 
+    // 🚀 Included 'name', 'walletAddress', and 'isVerified' so login response matches /me
     return {
       accessToken,
       user: {
         id: user.id,
+        name: user.name,
         email: user.email,
         phone: user.phone,
         role: user.role,
+        walletAddress: user.walletAddress,
+        isVerified: user.isVerified,
         kyc: user.kyc,
       },
     };
@@ -41,7 +46,6 @@ export class AuthService {
   async generatePrivyToken(userId: string): Promise<{ token: string }> {
     const now = Math.floor(Date.now() / 1000);
 
-    // 1. Construct a fully standard compliant OpenID JWT payload
     const payload = {
       iss: 'remzik-backend',
       sub: userId,
@@ -57,7 +61,6 @@ export class AuthService {
         .replace(/\+/g, '-')
         .replace(/\//g, '_');
 
-    // 2. JWT Header containing the exact Key ID matching your JWKS distribution
     const header = {
       alg: 'RS256',
       typ: 'JWT',
@@ -68,7 +71,6 @@ export class AuthService {
     const encodedPayload = base64UrlEncode(payload);
     const tokenData = `${encodedHeader}.${encodedPayload}`;
 
-    // 3. Extract the permanent private signing key from environment configurations
     const privateKeyInput = process.env.PRIVY_PRIVATE_KEY;
     if (!privateKeyInput) {
       throw new Error(
@@ -76,15 +78,11 @@ export class AuthService {
       );
     }
 
-    // 4. Create the cryptographic signature natively using RSA-SHA256 engine
     const sign = crypto.createSign('RSA-SHA256');
     sign.update(tokenData);
 
     const signature = sign
-      .sign(
-        privateKeyInput.replace(/\\n/g, '\n'), // Safely processes text explicit breaks
-        'base64',
-      )
+      .sign(privateKeyInput.replace(/\\n/g, '\n'), 'base64')
       .replace(/=/g, '')
       .replace(/\+/g, '-')
       .replace(/\//g, '_');

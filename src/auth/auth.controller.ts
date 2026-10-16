@@ -1,3 +1,4 @@
+// src/auth/auth.controller.ts
 import {
   Controller,
   Post,
@@ -31,7 +32,6 @@ export class AuthController {
   /**
    * Public JWKS Endpoint
    * Flat route to avoid NestJS routing conflicts with dots and slashes.
-   * Accessible via: http://localhost:4000/auth/jwks (or /api/auth/jwks if global prefix is active)
    */
   @Get('jwks')
   @HttpCode(HttpStatus.OK)
@@ -45,13 +45,11 @@ export class AuthController {
       );
     }
 
-    // Convert the clean public PEM string into a standard JWK component
     const keyObject = crypto.createPublicKey(
       publicKeyPem.replace(/\\n/g, '\n'),
     );
     const jwk = keyObject.export({ format: 'jwk' });
 
-    // Returns the exact compliant key set structure Privy demands
     return {
       keys: [
         {
@@ -82,7 +80,7 @@ export class AuthController {
     });
 
     return {
-      accessToken: result.accessToken, // 👈 Included so mobile app/WebView can extract & store it
+      accessToken: result.accessToken,
       user: result.user,
       message: 'Login successful',
     };
@@ -98,11 +96,15 @@ export class AuthController {
       throw new UnauthorizedException('User profile no longer exists');
     }
 
+    // 🚀 Included 'name', 'walletAddress', and 'isVerified' to match your entity schema fully
     return {
       id: fullUser.id,
+      name: fullUser.name,
       email: fullUser.email,
       phone: fullUser.phone,
       role: fullUser.role,
+      walletAddress: fullUser.walletAddress,
+      isVerified: fullUser.isVerified,
       kyc: fullUser.kyc,
     };
   }
@@ -123,7 +125,6 @@ export class AuthController {
   @Get('privy-token')
   async getPrivyToken(@Req() req: Request & { user?: any }) {
     const userId = req.user?.userId;
-
     const { token } = await this.authService.generatePrivyToken(userId);
 
     return {
@@ -168,6 +169,7 @@ export class AuthController {
       privyUserId: result.privyUserId,
     };
   }
+
   @UseGuards(JwtAuthGuard)
   @Post('provision-wallet')
   async provisionWallet(@Req() req: Request & { user?: any }) {
@@ -176,7 +178,6 @@ export class AuthController {
       throw new UnauthorizedException('Authenticated user not found.');
     }
 
-    // Automatically checks or provisions the Privy wallet server-side
     const result =
       await this.walletProvisionService.provisionMobileWallet(userId);
 
