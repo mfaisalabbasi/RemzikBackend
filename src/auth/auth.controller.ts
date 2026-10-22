@@ -125,10 +125,11 @@ export class AuthController {
   @Get('privy-token')
   async getPrivyToken(@Req() req: Request & { user?: any }) {
     const userId = req.user?.userId;
-    const { token } = await this.authService.generatePrivyToken(userId);
+    const result = await this.authService.generatePrivyToken(userId);
 
     return {
-      privyCustomToken: token,
+      privyCustomToken: result.token,
+      walletAddress: result.walletAddress,
       jwk: null,
     };
   }

@@ -1,7 +1,14 @@
-// src/auth/auth.service.ts
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import {
+  Injectable,
+  UnauthorizedException,
+  InternalServerErrorException,
+} from '@nestjs/common';
 import { UserService } from '../user/user.service';
 import { JwtService } from '@nestjs/jwt';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { User } from '../user/user.entity';
+import { WalletProvisionService } from './wallet-provision.service';
 import * as crypto from 'crypto';
 
 @Injectable()
@@ -9,6 +16,9 @@ export class AuthService {
   constructor(
     private userService: UserService,
     private jwtService: JwtService,
+    private walletProvisionService: WalletProvisionService,
+    @InjectRepository(User)
+    private userRepository: Repository<User>,
   ) {}
 
   async login(email: string, password: string) {
@@ -23,7 +33,6 @@ export class AuthService {
 
     const accessToken = this.jwtService.sign(payload);
 
-    // 🚀 Included 'name', 'walletAddress', and 'isVerified' so login response matches /me
     return {
       accessToken,
       user: {
@@ -40,16 +49,37 @@ export class AuthService {
   }
 
   /**
-   * Generates a temporary custom identity token for Privy verification
-   * using a secure, permanent static private key configuration.
+   * 🛡️ Generates a custom JWT for Privy verification.
+   * If the user doesn't have a privyUserId yet (new registration),
+   * it provisions the wallet automatically on demand.
    */
-  async generatePrivyToken(userId: string): Promise<{ token: string }> {
+  async generatePrivyToken(
+    userId: string,
+  ): Promise<{ token: string; walletAddress: string }> {
+    let user = await this.userRepository.findOne({ where: { id: userId } });
+
+    if (!user) {
+      throw new UnauthorizedException('User profile not found.');
+    }
+
+    // 🚀 Self-Healing: Provision wallet automatically if missing during registration
+    if (!user.privyUserId || !user.walletAddress) {
+      console.log(
+        `ℹ️ [AuthService] Provisioning missing Privy wallet for user ${userId}...`,
+      );
+      const provisioned =
+        await this.walletProvisionService.provisionMobileWallet(userId);
+      user.privyUserId = provisioned.privyUserId;
+      user.walletAddress = provisioned.walletAddress;
+      await this.userRepository.save(user);
+    }
+
     const now = Math.floor(Date.now() / 1000);
 
     const payload = {
       iss: 'remzik-backend',
-      sub: userId,
-      aud: 'remzik-app',
+      sub: user.privyUserId, // 👈 Bound to Privy user ID
+      aud: process.env.PRIVY_APP_ID || 'remzik-app',
       iat: now,
       exp: now + 60 * 15, // Valid for 15 minutes
     };
@@ -78,17 +108,23 @@ export class AuthService {
       );
     }
 
-    const sign = crypto.createSign('RSA-SHA256');
-    sign.update(tokenData);
+    try {
+      const sign = crypto.createSign('RSA-SHA256');
+      sign.update(tokenData);
 
-    const signature = sign
-      .sign(privateKeyInput.replace(/\\n/g, '\n'), 'base64')
-      .replace(/=/g, '')
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_');
+      const signature = sign
+        .sign(privateKeyInput.replace(/\\n/g, '\n'), 'base64')
+        .replace(/=/g, '')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_');
 
-    const token = `${tokenData}.${signature}`;
-
-    return { token };
+      const token = `${tokenData}.${signature}`;
+      return { token, walletAddress: user.walletAddress };
+    } catch (error: any) {
+      console.error('❌ Failed to sign custom Privy token:', error);
+      throw new InternalServerErrorException(
+        'Could not generate secure session token: ' + (error.message || error),
+      );
+    }
   }
 }
