@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Injectable,
   NotFoundException,
+  Logger,
 } from '@nestjs/common';
 import { LedgerService } from '../ledger/ledger.service';
 import { LedgerSource } from '../ledger/enums/ledger-source.enum';
@@ -10,13 +11,17 @@ import { WalletResponseDto } from './dto/wallet-response.dto';
 import { Repository, EntityManager } from 'typeorm';
 import { Wallet } from './wallet.entity';
 import { InjectRepository } from '@nestjs/typeorm';
+import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
 
 @Injectable()
 export class WalletService {
+  private readonly logger = new Logger(WalletService.name);
+
   constructor(
     private readonly ledgerService: LedgerService,
     @InjectRepository(Wallet)
     private readonly walletRepo: Repository<Wallet>,
+    private readonly notificationOrchestrator: NotificationOrchestrator,
   ) {}
 
   private getRepo(manager?: EntityManager) {
@@ -53,15 +58,25 @@ export class WalletService {
       );
     };
 
-    return manager
-      ? work(manager)
+    const res = manager
+      ? await work(manager)
       : await this.walletRepo.manager.transaction(work);
+
+    // 🛡️ NOTIFICATION: Inform user wallet funded
+    try {
+      await this.notificationOrchestrator.buildAndSave(userId, 'wallet.topup', {
+        title: 'Wallet Funded',
+        message: `Your wallet has been topped up with SAR ${amount.toLocaleString()}.`,
+        amount,
+        timestamp: new Date(),
+      });
+    } catch (err) {
+      this.logger.error(`Failed to send wallet top-up notification: ${err}`);
+    }
+
+    return res;
   }
 
-  /**
-   * 🛡️ FIXED: Added pessimistic write-locking (`FOR UPDATE`) when operating inside a transaction
-   * to completely prevent balance-check race conditions.
-   */
   private async getOrCreateWallet(
     userId: string,
     manager?: EntityManager,
@@ -89,7 +104,6 @@ export class WalletService {
       });
       await repo.save(created);
 
-      // Re-fetch with pessimistic write lock if inside a transaction
       if (manager) {
         wallet = await repo
           .createQueryBuilder('wallet')
@@ -246,6 +260,22 @@ export class WalletService {
       .set({ pendingBalance: () => `pendingBalance + ${amount}` })
       .where('userId = :userId', { userId })
       .execute();
+
+    // 🛡️ NOTIFICATION: Inform user payout requested
+    try {
+      await this.notificationOrchestrator.buildAndSave(
+        userId,
+        'wallet.payout_requested',
+        {
+          title: 'Payout Requested',
+          message: `Your withdrawal request of SAR ${amount.toLocaleString()} has been submitted.`,
+          amount,
+          timestamp: new Date(),
+        },
+      );
+    } catch (err) {
+      this.logger.error(`Failed to send payout request notification: ${err}`);
+    }
   }
 
   async finalizePayout(
@@ -272,6 +302,26 @@ export class WalletService {
         })
         .where('userId = :userId', { userId })
         .execute();
+    }
+
+    // 🛡️ NOTIFICATION: Inform user payout finalized
+    try {
+      await this.notificationOrchestrator.buildAndSave(
+        userId,
+        success ? 'wallet.payout_completed' : 'wallet.payout_failed',
+        {
+          title: success ? 'Payout Completed' : 'Payout Failed',
+          message: success
+            ? `Your payout of SAR ${amount.toLocaleString()} has been successfully processed.`
+            : `Your payout of SAR ${amount.toLocaleString()} failed and funds have been returned to your balance.`,
+          amount,
+          timestamp: new Date(),
+        },
+      );
+    } catch (err) {
+      this.logger.error(
+        `Failed to send payout finalization notification: ${err}`,
+      );
     }
   }
 

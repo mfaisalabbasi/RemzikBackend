@@ -1,9 +1,9 @@
-// src/recovery/recovery.service.ts
 import {
   Injectable,
   NotFoundException,
   BadRequestException,
   InternalServerErrorException,
+  Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -14,9 +14,12 @@ import { BlockchainService } from '../blockchain/blockchain.service';
 import { StorageService } from '../storage/storage.service';
 import { ethers } from 'ethers';
 import { Ownership } from '../ownership/ownership.entity';
+import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
 
 @Injectable()
 export class RecoveryService {
+  private readonly logger = new Logger(RecoveryService.name);
+
   constructor(
     @InjectRepository(RecoveryRequestEntity)
     private readonly recoveryRepo: Repository<RecoveryRequestEntity>,
@@ -24,6 +27,7 @@ export class RecoveryService {
     private readonly userRepo: Repository<User>,
     private readonly blockchainService: BlockchainService,
     private readonly storageService: StorageService,
+    private readonly notificationOrchestrator: NotificationOrchestrator,
   ) {}
 
   async createRequest(
@@ -48,7 +52,28 @@ export class RecoveryService {
       documentUrls: [],
       status: RecoveryStatus.PENDING_DOCUMENTS,
     });
-    return this.recoveryRepo.save(recovery);
+    const savedRecovery = await this.recoveryRepo.save(recovery);
+
+    // 🛡️ NOTIFICATION: Inform user recovery initiated
+    try {
+      await this.notificationOrchestrator.buildAndSave(
+        userId,
+        'recovery.created',
+        {
+          title: 'Wallet Recovery Initiated',
+          message:
+            'Your wallet recovery request has been logged. Please submit your verification documents.',
+          requestId: savedRecovery.id,
+          timestamp: new Date(),
+        },
+      );
+    } catch (err) {
+      this.logger.error(
+        `Failed to send recovery creation notification: ${err}`,
+      );
+    }
+
+    return savedRecovery;
   }
 
   async approveAndExecute(
@@ -68,7 +93,6 @@ export class RecoveryService {
       throw new BadRequestException('Request is already processed or rejected');
     }
 
-    // Fetch the user record to retrieve their secure Privy DID (`privyUserId`)
     const user = await this.userRepo.findOne({ where: { id: request.userId } });
     if (!user || !user.privyUserId) {
       throw new BadRequestException(
@@ -80,7 +104,7 @@ export class RecoveryService {
       request.newWallet && request.newWallet !== 'dummy'
         ? request.newWallet
         : await this.blockchainService.generateEmbeddedWalletForUser(
-            user.privyUserId, // 👈 Passing the actual Privy DID to the SDK
+            user.privyUserId,
           );
 
     request.newWallet = newWallet;
@@ -91,7 +115,6 @@ export class RecoveryService {
       request.status = RecoveryStatus.PROCESSING_BLOCKCHAIN;
       await this.recoveryRepo.save(request);
 
-      // 🛡️ Ensure the new recovery wallet is registered/whitelisted in the Identity Registry before execution
       await this.blockchainService.ensureWalletWhitelisted(newWallet);
 
       let txHash = '';
@@ -174,7 +197,28 @@ export class RecoveryService {
       request.txHash = txHash;
       request.status = RecoveryStatus.COMPLETED;
       request.completedAt = new Date();
-      return this.recoveryRepo.save(request);
+      const savedRequest = await this.recoveryRepo.save(request);
+
+      // 🛡️ NOTIFICATION: Inform user recovery completed successfully
+      try {
+        await this.notificationOrchestrator.buildAndSave(
+          request.userId,
+          'recovery.completed',
+          {
+            title: 'Wallet Recovery Successful',
+            message:
+              'Your wallet has been successfully recovered and assets have been transferred to your new address.',
+            requestId: request.id,
+            timestamp: new Date(),
+          },
+        );
+      } catch (err) {
+        this.logger.error(
+          `Failed to send recovery success notification: ${err}`,
+        );
+      }
+
+      return savedRequest;
     } catch (error: any) {
       if (request.newWallet && request.newWallet !== 'dummy') {
         await this.userRepo
@@ -184,6 +228,25 @@ export class RecoveryService {
 
       request.status = RecoveryStatus.REJECTED;
       await this.recoveryRepo.save(request);
+
+      // 🛡️ NOTIFICATION: Inform user recovery failed
+      try {
+        await this.notificationOrchestrator.buildAndSave(
+          request.userId,
+          'recovery.failed',
+          {
+            title: 'Wallet Recovery Failed',
+            message: `On-chain recovery execution failed: ${error.message}`,
+            requestId: request.id,
+            timestamp: new Date(),
+          },
+        );
+      } catch (err) {
+        this.logger.error(
+          `Failed to send recovery failure notification: ${err}`,
+        );
+      }
+
       throw new BadRequestException(
         `On-chain recovery execution failed: ${error.message}`,
       );
@@ -282,6 +345,25 @@ export class RecoveryService {
     request.documentUrls = uploadedFiles;
 
     await this.recoveryRepo.save(request);
+
+    // 🛡️ NOTIFICATION: Inform user recovery verification package submitted
+    try {
+      await this.notificationOrchestrator.buildAndSave(
+        userId,
+        'recovery.submitted',
+        {
+          title: 'Recovery Documents Submitted',
+          message:
+            'Your verification package has been uploaded and is now under review by administrators.',
+          requestId: request.id,
+          timestamp: new Date(),
+        },
+      );
+    } catch (err) {
+      this.logger.error(
+        `Failed to send recovery submission notification: ${err}`,
+      );
+    }
 
     return {
       success: true,

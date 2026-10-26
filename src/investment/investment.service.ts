@@ -142,101 +142,130 @@ export class InvestmentService {
       dto.transactionId ||
       `OFFCHAIN-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
 
-    return this.investmentRepo.manager.transaction(async (manager) => {
-      const availableBalance =
-        await this.walletService.getAvailableBalance(userId);
+    const savedInvestment = await this.investmentRepo.manager.transaction(
+      async (manager) => {
+        const availableBalance =
+          await this.walletService.getAvailableBalance(userId);
 
-      if (availableBalance < Number(dto.amount)) {
-        throw new BadRequestException('Insufficient balance.');
-      }
+        if (availableBalance < Number(dto.amount)) {
+          throw new BadRequestException('Insufficient balance.');
+        }
 
-      const investor = await manager.findOne(InvestorProfile, {
-        where: {
-          user: {
-            id: userId,
+        const investor = await manager.findOne(InvestorProfile, {
+          where: {
+            user: {
+              id: userId,
+            },
           },
-        },
-        relations: ['user'],
+          relations: ['user'],
+        });
+
+        if (!investor) {
+          throw new BadRequestException('Investor profile not found.');
+        }
+
+        const token = await manager
+          .getRepository(AssetToken)
+          .createQueryBuilder('token')
+          .setLock('pessimistic_write')
+          .where('token.assetId = :assetId', {
+            assetId: dto.assetId,
+          })
+          .getOne();
+
+        if (!token) {
+          throw new BadRequestException('Asset is not tokenized.');
+        }
+
+        const amount = Number(dto.amount);
+        const sharePrice = Number(token.sharePrice);
+
+        if (!Number.isFinite(amount) || amount <= 0) {
+          throw new BadRequestException(
+            'Investment amount must be greater than zero.',
+          );
+        }
+
+        if (!Number.isFinite(sharePrice) || sharePrice <= 0) {
+          throw new BadRequestException('Asset share price is invalid.');
+        }
+
+        const shares = this.calculateShares(amount, sharePrice);
+
+        if (shares > Number(token.availableShares)) {
+          throw new BadRequestException('Not enough shares available.');
+        }
+
+        token.availableShares = Number(token.availableShares) - shares;
+
+        await manager.save(token);
+
+        const asset = await manager.findOne(Asset, {
+          where: {
+            id: dto.assetId,
+          },
+          relations: ['partner', 'partner.user'],
+        });
+
+        if (!asset) {
+          throw new BadRequestException('Asset not found.');
+        }
+
+        const investment = manager.create(Investment, {
+          investor,
+          asset: {
+            id: dto.assetId,
+          } as Asset,
+          amount,
+          units: shares,
+          unitPriceAtPurchase: sharePrice,
+          status: InvestmentStatus.PENDING,
+        });
+
+        const saved = await manager.save(investment);
+
+        await this.investmentQueue.add(
+          'process-investment',
+          {
+            investmentId: saved.id,
+          },
+          {
+            jobId: transactionId,
+            attempts: 3,
+            removeOnComplete: true,
+          },
+        );
+
+        return saved;
+      },
+    );
+
+    // 🛡️ NOTIFICATION: Inform investor that investment request has been created/queued
+    try {
+      const fullSaved = await this.investmentRepo.findOne({
+        where: { id: savedInvestment.id },
+        relations: ['asset', 'investor', 'investor.user'],
       });
-
-      if (!investor) {
-        throw new BadRequestException('Investor profile not found.');
-      }
-
-      const token = await manager
-        .getRepository(AssetToken)
-        .createQueryBuilder('token')
-        .setLock('pessimistic_write')
-        .where('token.assetId = :assetId', {
-          assetId: dto.assetId,
-        })
-        .getOne();
-
-      if (!token) {
-        throw new BadRequestException('Asset is not tokenized.');
-      }
-
-      const amount = Number(dto.amount);
-      const sharePrice = Number(token.sharePrice);
-
-      if (!Number.isFinite(amount) || amount <= 0) {
-        throw new BadRequestException(
-          'Investment amount must be greater than zero.',
+      if (fullSaved?.investor?.user?.id && fullSaved.asset) {
+        await this.notificationOrchestrator.buildAndSave(
+          fullSaved.investor.user.id,
+          'investment.created',
+          {
+            title: 'Investment Request Processing',
+            message: `Your investment request of SAR ${fullSaved.amount} in "${fullSaved.asset.title}" is queued for processing.`,
+            amount: fullSaved.amount,
+            asset: fullSaved.asset.title,
+            timestamp: new Date(),
+          },
         );
       }
-
-      if (!Number.isFinite(sharePrice) || sharePrice <= 0) {
-        throw new BadRequestException('Asset share price is invalid.');
-      }
-
-      const shares = this.calculateShares(amount, sharePrice);
-
-      if (shares > Number(token.availableShares)) {
-        throw new BadRequestException('Not enough shares available.');
-      }
-
-      token.availableShares = Number(token.availableShares) - shares;
-
-      await manager.save(token);
-
-      const asset = await manager.findOne(Asset, {
-        where: {
-          id: dto.assetId,
-        },
-        relations: ['partner', 'partner.user'],
-      });
-
-      if (!asset) {
-        throw new BadRequestException('Asset not found.');
-      }
-
-      const investment = manager.create(Investment, {
-        investor,
-        asset: {
-          id: dto.assetId,
-        } as Asset,
-        amount,
-        units: shares,
-        unitPriceAtPurchase: sharePrice,
-        status: InvestmentStatus.PENDING,
-      });
-
-      const saved = await manager.save(investment);
-
-      await this.investmentQueue.add(
-        'process-investment',
-        {
-          investmentId: saved.id,
-        },
-        {
-          jobId: transactionId,
-          attempts: 3,
-          removeOnComplete: true,
-        },
+    } catch (err) {
+      this.logger.error(
+        `Failed to dispatch off-chain investment notification: ${err}`,
       );
+    }
 
-      return saved;
-    });
+    return savedInvestment;
   }
 
   async finalizeTokenization(
@@ -299,10 +328,17 @@ export class InvestmentService {
     if (confirmedInvestment) {
       const reloaded = await this.investmentRepo.findOne({
         where: { id: confirmedInvestment.id },
-        relations: ['asset', 'investor', 'investor.user'],
+        relations: [
+          'asset',
+          'investor',
+          'investor.user',
+          'asset.partner',
+          'asset.partner.user',
+        ],
       });
 
-      if (reloaded) {
+      if (reloaded && reloaded.asset) {
+        // 🛡️ NOTIFICATION 1: Inform Investor of confirmation
         await this.notificationOrchestrator.buildAndSave(
           reloaded.investor.user.id,
           'investment.created',
@@ -314,6 +350,21 @@ export class InvestmentService {
             timestamp: new Date(),
           },
         );
+
+        // 🛡️ NOTIFICATION 2: Inform Asset Partner that capital has been allocated/funded
+        if (reloaded.asset?.partner?.user?.id) {
+          await this.notificationOrchestrator.buildAndSave(
+            reloaded.asset.partner.user.id,
+            'investment.partner.funded',
+            {
+              title: 'New Investment Funded',
+              message: `An investment of SAR ${reloaded.amount} was successfully completed for your asset "${reloaded.asset.title}".`,
+              amount: reloaded.amount,
+              asset: reloaded.asset.title,
+              timestamp: new Date(),
+            },
+          );
+        }
       }
     }
   }
@@ -481,12 +532,6 @@ export class InvestmentService {
         stablecoinDecimals,
       );
 
-      /**
-       * FIXED: Scale expected asset tokens using precise calculated shares and proper token decimals
-       */
-      /**
-       * FIXED: Match TreasuryVault contract logic where tokensToTransfer = amount (1:1 with stablecoin integer units)
-       */
       const expectedTokenAmount = stablecoinAmount;
 
       // ------------------------------------------------------
@@ -554,6 +599,23 @@ export class InvestmentService {
       );
 
       await queryRunner.commitTransaction();
+
+      // 🛡️ NOTIFICATION: Inform investor that on-chain investment intent is ready for signing/approval
+      try {
+        await this.notificationOrchestrator.buildAndSave(
+          investor.user.id,
+          'investment.intent_created',
+          {
+            title: 'On-Chain Investment Intent Ready',
+            message: `Please sign your on-chain transaction of SAR ${amount} for "${asset.title}".`,
+            amount,
+            asset: asset.title,
+            timestamp: new Date(),
+          },
+        );
+      } catch (err) {
+        this.logger.error(`Failed to dispatch intent notification: ${err}`);
+      }
 
       // ------------------------------------------------------
       // RETURN SIGNING PAYLOAD
@@ -722,8 +784,7 @@ export class InvestmentService {
       }
 
       /**
-       * Never replace a transaction hash
-       * silently.
+       * Never replace a transaction hash silently.
        */
       if (locked.txHash && locked.txHash.toLowerCase() !== normalizedHash) {
         throw new ConflictException(
@@ -777,10 +838,6 @@ export class InvestmentService {
         'Transaction submitted. Remzik is verifying the blockchain transaction.',
     };
   }
-
-  // =========================================================
-  // BLOCKCHAIN VERIFICATION
-  // =========================================================
 
   // =========================================================
   // BLOCKCHAIN VERIFICATION
@@ -895,10 +952,6 @@ export class InvestmentService {
         'Investment token amount snapshot is missing.',
       );
     }
-
-    // ------------------------------------------------------
-    // FETCH TX
-    // ------------------------------------------------------
 
     const tx = await this.provider.getTransaction(txHash);
 
@@ -1157,17 +1210,24 @@ export class InvestmentService {
     );
 
     // ------------------------------------------------------
-    // NOTIFICATION
+    // NOTIFICATION (Investor & Partner)
     // ------------------------------------------------------
 
     const reloaded = await this.investmentRepo.findOne({
       where: {
         id: investmentId,
       },
-      relations: ['asset', 'investor', 'investor.user'],
+      relations: [
+        'asset',
+        'investor',
+        'investor.user',
+        'asset.partner',
+        'asset.partner.user',
+      ],
     });
 
     if (reloaded?.investor?.user?.id && reloaded.asset) {
+      // 1. Investor notification
       await this.notificationOrchestrator.buildAndSave(
         reloaded.investor.user.id,
         'investment.created',
@@ -1183,6 +1243,21 @@ export class InvestmentService {
           timestamp: new Date(),
         },
       );
+
+      // 2. Partner notification
+      if (reloaded.asset?.partner?.user?.id) {
+        await this.notificationOrchestrator.buildAndSave(
+          reloaded.asset.partner.user.id,
+          'investment.partner.funded',
+          {
+            title: 'New On-Chain Investment Funded',
+            message: `An on-chain investment of SAR ${reloaded.amount} was successfully verified for your asset "${reloaded.asset.title}".`,
+            amount: reloaded.amount,
+            asset: reloaded.asset.title,
+            timestamp: new Date(),
+          },
+        );
+      }
     }
 
     return {
@@ -1245,12 +1320,7 @@ export class InvestmentService {
 
       /**
        * Lock the asset too.
-       *
-       * This serializes:
-       *
-       * funded
-       * investor count
-       * ownership creation
+       * This serializes: funded, investor count, ownership creation
        */
       const asset = await manager.findOne(Asset, {
         where: {
@@ -1344,6 +1414,9 @@ export class InvestmentService {
     investmentId: string,
     reason: string,
   ): Promise<void> {
+    let investorUserId: string | null = null;
+    let assetTitle: string | null = null;
+
     await this.investmentRepo.manager.transaction(async (manager) => {
       // 1. Fetch ONLY the investment with lock (NO relations to avoid Postgres join error)
       const investment = await manager.findOne(Investment, {
@@ -1370,8 +1443,13 @@ export class InvestmentService {
       // 2. Fetch relations separately in a non-locked query if needed
       const fullInvestment = await manager.findOne(Investment, {
         where: { id: investmentId },
-        relations: ['asset'],
+        relations: ['asset', 'investor', 'investor.user'],
       });
+
+      if (fullInvestment?.investor?.user?.id) {
+        investorUserId = fullInvestment.investor.user.id;
+        assetTitle = fullInvestment.asset?.title || 'Property Asset';
+      }
 
       // ----------------------------------------------------
       // RELEASE RESERVED SHARES
@@ -1403,6 +1481,24 @@ export class InvestmentService {
 
       this.logger.warn(`Investment ${investmentId} failed: ${reason}`);
     });
+
+    // 🛡️ NOTIFICATION: Inform investor about investment failure / reversion
+    if (investorUserId) {
+      try {
+        await this.notificationOrchestrator.buildAndSave(
+          investorUserId,
+          'investment.failed',
+          {
+            title: 'Investment Failed',
+            message: `Your investment in "${assetTitle}" could not be completed. Reason: ${reason}`,
+            reason,
+            timestamp: new Date(),
+          },
+        );
+      } catch (err) {
+        this.logger.error(`Failed to dispatch failure notification: ${err}`);
+      }
+    }
   }
 
   // =========================================================
@@ -1422,9 +1518,7 @@ export class InvestmentService {
 
     /**
      * CRITICAL:
-     *
-     * Admin must NEVER confirm an ON_CHAIN
-     * investment manually.
+     * Admin must NEVER confirm an ON_CHAIN investment manually.
      */
     if ((investment as any).expectedCalldata) {
       throw new BadRequestException(
@@ -1817,8 +1911,7 @@ export class InvestmentService {
     }
 
     /**
-     * Multiple matching transfers make the
-     * transaction ambiguous.
+     * Multiple matching transfers make the transaction ambiguous.
      */
     if (matches.length !== 1) {
       return null;

@@ -3,6 +3,7 @@ import {
   BadRequestException,
   NotFoundException,
   InternalServerErrorException,
+  Logger,
 } from '@nestjs/common';
 import { PartnerService } from 'src/partner/partner.service';
 import { AssetService } from 'src/asset/asset.service';
@@ -37,9 +38,12 @@ import { ChainEventLog } from 'src/blockchain/chain-event-log.entity';
 import { OracleService } from 'src/secondary-market/trade/oracle.service';
 import { Mutex } from 'async-mutex';
 import { RecoveryRequestEntity } from 'src/Recovery/recovery.entity';
+import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
 
 @Injectable()
 export class AdminService {
+  private readonly logger = new Logger(AdminService.name);
+
   constructor(
     private readonly partnerService: PartnerService,
     private readonly assetService: AssetService,
@@ -70,6 +74,7 @@ export class AdminService {
     private readonly oracleService: OracleService,
     @InjectRepository(RecoveryRequestEntity)
     private readonly recoveryRequestRepo: Repository<RecoveryRequestEntity>,
+    private readonly notificationOrchestrator: NotificationOrchestrator,
   ) {}
   private readonly mutex = new Mutex();
 
@@ -111,9 +116,7 @@ export class AdminService {
   }
 
   /**
-   * Refined KYC Action:
-   * Rejection keeps the account ACTIVE so the user can re-upload.
-   * Pulls walletAddress directly from the User entity relation layout.
+   * Refined KYC Action
    */
   async handleKycAction(dto: AdminActionDto, adminId: string) {
     const kyc = await this.kycRepo.findOne({
@@ -123,48 +126,69 @@ export class AdminService {
 
     if (!kyc) throw new NotFoundException('KYC record not found');
 
-    if (dto.action === AdminAction.APPROVE) {
-      await this.kycService.approve(dto.targetId);
-      if (kyc.user) {
-        kyc.user.isVerified = true;
-        await this.dataSource.manager.save(User, kyc.user);
+    await this.dataSource.transaction(async (manager) => {
+      if (dto.action === AdminAction.APPROVE) {
+        await this.kycService.approve(dto.targetId);
+        if (kyc.user) {
+          kyc.user.isVerified = true;
+          await manager.save(User, kyc.user);
 
-        // On-chain Compliance sync using your explicit column layout
-        if (kyc.user.walletAddress) {
-          await this.blockchainService.registerIdentity(
-            kyc.user.walletAddress,
-            true,
-          );
+          if (kyc.user.walletAddress) {
+            await this.blockchainService.registerIdentity(
+              kyc.user.walletAddress,
+              true,
+            );
+          }
+        }
+      } else if (dto.action === AdminAction.REJECT) {
+        if (!dto.reason) throw new BadRequestException('Reason required');
+        await this.kycService.reject(dto.targetId, dto.reason);
+        if (kyc.user) {
+          kyc.user.isVerified = false;
+          await manager.save(User, kyc.user);
+
+          if (kyc.user.walletAddress) {
+            await this.blockchainService.registerIdentity(
+              kyc.user.walletAddress,
+              false,
+            );
+          }
         }
       }
-    } else if (dto.action === AdminAction.REJECT) {
-      if (!dto.reason) throw new BadRequestException('Reason required');
-      await this.kycService.reject(dto.targetId, dto.reason);
-      if (kyc.user) {
-        kyc.user.isVerified = false;
-        await this.dataSource.manager.save(User, kyc.user);
 
-        // On-chain Compliance revocation
-        if (kyc.user.walletAddress) {
-          await this.blockchainService.registerIdentity(
-            kyc.user.walletAddress,
-            false,
-          );
-        }
+      await this.auditService.log(
+        {
+          adminId,
+          action: dto.action,
+          targetId: dto.targetId,
+          reason: dto.reason,
+        },
+        manager,
+      );
+    });
+
+    // 🛡️ NOTIFICATION: Inform user of KYC status update
+    if (kyc?.user?.id) {
+      try {
+        const isApproved = dto.action === AdminAction.APPROVE;
+        await this.notificationOrchestrator.buildAndSave(
+          kyc.user.id,
+          isApproved ? 'kyc.approved' : 'kyc.rejected',
+          {
+            title: isApproved ? 'KYC Verified!' : 'KYC Verification Rejected',
+            message: isApproved
+              ? 'Your identity has been successfully verified.'
+              : `Your verification was rejected. Reason: ${dto.reason || 'Not specified'}`,
+            reason: dto.reason,
+            timestamp: new Date(),
+          },
+        );
+      } catch (err) {
+        this.logger.error(`Failed to send KYC status notification: ${err}`);
       }
     }
-
-    await this.auditService.log({
-      adminId,
-      action: dto.action,
-      targetId: dto.targetId,
-      reason: dto.reason,
-    });
   }
 
-  /**
-   * Directly approves an investor profile and flips isVerified.
-   */
   /**
    * Refactored: Approve KYC (Investor)
    */
@@ -176,7 +200,6 @@ export class AdminService {
     if (!profile || !profile.user)
       throw new BadRequestException('Profile or User not found');
 
-    // 1. BLOCKCHAIN GATE: Register identity on-chain BEFORE DB changes
     if (profile.user.walletAddress) {
       await this.blockchainService.registerIdentity(
         profile.user.walletAddress,
@@ -184,8 +207,7 @@ export class AdminService {
       );
     }
 
-    // 2. ATOMIC DB TRANSACTION
-    return await this.dataSource.transaction(async (manager) => {
+    const result = await this.dataSource.transaction(async (manager) => {
       profile.user.isVerified = true;
       await manager.save(User, profile.user);
       await manager.update(
@@ -217,9 +239,28 @@ export class AdminService {
 
       return { success: true };
     });
+
+    // 🛡️ NOTIFICATION: Inform user KYC verified
+    try {
+      await this.notificationOrchestrator.buildAndSave(
+        profile.user.id,
+        'kyc.approved',
+        {
+          title: 'KYC Verified!',
+          message:
+            'Your identity has been successfully verified by administration.',
+          timestamp: new Date(),
+        },
+      );
+    } catch (err) {
+      this.logger.error(`Failed to send KYC approval notification: ${err}`);
+    }
+
+    return result;
   }
+
   /**
-   * Freeze/Unfreeze: The ultimate safety switch.
+   * Freeze/Unfreeze Account Safety Switch
    */
   async toggleAccountFreeze(id: string, reason: string, adminId: string) {
     const profile = await this.investorRepo.findOne({
@@ -230,7 +271,6 @@ export class AdminService {
 
     const nextActiveState = !profile.user.isActive;
 
-    // 1. BLOCKCHAIN GATE
     if (profile.user.walletAddress) {
       await this.blockchainService.toggleFreeze(
         profile.user.walletAddress,
@@ -238,39 +278,65 @@ export class AdminService {
       );
     }
 
-    // 2. DB UPDATE
-    profile.user.isActive = nextActiveState;
-    await this.investorRepo.manager.save(profile.user);
+    const result = await this.dataSource.transaction(async (manager) => {
+      profile.user.isActive = nextActiveState;
+      await manager.save(User, profile.user);
 
-    await this.ledgerService.record({
-      userId: profile.user.id,
-      amount: 0,
-      type: LedgerType.ADJUSTMENT,
-      source: LedgerSource.ADMIN_ADJUSTMENT,
-      description: nextActiveState
-        ? 'ACCOUNT UNFROZEN'
-        : `ACCOUNT FROZEN: ${reason}`,
+      await this.ledgerService.record(
+        {
+          userId: profile.user.id,
+          amount: 0,
+          type: LedgerType.ADJUSTMENT,
+          source: LedgerSource.ADMIN_ADJUSTMENT,
+          description: nextActiveState
+            ? 'ACCOUNT UNFROZEN'
+            : `ACCOUNT FROZEN: ${reason}`,
+        },
+        manager,
+      );
+
+      await this.auditService.log(
+        {
+          adminId,
+          action: nextActiveState
+            ? AdminAction.APPROVE
+            : AdminAction.USER_SUSPENDED,
+          targetId: id,
+          reason:
+            reason ||
+            (nextActiveState ? 'Manual Reactivation' : 'Manual Suspension'),
+        },
+        manager,
+      );
+
+      return {
+        success: true,
+        newStatus: profile.user.isActive ? 'Active' : 'Frozen',
+      };
     });
 
-    await this.auditService.log({
-      adminId,
-      action: nextActiveState
-        ? AdminAction.APPROVE
-        : AdminAction.USER_SUSPENDED,
-      targetId: id,
-      reason:
-        reason ||
-        (nextActiveState ? 'Manual Reactivation' : 'Manual Suspension'),
-    });
+    // 🛡️ NOTIFICATION: Inform user account freeze state changed
+    try {
+      await this.notificationOrchestrator.buildAndSave(
+        profile.user.id,
+        nextActiveState ? 'user.unfrozen' : 'user.frozen',
+        {
+          title: nextActiveState ? 'Account Reactivated' : 'Account Suspended',
+          message: nextActiveState
+            ? 'Your account has been reactivated by administration.'
+            : `Your account has been suspended. Reason: ${reason || 'Security compliance'}`,
+          timestamp: new Date(),
+        },
+      );
+    } catch (err) {
+      this.logger.error(`Failed to send account status notification: ${err}`);
+    }
 
-    return {
-      success: true,
-      newStatus: profile.user.isActive ? 'Active' : 'Frozen',
-    };
+    return result;
   }
 
   /**
-   * Directly rejects an investor profile and strips verification state.
+   * Reject Investor Profile KYC
    */
   async rejectKyc(investorProfileId: string, reason: string, adminId: string) {
     const profile = await this.investorRepo.findOne({
@@ -280,7 +346,6 @@ export class AdminService {
     if (!profile || !profile.user)
       throw new BadRequestException('Profile or User not found');
 
-    // 1. BLOCKCHAIN GATE: Revoke on-chain
     if (profile.user.walletAddress) {
       await this.blockchainService.registerIdentity(
         profile.user.walletAddress,
@@ -288,8 +353,7 @@ export class AdminService {
       );
     }
 
-    // 2. ATOMIC DB TRANSACTION
-    return await this.dataSource.transaction(async (manager) => {
+    const result = await this.dataSource.transaction(async (manager) => {
       profile.user.isVerified = false;
       await manager.save(User, profile.user);
       await manager.update(
@@ -310,35 +374,118 @@ export class AdminService {
 
       return { success: true };
     });
+
+    // 🛡️ NOTIFICATION: Inform user KYC rejected
+    try {
+      await this.notificationOrchestrator.buildAndSave(
+        profile.user.id,
+        'kyc.rejected',
+        {
+          title: 'KYC Verification Rejected',
+          message: `Your verification was rejected. Reason: ${reason}`,
+          reason,
+          timestamp: new Date(),
+        },
+      );
+    } catch (err) {
+      this.logger.error(`Failed to send KYC rejection notification: ${err}`);
+    }
+
+    return result;
   }
 
   async handlePartnerAction(dto: AdminActionDto, adminId: string) {
-    if (dto.action === AdminAction.APPROVE)
-      await this.partnerService.approve(dto.targetId);
-    if (dto.action === AdminAction.REJECT) {
-      if (!dto.reason)
-        throw new BadRequestException('Rejection reason is required');
-      await this.partnerService.reject(dto.targetId, dto.reason);
-    }
-    await this.auditService.log({
-      adminId,
-      action: dto.action,
-      targetId: dto.targetId,
-      reason: dto.reason,
+    const partner = await this.partnerRepo.findOne({
+      where: { id: dto.targetId },
+      relations: ['user'],
     });
+
+    await this.dataSource.transaction(async (manager) => {
+      if (dto.action === AdminAction.APPROVE)
+        await this.partnerService.approve(dto.targetId);
+      if (dto.action === AdminAction.REJECT) {
+        if (!dto.reason)
+          throw new BadRequestException('Rejection reason is required');
+        await this.partnerService.reject(dto.targetId, dto.reason);
+      }
+
+      await this.auditService.log(
+        {
+          adminId,
+          action: dto.action,
+          targetId: dto.targetId,
+          reason: dto.reason,
+        },
+        manager,
+      );
+    });
+
+    // 🛡️ NOTIFICATION: Inform partner of action result
+    if (partner?.user?.id) {
+      try {
+        const isApproved = dto.action === AdminAction.APPROVE;
+        await this.notificationOrchestrator.buildAndSave(
+          partner.user.id,
+          isApproved ? 'partner.approved' : 'partner.rejected',
+          {
+            title: isApproved
+              ? 'Partner Account Approved!'
+              : 'Partner Application Rejected',
+            message: isApproved
+              ? 'Your company profile has been approved.'
+              : `Your application was rejected. Reason: ${dto.reason || 'Not specified'}`,
+            timestamp: new Date(),
+          },
+        );
+      } catch (err) {
+        this.logger.error(`Failed to send partner action notification: ${err}`);
+      }
+    }
   }
 
   async handleAssetAction(dto: AdminActionDto, adminId: string) {
-    if (dto.action === AdminAction.APPROVE)
-      await this.assetService.approve(dto.targetId);
-    if (dto.action === AdminAction.FREEZE)
-      await this.assetService.freeze(dto.targetId);
-    await this.auditService.log({
-      adminId,
-      action: dto.action,
-      targetId: dto.targetId,
-      reason: dto.reason,
+    const asset = await this.assetRepo.findOne({
+      where: { id: dto.targetId },
+      relations: ['partner', 'partner.user'],
     });
+
+    await this.dataSource.transaction(async (manager) => {
+      if (dto.action === AdminAction.APPROVE)
+        await this.assetService.approve(dto.targetId);
+      if (dto.action === AdminAction.FREEZE)
+        await this.assetService.freeze(dto.targetId);
+
+      await this.auditService.log(
+        {
+          adminId,
+          action: dto.action,
+          targetId: dto.targetId,
+          reason: dto.reason,
+        },
+        manager,
+      );
+    });
+
+    // 🛡️ NOTIFICATION: Inform partner of asset action
+    if (asset?.partner?.user?.id) {
+      try {
+        const isApproved = dto.action === AdminAction.APPROVE;
+        await this.notificationOrchestrator.buildAndSave(
+          asset.partner.user.id,
+          isApproved ? 'asset.approved' : 'asset.frozen',
+          {
+            title: isApproved ? 'Asset Approved!' : 'Asset Frozen',
+            message: isApproved
+              ? `Your asset listing "${asset.title}" has been approved.`
+              : `Your asset listing "${asset.title}" has been frozen by administration.`,
+            assetId: asset.id,
+            timestamp: new Date(),
+          },
+        );
+      } catch (err) {
+        this.logger.error(`Failed to send asset action notification: ${err}`);
+      }
+    }
   }
 
   async getDashboardPipeline() {
@@ -391,7 +538,6 @@ export class AdminService {
   }
 
   async getInvestorDetail(id: string) {
-    // 1. Try finding by InvestorProfile primary id first, then fallback to user id
     let investorProfile = await this.investorRepo.findOne({
       where: { id },
       relations: ['user'],
@@ -476,6 +622,7 @@ export class AdminService {
       recoveryRequests: recoveryRequests || [],
     };
   }
+
   async getPartnersList(): Promise<PartnerProfile[]> {
     return this.partnerRepo.find({
       relations: ['user'],
@@ -524,7 +671,6 @@ export class AdminService {
 
     const formattedStatus = status.toUpperCase();
 
-    // 1. BLOCKCHAIN GATE (If approving partner, register them)
     if (
       formattedStatus === PartnerStatus.APPROVED &&
       partner.user.walletAddress
@@ -535,21 +681,45 @@ export class AdminService {
       );
     }
 
-    // 2. DB UPDATE
-    partner.status = formattedStatus as PartnerStatus;
-    await this.partnerRepo.save(partner);
+    const result = await this.dataSource.transaction(async (manager) => {
+      partner.status = formattedStatus as PartnerStatus;
+      await manager.save(PartnerProfile, partner);
 
-    await this.auditService.log({
-      adminId,
-      action:
-        formattedStatus === PartnerStatus.APPROVED
-          ? AdminAction.APPROVE
-          : AdminAction.REJECT,
-      targetId: id,
-      reason: `Partner status manually updated to ${formattedStatus}`,
+      await this.auditService.log(
+        {
+          adminId,
+          action:
+            formattedStatus === PartnerStatus.APPROVED
+              ? AdminAction.APPROVE
+              : AdminAction.REJECT,
+          targetId: id,
+          reason: `Partner status manually updated to ${formattedStatus}`,
+        },
+        manager,
+      );
+
+      return partner;
     });
 
-    return partner;
+    // 🛡️ NOTIFICATION: Inform partner of status change
+    try {
+      const isApproved = formattedStatus === PartnerStatus.APPROVED;
+      await this.notificationOrchestrator.buildAndSave(
+        partner.user.id,
+        isApproved ? 'partner.approved' : 'partner.rejected',
+        {
+          title: isApproved
+            ? 'Partner Account Approved!'
+            : 'Partner Status Updated',
+          message: `Your company status has been updated to ${formattedStatus}.`,
+          timestamp: new Date(),
+        },
+      );
+    } catch (err) {
+      this.logger.error(`Failed to send partner status notification: ${err}`);
+    }
+
+    return result;
   }
 
   async findAllAssets(): Promise<Asset[]> {
@@ -574,7 +744,7 @@ export class AdminService {
   ): Promise<Asset> {
     const asset = await this.assetRepo.findOne({
       where: { id },
-      relations: ['partner'],
+      relations: ['partner', 'partner.user'],
     });
 
     if (!asset) throw new NotFoundException(`Asset record ${id} not found.`);
@@ -585,19 +755,59 @@ export class AdminService {
       asset.rejectionReason = rejectionReason;
     }
 
-    asset.status = status as AssetStatus;
-    const updatedAsset = await this.assetRepo.save(asset);
-
     let auditAction: AdminAction = AdminAction.APPROVE;
     if (status === AssetStatus.REJECTED) auditAction = AdminAction.REJECT;
     if (status === AssetStatus.FREEZ) auditAction = AdminAction.FREEZE;
 
-    await this.auditService.log({
-      adminId,
-      targetId: id,
-      action: auditAction,
-      reason: rejectionReason || `Asset status changed to ${status}`,
+    const updatedAsset = await this.dataSource.transaction(async (manager) => {
+      asset.status = status as AssetStatus;
+      const updated = await manager.save(Asset, asset);
+
+      await this.auditService.log(
+        {
+          adminId,
+          targetId: id,
+          action: auditAction,
+          reason: rejectionReason || `Asset status changed to ${status}`,
+        },
+        manager,
+      );
+
+      return updated;
     });
+
+    // 🛡️ NOTIFICATION: Inform partner of asset status update
+    if (asset?.partner?.user?.id) {
+      try {
+        const isApproved = status === AssetStatus.APPROVED;
+        const isRejected = status === AssetStatus.REJECTED;
+        await this.notificationOrchestrator.buildAndSave(
+          asset.partner.user.id,
+          isApproved
+            ? 'asset.approved'
+            : isRejected
+              ? 'asset.rejected'
+              : 'asset.status_updated',
+          {
+            title: isApproved
+              ? 'Asset Approved!'
+              : isRejected
+                ? 'Asset Listing Rejected'
+                : 'Asset Status Updated',
+            message: isApproved
+              ? `Your asset "${asset.title}" has been approved.`
+              : isRejected
+                ? `Your asset "${asset.title}" was rejected. Reason: ${rejectionReason}`
+                : `Your asset status changed to ${status}.`,
+            reason: rejectionReason,
+            assetId: asset.id,
+            timestamp: new Date(),
+          },
+        );
+      } catch (err) {
+        this.logger.error(`Failed to send asset status notification: ${err}`);
+      }
+    }
 
     return updatedAsset;
   }
@@ -663,7 +873,6 @@ export class AdminService {
 
     const nextActiveState = !partner.user.isActive;
 
-    // 1. BLOCKCHAIN GATE
     if (partner.user.walletAddress) {
       await this.blockchainService.toggleFreeze(
         partner.user.walletAddress,
@@ -671,38 +880,59 @@ export class AdminService {
       );
     }
 
-    // 2. DB UPDATE
-    partner.user.isActive = nextActiveState;
-    await this.dataSource.manager.save(User, partner.user);
+    const result = await this.dataSource.transaction(async (manager) => {
+      partner.user.isActive = nextActiveState;
+      await manager.save(User, partner.user);
 
-    await this.auditService.log({
-      adminId,
-      action: nextActiveState
-        ? AdminAction.APPROVE
-        : AdminAction.USER_SUSPENDED,
-      targetId: partnerId,
-      reason:
-        reason ||
-        (nextActiveState ? 'Manual Reactivation' : 'Manual Suspension'),
+      await this.auditService.log(
+        {
+          adminId,
+          action: nextActiveState
+            ? AdminAction.APPROVE
+            : AdminAction.USER_SUSPENDED,
+          targetId: partnerId,
+          reason:
+            reason ||
+            (nextActiveState ? 'Manual Reactivation' : 'Manual Suspension'),
+        },
+        manager,
+      );
+
+      return { success: true, isActive: partner.user.isActive };
     });
 
-    return { success: true, isActive: partner.user.isActive };
-  }
+    // 🛡️ NOTIFICATION: Inform partner freeze state updated
+    try {
+      await this.notificationOrchestrator.buildAndSave(
+        partner.user.id,
+        nextActiveState ? 'partner.unfrozen' : 'partner.frozen',
+        {
+          title: nextActiveState
+            ? 'Partner Account Reactivated'
+            : 'Partner Account Suspended',
+          message: nextActiveState
+            ? 'Your partner account has been reactivated.'
+            : `Your partner account has been suspended. Reason: ${reason || 'Compliance'}`,
+          timestamp: new Date(),
+        },
+      );
+    } catch (err) {
+      this.logger.error(`Failed to send partner freeze notification: ${err}`);
+    }
 
-  // src/admin/admin.service.ts
+    return result;
+  }
 
   async getExplorerData(query: string | undefined, page: number = 1) {
     const limit = 20;
 
     if (query && query.trim() !== '') {
-      // 1. Search Chain Events (by txHash OR eventName)
       const events = await this.chainEventRepo
         .createQueryBuilder('log')
         .where('log.txHash ILIKE :query', { query: `%${query}%` })
         .orWhere('log.eventName ILIKE :query', { query: `%${query}%` })
         .getMany();
 
-      // 2. Search Audit Logs (by targetId)
       const audits = await this.auditLogRepo
         .createQueryBuilder('audit')
         .where('audit.targetId = :query', { query })
@@ -713,7 +943,6 @@ export class AdminService {
       );
     }
 
-    // Default view
     return await this.chainEventRepo.find({
       order: { createdAt: 'DESC' },
       take: limit,
@@ -736,32 +965,74 @@ export class AdminService {
   }
 
   async getTransactionDetail(txHash: string) {
-    // 1. Get the Chain Reality
     const event = await this.chainEventRepo.findOne({ where: { txHash } });
-
-    // 2. Get the Admin Intent (The AuditLog)
     const audit = await this.auditLogRepo.findOne({ where: { txHash } });
 
     if (!event) throw new NotFoundException('Transaction not found on chain');
 
     return {
-      event, // The "Truth": Contract event details
-      audit, // The "Intent": Which admin did this and why
+      event,
+      audit,
       block: event.blockNumber,
       timestamp: event.createdAt,
     };
   }
 
-  // Inside AdminService.ts
-  async updateAssetPrice(id: string, newPrice: number) {
+  /**
+   * 🛡️ Upgraded Asset Price Update with mandatory admin audit recording
+   */
+  async updateAssetPrice(id: string, newPrice: number, adminId: string) {
     return await this.mutex.runExclusive(async () => {
-      // 1. Update Database
-      await this.assetRepo.update(id, { unitPrice: newPrice });
+      const asset = await this.assetRepo.findOne({
+        where: { id },
+        relations: ['partner', 'partner.user'],
+      });
+      if (!asset) throw new NotFoundException(`Asset record ${id} not found.`);
 
-      // 2. Sync to Blockchain (this now waits for the previous sync to fully finish)
-      await this.oracleService.syncAssetPriceToOracle(id);
+      const oldPrice = asset.unitPrice;
 
-      return await this.assetRepo.findOne({ where: { id } });
+      const updatedAsset = await this.dataSource.transaction(
+        async (manager) => {
+          await manager.update(Asset, id, { unitPrice: newPrice });
+          await this.oracleService.syncAssetPriceToOracle(id);
+
+          await this.auditService.log(
+            {
+              adminId,
+              targetId: id,
+              action: AdminAction.APPROVE,
+              reason: `Asset valuation adjusted from SAR ${oldPrice} to SAR ${newPrice}`,
+            },
+            manager,
+          );
+
+          return await manager.findOne(Asset, { where: { id } });
+        },
+      );
+
+      // 🛡️ NOTIFICATION: Inform partner of asset price update
+      if (asset?.partner?.user?.id) {
+        try {
+          await this.notificationOrchestrator.buildAndSave(
+            asset.partner.user.id,
+            'asset.price_updated',
+            {
+              title: 'Asset Valuation Updated',
+              message: `The unit price for "${asset.title}" has been updated from SAR ${oldPrice} to SAR ${newPrice}.`,
+              assetId: asset.id,
+              oldPrice,
+              newPrice,
+              timestamp: new Date(),
+            },
+          );
+        } catch (err) {
+          this.logger.error(
+            `Failed to send asset price update notification: ${err}`,
+          );
+        }
+      }
+
+      return updatedAsset;
     });
   }
 }

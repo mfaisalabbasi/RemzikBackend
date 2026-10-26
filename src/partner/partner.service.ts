@@ -2,6 +2,7 @@ import {
   Injectable,
   BadRequestException,
   NotFoundException,
+  Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, EntityManager } from 'typeorm';
@@ -11,10 +12,13 @@ import { UpdatePartnerCompanyDto } from './dto/update-partner-only.dto';
 import { PartnerStatus } from './enums/partner-status.enum';
 import { Asset } from '../asset/asset.entity';
 import { StorageService } from '../storage/storage.service';
+import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
 import { v4 as uuid } from 'uuid';
 
 @Injectable()
 export class PartnerService {
+  private readonly logger = new Logger(PartnerService.name);
+
   constructor(
     @InjectRepository(PartnerProfile)
     private readonly partnerRepo: Repository<PartnerProfile>,
@@ -23,9 +27,9 @@ export class PartnerService {
     private readonly assetRepo: Repository<Asset>,
 
     private readonly storageService: StorageService,
+    private readonly notificationOrchestrator: NotificationOrchestrator,
   ) {}
 
-  // ✅ UPDATED: Added manager for transaction support
   async createProfile(
     userId: string,
     dto: CreatePartnerProfileDto,
@@ -50,7 +54,25 @@ export class PartnerService {
       user: { id: userId },
     });
 
-    return repo.save(profile);
+    const savedProfile = await repo.save(profile);
+
+    // 🛡️ NOTIFICATION: Inform partner profile submitted
+    try {
+      await this.notificationOrchestrator.buildAndSave(
+        userId,
+        'partner.created',
+        {
+          title: 'Partner Application Submitted',
+          message: `Your application for "${dto.companyName}" has been submitted and is pending review.`,
+          companyName: dto.companyName,
+          timestamp: new Date(),
+        },
+      );
+    } catch (err) {
+      this.logger.error(`Failed to send partner creation notification: ${err}`);
+    }
+
+    return savedProfile;
   }
 
   async getMyProfile(userId: string): Promise<PartnerProfile> {
@@ -89,27 +111,86 @@ export class PartnerService {
   }
 
   async updateStatus(id: string, status: PartnerStatus) {
-    const partner = await this.partnerRepo.findOneBy({ id });
-    if (!partner) throw new NotFoundException();
+    const partner = await this.partnerRepo.findOne({
+      where: { id },
+      relations: ['user'],
+    });
+    if (!partner) throw new NotFoundException('Partner not found');
     if (partner.status !== PartnerStatus.PENDING) {
       throw new BadRequestException('Status already decided');
     }
     partner.status = status;
-    return this.partnerRepo.save(partner);
+    const saved = await this.partnerRepo.save(partner);
+
+    if (status === PartnerStatus.APPROVED && partner.user) {
+      await this.approve(partner.id);
+    } else if (status === PartnerStatus.REJECTED && partner.user) {
+      await this.reject(partner.id, 'Status updated by administrator');
+    }
+
+    return saved;
   }
 
   async approve(partnerId: string) {
-    const partner = await this.partnerRepo.findOneBy({ id: partnerId });
+    const partner = await this.partnerRepo.findOne({
+      where: { id: partnerId },
+      relations: ['user'],
+    });
     if (!partner) throw new NotFoundException('Partner not found');
+
     partner.status = PartnerStatus.APPROVED;
     await this.partnerRepo.save(partner);
+
+    // 🛡️ NOTIFICATION: Inform partner account approved
+    if (partner.user) {
+      try {
+        await this.notificationOrchestrator.buildAndSave(
+          partner.user.id,
+          'partner.approved',
+          {
+            title: 'Partner Account Approved!',
+            message: `Your company profile "${partner.companyName}" has been approved. You can now list and manage assets.`,
+            companyName: partner.companyName,
+            timestamp: new Date(),
+          },
+        );
+      } catch (err) {
+        this.logger.error(
+          `Failed to send partner approval notification: ${err}`,
+        );
+      }
+    }
   }
 
   async reject(partnerId: string, reason?: string) {
-    const partner = await this.partnerRepo.findOneBy({ id: partnerId });
+    const partner = await this.partnerRepo.findOne({
+      where: { id: partnerId },
+      relations: ['user'],
+    });
     if (!partner) throw new NotFoundException('Partner not found');
+
     partner.status = PartnerStatus.REJECTED;
     await this.partnerRepo.save(partner);
+
+    // 🛡️ NOTIFICATION: Inform partner account rejected
+    if (partner.user) {
+      try {
+        await this.notificationOrchestrator.buildAndSave(
+          partner.user.id,
+          'partner.rejected',
+          {
+            title: 'Partner Application Rejected',
+            message: `Your partner application was rejected.${reason ? ` Reason: ${reason}` : ''}`,
+            reason: reason || 'Not specified',
+            timestamp: new Date(),
+          },
+        );
+      } catch (err) {
+        this.logger.error(
+          `Failed to send partner rejection notification: ${err}`,
+        );
+      }
+    }
   }
 
   async getProfile(userId: string) {
@@ -229,6 +310,7 @@ export class PartnerService {
       where: {
         status: PartnerStatus.PENDING,
       },
+      relations: ['user'],
     });
   }
 
@@ -239,7 +321,6 @@ export class PartnerService {
 
     if (!profile) throw new NotFoundException('Partner profile not found');
 
-    // Prevent re-upload if already approved
     if (profile.status === PartnerStatus.APPROVED) {
       throw new BadRequestException('Profile already approved');
     }
@@ -266,9 +347,27 @@ export class PartnerService {
 
     profile.commercialRegistration = crUrl;
     profile.amlPolicy = taxUrl;
-    profile.status = PartnerStatus.PENDING; // Reset to pending for admin review
+    profile.status = PartnerStatus.PENDING;
 
     await this.partnerRepo.save(profile);
+
+    // 🛡️ NOTIFICATION: Inform partner documents uploaded
+    try {
+      await this.notificationOrchestrator.buildAndSave(
+        userId,
+        'partner.docs_uploaded',
+        {
+          title: 'Business Documents Uploaded',
+          message:
+            'Your commercial registration and tax documents have been submitted for review.',
+          timestamp: new Date(),
+        },
+      );
+    } catch (err) {
+      this.logger.error(
+        `Failed to send partner docs uploaded notification: ${err}`,
+      );
+    }
 
     return {
       message: 'Business documents uploaded successfully',

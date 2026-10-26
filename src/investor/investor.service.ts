@@ -2,6 +2,7 @@ import {
   Injectable,
   BadRequestException,
   NotFoundException,
+  Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, EntityManager } from 'typeorm';
@@ -17,9 +18,12 @@ import { InvestmentService } from 'src/investment/investment.service';
 import { InvestmentStatus } from 'src/investment/enums/investment-status.enum';
 import { LedgerService } from 'src/ledger/ledger.service';
 import { TradeService } from 'src/secondary-market/trade/trade.service';
+import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
 
 @Injectable()
 export class InvestorService {
+  private readonly logger = new Logger(InvestorService.name);
+
   constructor(
     @InjectRepository(InvestorProfile)
     private readonly investorRepo: Repository<InvestorProfile>,
@@ -34,6 +38,7 @@ export class InvestorService {
     private readonly investmentService: InvestmentService,
     private readonly ledgerService: LedgerService,
     private readonly tradeService: TradeService,
+    private readonly notificationOrchestrator: NotificationOrchestrator,
   ) {}
 
   async getSecondaryMarketPositions(userId: string) {
@@ -78,7 +83,27 @@ export class InvestorService {
     if (existing) throw new BadRequestException('Profile exists');
 
     const profile = repo.create({ user: { id: userId } as User });
-    return repo.save(profile);
+    const savedProfile = await repo.save(profile);
+
+    // 🛡️ NOTIFICATION: Inform investor profile created
+    try {
+      await this.notificationOrchestrator.buildAndSave(
+        userId,
+        'investor.profile_created',
+        {
+          title: 'Investor Profile Initialized',
+          message:
+            'Your investor account has been successfully set up and is ready for funding.',
+          timestamp: new Date(),
+        },
+      );
+    } catch (err) {
+      this.logger.error(
+        `Failed to send investor profile creation notification: ${err}`,
+      );
+    }
+
+    return savedProfile;
   }
 
   async getMyProfile(userId: string): Promise<InvestorProfile> {
@@ -90,7 +115,6 @@ export class InvestorService {
     return profile;
   }
 
-  // ✅ UPDATED: Strict admin batchId check, structured distribution sync & explicit distStatus exposure
   async getProfileData(userId: string) {
     const profile = await this.getMyProfile(userId);
     const investments = await this.investmentService.getMyInvestments(userId);
@@ -152,7 +176,7 @@ export class InvestorService {
           assetTitle: inv.assetTitle || inv.asset?.title || 'Asset',
           amountInvested: Number(inv.amount),
           status: resolvedStatus,
-          distStatus: resolvedStatus, // Explicitly exposed for frontend destructuring
+          distStatus: resolvedStatus,
           image: inv.image || inv.asset?.imageUrl || '/slider/real-estate.jpg',
           roi: inv.roi,
           batchId: effectiveDist?.batchId || inv.batchId || undefined,
@@ -187,6 +211,25 @@ export class InvestorService {
     if (profile && data.distributionMode) {
       profile.distributionMode = data.distributionMode as any;
       await this.investorRepo.save(profile);
+    }
+
+    // 🛡️ NOTIFICATION: Inform investor profile updated
+    try {
+      await this.notificationOrchestrator.buildAndSave(
+        userId,
+        'investor.profile_updated',
+        {
+          title: 'Profile Updated',
+          message:
+            'Your investor account preferences have been successfully updated.',
+          distributionMode: data.distributionMode || profile?.distributionMode,
+          timestamp: new Date(),
+        },
+      );
+    } catch (err) {
+      this.logger.error(
+        `Failed to send investor profile update notification: ${err}`,
+      );
     }
 
     return {

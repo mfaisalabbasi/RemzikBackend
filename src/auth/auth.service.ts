@@ -2,6 +2,7 @@ import {
   Injectable,
   UnauthorizedException,
   InternalServerErrorException,
+  Logger,
 } from '@nestjs/common';
 import { UserService } from '../user/user.service';
 import { JwtService } from '@nestjs/jwt';
@@ -9,16 +10,20 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { User } from '../user/user.entity';
 import { WalletProvisionService } from './wallet-provision.service';
+import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
 import * as crypto from 'crypto';
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private userService: UserService,
     private jwtService: JwtService,
     private walletProvisionService: WalletProvisionService,
     @InjectRepository(User)
     private userRepository: Repository<User>,
+    private notificationOrchestrator: NotificationOrchestrator,
   ) {}
 
   async login(email: string, password: string) {
@@ -32,6 +37,17 @@ export class AuthService {
     };
 
     const accessToken = this.jwtService.sign(payload);
+
+    // 🛡️ NOTIFICATION: Inform user of login session
+    try {
+      await this.notificationOrchestrator.buildAndSave(user.id, 'auth.login', {
+        title: 'New Login Detected',
+        message: 'You have successfully signed into your account.',
+        timestamp: new Date(),
+      });
+    } catch (err) {
+      this.logger.error(`Failed to send login notification: ${err}`);
+    }
 
     return {
       accessToken,
@@ -64,7 +80,7 @@ export class AuthService {
 
     // 🚀 Self-Healing: Provision wallet automatically if missing during registration
     if (!user.privyUserId || !user.walletAddress) {
-      console.log(
+      this.logger.log(
         `ℹ️ [AuthService] Provisioning missing Privy wallet for user ${userId}...`,
       );
       const provisioned =
@@ -72,6 +88,25 @@ export class AuthService {
       user.privyUserId = provisioned.privyUserId;
       user.walletAddress = provisioned.walletAddress;
       await this.userRepository.save(user);
+
+      // 🛡️ NOTIFICATION: Inform user wallet provisioned
+      try {
+        await this.notificationOrchestrator.buildAndSave(
+          userId,
+          'auth.wallet_provisioned',
+          {
+            title: 'Embedded Wallet Provisioned',
+            message:
+              'Your on-chain embedded wallet has been created successfully.',
+            walletAddress: user.walletAddress,
+            timestamp: new Date(),
+          },
+        );
+      } catch (err) {
+        this.logger.error(
+          `Failed to send wallet provision notification: ${err}`,
+        );
+      }
     }
 
     const now = Math.floor(Date.now() / 1000);
@@ -121,7 +156,7 @@ export class AuthService {
       const token = `${tokenData}.${signature}`;
       return { token, walletAddress: user.walletAddress };
     } catch (error: any) {
-      console.error('❌ Failed to sign custom Privy token:', error);
+      this.logger.error('❌ Failed to sign custom Privy token:', error);
       throw new InternalServerErrorException(
         'Could not generate secure session token: ' + (error.message || error),
       );

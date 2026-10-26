@@ -117,9 +117,6 @@ export class AdminController {
     return this.adminService.approveKyc(id, req.user.userId);
   }
 
-  /**
-   * FIXED: Standardized to req.user.userId to ensure Audit Logs get the Admin ID
-   */
   @Patch('investors/:id/reject-kyc')
   @Roles(UserRole.ADMIN)
   async reject(
@@ -308,10 +305,11 @@ export class AdminController {
       req.user.userId,
     );
   }
+
   @Patch('partners/:id/toggle-freeze')
   @Roles(UserRole.ADMIN)
   async togglePartnerFreeze(
-    @Param('id') id: string, // partnerProfileId
+    @Param('id') id: string,
     @Body('reason') reason: string,
     @Req() req,
   ) {
@@ -346,16 +344,21 @@ export class AdminController {
     @Body('newPrice') newPrice: number,
     @Req() req,
   ) {
-    // 1. Update your database via AdminService (or directly via repository)
-    // Assuming you have a method in adminService to handle this:
-    const updatedAsset = await this.adminService.updateAssetPrice(id, newPrice);
+    const adminId = req.user?.userId;
 
-    // 2. Sync the new price to the Blockchain Oracle
-    const txHash = await this.oracleService.syncAssetPriceToOracle(id);
+    if (!adminId) {
+      throw new UnauthorizedException('Admin ID not found in token');
+    }
+
+    // Passes id, newPrice, and adminId to AdminService (which handles DB update, oracle sync, and audit log)
+    const updatedAsset = await this.adminService.updateAssetPrice(
+      id,
+      newPrice,
+      adminId,
+    );
 
     return {
       message: 'Asset price updated and synced to blockchain',
-      txHash,
       updatedAsset,
     };
   }

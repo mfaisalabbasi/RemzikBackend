@@ -17,6 +17,7 @@ import { BlockchainService } from 'src/blockchain/blockchain.service';
 import { ethers } from 'ethers';
 import { InvestorProfile } from 'src/investor/investor.entity';
 import { StandardMerkleTree } from '@openzeppelin/merkle-tree';
+import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
 
 @Injectable()
 export class DistributionService {
@@ -33,6 +34,7 @@ export class DistributionService {
     private readonly walletService: WalletService,
     private readonly dataSource: DataSource,
     private readonly blockchainService: BlockchainService,
+    private readonly notificationOrchestrator: NotificationOrchestrator,
   ) {}
 
   // OpenZeppelin standard tree generator using structured leaf values [address, uint256]
@@ -109,6 +111,8 @@ export class DistributionService {
     totalAmount: number,
     existingManager?: EntityManager,
   ) {
+    let batchIdResult = '';
+
     const work = async (manager: EntityManager) => {
       const partnerBalance =
         await this.walletService.getAvailableBalance(partnerUserId);
@@ -135,6 +139,7 @@ export class DistributionService {
       );
 
       const batchId = `BATCH-${Date.now()}-${assetId.substring(0, 4)}`;
+      batchIdResult = batchId;
       let allocatedGrossTotal = 0;
 
       for (let i = 0; i < currentHolders.length; i++) {
@@ -178,9 +183,30 @@ export class DistributionService {
       };
     };
 
-    return existingManager
-      ? work(existingManager)
+    const res = existingManager
+      ? await work(existingManager)
       : await this.dataSource.transaction(work);
+
+    // 🛡️ NOTIFICATION: Inform partner that distribution batch was created
+    try {
+      await this.notificationOrchestrator.buildAndSave(
+        partnerUserId,
+        'distribution.batched',
+        {
+          title: 'Distribution Batch Created',
+          message: `Yield distribution batch ${batchIdResult} for SAR ${totalAmount} has been submitted for approval.`,
+          batchId: batchIdResult,
+          amount: totalAmount,
+          timestamp: new Date(),
+        },
+      );
+    } catch (err) {
+      this.logger.error(
+        `Failed to send distribution batch notification: ${err}`,
+      );
+    }
+
+    return res;
   }
 
   async approveDistributionBatch(batchId: string) {
@@ -513,8 +539,7 @@ export class DistributionService {
   async confirmOnChainClaim(batchId: string, userId: string) {
     const cleanBatchId = batchId.trim();
 
-    return await this.dataSource.transaction(async (manager) => {
-      // 1. Find the investor profile tied to the authenticated user
+    const result = await this.dataSource.transaction(async (manager) => {
       const investor = await manager.findOne(InvestorProfile, {
         where: { user: { id: userId } },
       });
@@ -523,27 +548,57 @@ export class DistributionService {
         throw new NotFoundException('Investor profile not found for user.');
       }
 
-      // 2. Fetch the specific distribution row matching BOTH batchId and investorId
-      const distRows = await manager.query(
-        `SELECT id, status, "investorId" FROM distributions WHERE "batchId" = $1 AND "investorId" = $2 LIMIT 1`,
-        [cleanBatchId, investor.id],
-      );
+      const distribution = await manager.findOne(Distribution, {
+        where: {
+          batchId: cleanBatchId,
+          investor: { id: investor.id },
+        },
+      });
 
-      if (!distRows || distRows.length === 0) {
+      if (!distribution) {
         throw new NotFoundException(
           'On-chain distribution record not found for user.',
         );
       }
 
-      // 3. Update ONLY this specific user's record status to PAID
-      await manager.query(
-        `UPDATE distributions SET status = 'PAID', "updatedAt" = NOW() WHERE id = $1`,
-        [distRows[0].id],
-      );
+      if (distribution.status === PayoutStatus.PAID) {
+        throw new BadRequestException('This yield has already been claimed.');
+      }
 
-      return { success: true, status: 'PAID' };
+      distribution.status = PayoutStatus.PAID;
+      await manager.save(distribution);
+
+      return { success: true, status: PayoutStatus.PAID };
     });
+
+    // 🛡️ NOTIFICATION: Inform investor of successful claim (with explicit error logging)
+    try {
+      this.logger.log(
+        `📢 Triggering distribution.claimed notification for user: ${userId}`,
+      );
+      await this.notificationOrchestrator.buildAndSave(
+        userId,
+        'distribution.claimed',
+        {
+          title: 'Yield Claimed Successfully',
+          message: `Your on-chain yield claim for batch ${cleanBatchId} has been successfully verified and completed.`,
+          batchId: cleanBatchId,
+          timestamp: new Date(),
+        },
+      );
+      this.logger.log(
+        `✅ Claim notification successfully created and dispatched.`,
+      );
+    } catch (err: any) {
+      this.logger.error(
+        `❌ Failed to send claim notification FULL ERROR: ${err?.message}`,
+        err?.stack,
+      );
+    }
+
+    return result;
   }
+
   async getUserDistributions(userId: string) {
     const investor = await this.dataSource
       .getRepository(InvestorProfile)

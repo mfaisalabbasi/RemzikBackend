@@ -20,6 +20,7 @@ import { OwnershipService } from '../ownership/ownership.service';
 import { Trade } from '../secondary-market/trade/trade.entity';
 import { BlockchainService } from '../blockchain/blockchain.service';
 import { TradeStatus } from 'src/secondary-market/trade/enums/trade-status.enum';
+import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
 
 @Injectable()
 export class DisputeService {
@@ -36,10 +37,11 @@ export class DisputeService {
     private readonly dataSource: DataSource,
     private readonly ownershipService: OwnershipService,
     private readonly blockchainService: BlockchainService,
+    private readonly notificationOrchestrator: NotificationOrchestrator,
   ) {}
 
   async createDispute(userId: string, dto: CreateDisputeDto) {
-    return await this.dataSource.transaction(async (manager) => {
+    const savedDispute = await this.dataSource.transaction(async (manager) => {
       const existingDispute = await manager.findOne(Dispute, {
         where: { referenceId: dto.referenceId },
       });
@@ -58,7 +60,7 @@ export class DisputeService {
         status: DisputeStatus.OPEN,
       });
 
-      const savedDispute = await manager.save(dispute);
+      const saved = await manager.save(dispute);
 
       if (
         dto.type === DisputeType.TRADE ||
@@ -79,15 +81,33 @@ export class DisputeService {
       await this.auditService.log(
         {
           adminId: userId,
-          targetId: savedDispute.id,
+          targetId: saved.id,
           action: AdminAction.DISPUTE_OPENED,
           reason: `System-level freeze initiated for ${dto.type} ID: ${dto.referenceId}`,
         },
         manager,
       );
 
-      return savedDispute;
+      return saved;
     });
+
+    // 🛡️ NOTIFICATION: Inform user that dispute has been opened
+    try {
+      await this.notificationOrchestrator.buildAndSave(
+        userId,
+        'dispute.created',
+        {
+          title: 'Dispute Case Opened',
+          message: `Your dispute for ${dto.type} reference (${dto.referenceId}) has been initiated and is under review.`,
+          referenceId: dto.referenceId,
+          timestamp: new Date(),
+        },
+      );
+    } catch (err) {
+      this.logger.error(`Failed to send dispute creation notification: ${err}`);
+    }
+
+    return savedDispute;
   }
 
   async resolveDispute(
@@ -113,114 +133,137 @@ export class DisputeService {
         );
       }
 
-      return await this.dataSource.transaction(async (manager) => {
-        let txReceipt: ethers.TransactionReceipt | null = null;
-        let txHash: string | null = null;
+      const updatedDispute = await this.dataSource.transaction(
+        async (manager) => {
+          let txReceipt: ethers.TransactionReceipt | null = null;
+          let txHash: string | null = null;
 
-        if (
-          dto.status === DisputeStatus.RESOLVED_FAVOR_SELLER &&
-          (dispute.type === DisputeType.TRADE ||
-            dispute.type === DisputeType.SECONDARY_TRADE)
-        ) {
-          const trade = await manager.getRepository(Trade).findOne({
-            where: { id: dispute.referenceId },
-            relations: [
-              'seller',
-              'seller.user',
-              'buyer',
-              'buyer.user',
-              'asset',
-            ],
-          });
+          if (
+            dto.status === DisputeStatus.RESOLVED_FAVOR_SELLER &&
+            (dispute.type === DisputeType.TRADE ||
+              dispute.type === DisputeType.SECONDARY_TRADE)
+          ) {
+            const trade = await manager.getRepository(Trade).findOne({
+              where: { id: dispute.referenceId },
+              relations: [
+                'seller',
+                'seller.user',
+                'buyer',
+                'buyer.user',
+                'asset',
+              ],
+            });
 
-          const sellerAddr = trade?.seller.user?.walletAddress;
-          const buyerAddr = trade?.buyer.user?.walletAddress;
+            const sellerAddr = trade?.seller.user?.walletAddress;
+            const buyerAddr = trade?.buyer.user?.walletAddress;
 
-          if (!sellerAddr || !buyerAddr) {
-            throw new BadRequestException(
-              'Trade participants lack valid wallet addresses.',
-            );
-          }
-
-          const tokenAmount = trade!.units.toString();
-          this.logger.log(
-            `Initiating on-chain settlement for listingId=${trade!.listingId}, tokenAmount=${tokenAmount}`,
-          );
-
-          try {
-            txReceipt = await this.blockchainService.settleTrade(
-              String(trade!.listingId),
-              sellerAddr,
-              buyerAddr,
-              tokenAmount,
-            );
-            txHash = txReceipt!.hash;
-            this.logger.log(`On-chain settlement succeeded. TX: ${txHash}`);
-          } catch (blockchainErr: any) {
-            this.logger.error(
-              'RAW BLOCKCHAIN SETTLEMENT ERROR:',
-              blockchainErr,
-            );
-            throw new BadRequestException(
-              `On-chain release failed: ${blockchainErr.reason || blockchainErr.message}`,
-            );
-          }
-        }
-
-        if (
-          dispute.type === DisputeType.TRADE ||
-          dispute.type === DisputeType.SECONDARY_TRADE
-        ) {
-          if (dto.status === DisputeStatus.RESOLVED_FAVOR_SELLER) {
-            if (!txReceipt) {
+            if (!sellerAddr || !buyerAddr) {
               throw new BadRequestException(
-                'Missing blockchain transaction receipt.',
+                'Trade participants lack valid wallet addresses.',
               );
             }
-            await this.handleFinancialResolution(
-              dispute.referenceId,
-              dto.status,
-              manager,
-              txReceipt,
+
+            const tokenAmount = trade!.units.toString();
+            this.logger.log(
+              `Initiating on-chain settlement for listingId=${trade!.listingId}, tokenAmount=${tokenAmount}`,
             );
-          } else {
-            await this.handleFinancialResolution(
-              dispute.referenceId,
-              dto.status,
-              manager,
-              undefined,
-            );
+
+            try {
+              txReceipt = await this.blockchainService.settleTrade(
+                String(trade!.listingId),
+                sellerAddr,
+                buyerAddr,
+                tokenAmount,
+              );
+              txHash = txReceipt!.hash;
+              this.logger.log(`On-chain settlement succeeded. TX: ${txHash}`);
+            } catch (blockchainErr: any) {
+              this.logger.error(
+                'RAW BLOCKCHAIN SETTLEMENT ERROR:',
+                blockchainErr,
+              );
+              throw new BadRequestException(
+                `On-chain release failed: ${blockchainErr.reason || blockchainErr.message}`,
+              );
+            }
           }
-        }
 
-        dispute.status = dto.status;
-        dispute.adminNote = dto.adminNote;
-        dispute.adminId = adminId;
-        dispute.resolvedAt = new Date();
-        const updatedDispute = await manager.save(dispute);
+          if (
+            dispute.type === DisputeType.TRADE ||
+            dispute.type === DisputeType.SECONDARY_TRADE
+          ) {
+            if (dto.status === DisputeStatus.RESOLVED_FAVOR_SELLER) {
+              if (!txReceipt) {
+                throw new BadRequestException(
+                  'Missing blockchain transaction receipt.',
+                );
+              }
+              await this.handleFinancialResolution(
+                dispute.referenceId,
+                dto.status,
+                manager,
+                txReceipt,
+              );
+            } else {
+              await this.handleFinancialResolution(
+                dispute.referenceId,
+                dto.status,
+                manager,
+                undefined,
+              );
+            }
+          }
 
-        if (
-          dto.status === DisputeStatus.RESOLVED_FAVOR_SELLER ||
-          dto.status === DisputeStatus.RESOLVED_FAVOR_BUYER
-        ) {
-          await manager.update(Trade, dispute.referenceId, {
-            status: TradeStatus.COMPLETED as any,
-            ...(txHash && { txHash }),
-          });
-        }
+          dispute.status = dto.status;
+          dispute.adminNote = dto.adminNote;
+          dispute.adminId = adminId;
+          dispute.resolvedAt = new Date();
+          const saved = await manager.save(dispute);
 
-        await this.auditService.log(
+          if (
+            dto.status === DisputeStatus.RESOLVED_FAVOR_SELLER ||
+            dto.status === DisputeStatus.RESOLVED_FAVOR_BUYER
+          ) {
+            await manager.update(Trade, dispute.referenceId, {
+              status: TradeStatus.COMPLETED as any,
+              ...(txHash && { txHash }),
+            });
+          }
+
+          await this.auditService.log(
+            {
+              adminId,
+              targetId: disputeId,
+              action: AdminAction.DISPUTE_RESOLVED,
+              reason: `Resolution: ${dto.status}. Note: ${dto.adminNote}`,
+            },
+            manager,
+          );
+
+          return saved;
+        },
+      );
+
+      // 🛡️ NOTIFICATION: Inform user about dispute resolution outcome
+      try {
+        await this.notificationOrchestrator.buildAndSave(
+          dispute.userId,
+          'dispute.resolved',
           {
-            adminId,
-            targetId: disputeId,
-            action: AdminAction.DISPUTE_RESOLVED,
-            reason: `Resolution: ${dto.status}. Note: ${dto.adminNote}`,
+            title: 'Dispute Resolved',
+            message: `Your dispute for reference (${dispute.referenceId}) has been resolved. Outcome: ${dto.status}.`,
+            status: dto.status,
+            referenceId: dispute.referenceId,
+            timestamp: new Date(),
           },
-          manager,
         );
+      } catch (err) {
+        this.logger.error(
+          `Failed to send dispute resolution notification: ${err}`,
+        );
+      }
 
-        return updatedDispute;
-      });
+      return updatedDispute;
     });
   }
 

@@ -5,6 +5,7 @@ import { GovernanceProposal } from './governance.entity';
 import { Asset } from '../asset/asset.entity';
 import { BlockchainService } from '../blockchain/blockchain.service';
 import { ethers } from 'ethers';
+import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
 
 @Injectable()
 export class GovernanceService {
@@ -18,15 +19,19 @@ export class GovernanceService {
     private assetRepo: Repository<Asset>,
 
     private blockchainService: BlockchainService,
+    private notificationOrchestrator: NotificationOrchestrator,
   ) {}
 
   /**
-   * 1. Submit proposal to the blockchain
+   * Submit proposal to the blockchain
    * 2. Parse the on-chain proposalId from logs
    * 3. Save proposal record with proposalId in the database
    */
   async proposeAction(assetId: string, description: string, duration: number) {
-    const asset = await this.assetRepo.findOneBy({ id: assetId });
+    const asset = await this.assetRepo.findOne({
+      where: { id: assetId },
+      relations: ['partner', 'partner.user'],
+    });
 
     if (!asset || !asset.governanceAddress) {
       throw new Error('Asset governance contract not found.');
@@ -77,13 +82,37 @@ export class GovernanceService {
       }
 
       // 3. Save to database with the required proposalId
-      return await this.proposalRepo.save({
+      const savedProposal = await this.proposalRepo.save({
         proposalId: onChainProposalId,
         asset: { id: assetId },
         description,
         status: 'PENDING',
         txHash: tx.hash,
       });
+
+      // 🛡️ NOTIFICATION: Inform partner/stakeholders of new proposal
+      try {
+        const partnerUserId = asset.partner?.user?.id;
+        if (partnerUserId) {
+          await this.notificationOrchestrator.buildAndSave(
+            partnerUserId,
+            'governance.proposal_created',
+            {
+              title: 'Governance Proposal Created',
+              message: `A new proposal has been submitted for asset "${asset.title}".`,
+              proposalId: onChainProposalId,
+              assetId,
+              timestamp: new Date(),
+            },
+          );
+        }
+      } catch (err) {
+        this.logger.error(
+          `Failed to send proposal creation notification: ${err}`,
+        );
+      }
+
+      return savedProposal;
     } catch (error: any) {
       this.logger.error(
         `Proposal creation failed for asset ${assetId}: ${error.message}`,
@@ -97,7 +126,10 @@ export class GovernanceService {
    * Finalizes an existing proposal on the blockchain.
    */
   async executeProposal(assetId: string, proposalId: number) {
-    const asset = await this.assetRepo.findOneBy({ id: assetId });
+    const asset = await this.assetRepo.findOne({
+      where: { id: assetId },
+      relations: ['partner', 'partner.user'],
+    });
 
     if (!asset || !asset.governanceAddress) throw new Error('Asset not found.');
 
@@ -111,6 +143,28 @@ export class GovernanceService {
         { asset: { id: assetId }, proposalId },
         { status: 'EXECUTED' },
       );
+
+      // 🛡️ NOTIFICATION: Inform partner of proposal execution
+      try {
+        const partnerUserId = asset.partner?.user?.id;
+        if (partnerUserId) {
+          await this.notificationOrchestrator.buildAndSave(
+            partnerUserId,
+            'governance.proposal_executed',
+            {
+              title: 'Governance Proposal Executed',
+              message: `Proposal #${proposalId} for asset "${asset.title}" has been successfully executed.`,
+              proposalId,
+              assetId,
+              timestamp: new Date(),
+            },
+          );
+        }
+      } catch (err) {
+        this.logger.error(
+          `Failed to send proposal execution notification: ${err}`,
+        );
+      }
 
       return { success: true };
     } catch (error: any) {
@@ -130,6 +184,11 @@ export class GovernanceService {
       throw new Error('Missing assetId or governanceAddress.');
     }
 
+    const asset = await this.assetRepo.findOne({
+      where: { id: assetId },
+      relations: ['partner', 'partner.user'],
+    });
+
     try {
       // On-chain call
       await this.blockchainService.triggerLiquidationOnChain(governanceAddress);
@@ -145,9 +204,27 @@ export class GovernanceService {
         status: 'LIQUIDATED',
       } as any);
 
+      // 🛡️ NOTIFICATION: Inform partner of asset liquidation
+      try {
+        const partnerUserId = asset?.partner?.user?.id;
+        if (partnerUserId) {
+          await this.notificationOrchestrator.buildAndSave(
+            partnerUserId,
+            'governance.liquidated',
+            {
+              title: 'Asset Liquidated',
+              message: `The liquidation kill-switch has been triggered for asset "${asset?.title || assetId}".`,
+              assetId,
+              timestamp: new Date(),
+            },
+          );
+        }
+      } catch (err) {
+        this.logger.error(`Failed to send liquidation notification: ${err}`);
+      }
+
       return { success: true };
     } catch (error: any) {
-      // 🛡️ PERMANENT FIX: Catch EnforcedPause() or VM custom error desyncs gracefully
       if (
         error.message?.includes('EnforcedPause') ||
         error.message?.includes('0xd93c0665') ||

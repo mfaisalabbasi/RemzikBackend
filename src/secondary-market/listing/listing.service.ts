@@ -18,6 +18,7 @@ import { AdminAction } from 'src/audit/enums/audit-action.enum';
 import { BlockchainService } from 'src/blockchain/blockchain.service';
 import { Asset } from 'src/asset/asset.entity';
 import { User } from 'src/user/user.entity';
+import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
 
 @Injectable()
 export class ListingService {
@@ -35,6 +36,7 @@ export class ListingService {
     private readonly configService: ConfigService,
     @InjectRepository(User)
     private readonly userRepo: Repository<User>,
+    private readonly notificationOrchestrator: NotificationOrchestrator,
   ) {}
 
   async getReservedUnits(userId: string, assetId: string): Promise<number> {
@@ -68,7 +70,7 @@ export class ListingService {
       });
       if (!asset) throw new NotFoundException('Asset not found.');
 
-      return await this.listingRepo.manager.transaction(
+      const savedListing = await this.listingRepo.manager.transaction(
         async (manager: EntityManager) => {
           const listing = manager.create(SecondaryMarketListing, {
             id: listingId,
@@ -95,6 +97,26 @@ export class ListingService {
           return saved;
         },
       );
+
+      // 🛡️ NOTIFICATION: Inform seller listing is active
+      try {
+        await this.notificationOrchestrator.buildAndSave(
+          sellerId,
+          'listing.created',
+          {
+            title: 'Secondary Market Listing Active',
+            message: `Your listing for ${dto.unitsForSale} units of "${asset.title}" is now active on the marketplace.`,
+            listingId: savedListing.id,
+            timestamp: new Date(),
+          },
+        );
+      } catch (err) {
+        this.logger.error(
+          `Failed to send listing creation notification: ${err}`,
+        );
+      }
+
+      return savedListing;
     });
   }
 
@@ -104,7 +126,6 @@ export class ListingService {
   ): Promise<string> {
     return await this.listingMutex.runExclusive(async () => {
       return await this.listingRepo.manager.transaction(async (manager) => {
-        // 🛡️ Clean up stale PENDING listings older than 10 minutes, safely excluding those referenced in trades
         await manager
           .createQueryBuilder()
           .delete()
@@ -183,6 +204,7 @@ export class ListingService {
 
       const listing = await this.listingRepo.findOne({
         where: { id: listingId },
+        relations: ['asset'],
       });
       if (!listing) throw new NotFoundException('Listing record not found.');
 
@@ -192,7 +214,27 @@ export class ListingService {
         listing.txHash = txHash;
       }
 
-      return await this.listingRepo.save(listing);
+      const savedListing = await this.listingRepo.save(listing);
+
+      // 🛡️ NOTIFICATION: Inform seller listing confirmed
+      try {
+        await this.notificationOrchestrator.buildAndSave(
+          listing.sellerId,
+          'listing.confirmed',
+          {
+            title: 'Listing Confirmed',
+            message: `Your listing for "${listing.asset?.title || 'Asset'}" has been confirmed on-chain.`,
+            listingId: savedListing.id,
+            timestamp: new Date(),
+          },
+        );
+      } catch (err) {
+        this.logger.error(
+          `Failed to send listing confirmation notification: ${err}`,
+        );
+      }
+
+      return savedListing;
     });
   }
 
@@ -236,12 +278,31 @@ export class ListingService {
   async cancelListing(listingId: string, userId: string): Promise<void> {
     const listing = await this.listingRepo.findOne({
       where: { id: listingId, sellerId: userId },
+      relations: ['asset'],
     });
     if (!listing) throw new NotFoundException('Listing not found');
 
     try {
       await this.listingRepo.delete({ id: listingId });
       this.logger.log(`Listing ${listingId} successfully removed from DB.`);
+
+      // 🛡️ NOTIFICATION: Inform seller listing cancelled
+      try {
+        await this.notificationOrchestrator.buildAndSave(
+          userId,
+          'listing.cancelled',
+          {
+            title: 'Listing Cancelled',
+            message: `Your listing for "${listing.asset?.title || 'Asset'}" has been cancelled successfully.`,
+            listingId,
+            timestamp: new Date(),
+          },
+        );
+      } catch (err) {
+        this.logger.error(
+          `Failed to send listing cancellation notification: ${err}`,
+        );
+      }
     } catch (error: any) {
       this.logger.error(
         `Failed to delete listing ${listingId}: ${error.message}`,

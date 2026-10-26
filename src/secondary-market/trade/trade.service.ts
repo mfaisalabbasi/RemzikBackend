@@ -5,6 +5,7 @@ import {
   ForbiddenException,
   ConflictException,
   InternalServerErrorException,
+  Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, EntityManager } from 'typeorm';
@@ -26,9 +27,11 @@ import { SecondaryMarketListing } from '../listing/listing.entity';
 import { BlockchainService } from 'src/blockchain/blockchain.service';
 import { Mutex } from 'async-mutex';
 import { ConfigService } from '@nestjs/config';
+import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
 
 @Injectable()
 export class TradeService {
+  private readonly logger = new Logger(TradeService.name);
   private readonly settlementMutex = new Mutex();
 
   constructor(
@@ -41,6 +44,7 @@ export class TradeService {
     private readonly escrowService: EscrowService,
     private readonly blockchainService: BlockchainService,
     private readonly configService: ConfigService,
+    private readonly notificationOrchestrator: NotificationOrchestrator,
   ) {}
 
   async createTrade(
@@ -83,7 +87,7 @@ export class TradeService {
     }
 
     try {
-      return await this.tradeRepo.manager.transaction(
+      const result = await this.tradeRepo.manager.transaction(
         async (manager: EntityManager) => {
           const listing = await manager
             .getRepository(SecondaryMarketListing)
@@ -136,9 +140,41 @@ export class TradeService {
             settlementMode: savedTrade.settlementMode,
             listingId: listing.id,
             totalPrice,
+            sellerUserId: sellerProfile.user?.id,
           };
         },
       );
+
+      // 🛡️ NOTIFICATION: Inform buyer and seller trade intent created
+      try {
+        await this.notificationOrchestrator.buildAndSave(
+          buyer.user.id,
+          'trade.intent_created',
+          {
+            title: 'Trade Intent Created',
+            message: `Your trade intent for listing ${listingId} has been initialized.`,
+            tradeId: result.tradeId,
+            timestamp: new Date(),
+          },
+        );
+
+        if (result.sellerUserId) {
+          await this.notificationOrchestrator.buildAndSave(
+            result.sellerUserId,
+            'trade.intent_created',
+            {
+              title: 'Listing Pending Sale',
+              message: `A buyer has initiated a trade intent for your listing.`,
+              tradeId: result.tradeId,
+              timestamp: new Date(),
+            },
+          );
+        }
+      } catch (err) {
+        this.logger.error(`Failed to send trade intent notification: ${err}`);
+      }
+
+      return result;
     } finally {
       this.tradeLockService.unlock(listingId);
     }
@@ -249,7 +285,7 @@ export class TradeService {
       throw new BadRequestException('On-chain trade transaction reverted.');
     }
 
-    return await this.tradeRepo.manager.transaction(
+    const result = await this.tradeRepo.manager.transaction(
       async (manager: EntityManager) => {
         const lockedTrade = await manager.findOne(Trade, {
           where: { id: tradeId },
@@ -312,6 +348,39 @@ export class TradeService {
         };
       },
     );
+
+    // 🛡️ NOTIFICATION: Inform buyer and seller trade completed successfully
+    try {
+      const assetTitle = trade.asset?.title || 'Asset Shares';
+      if (trade.buyer?.user?.id) {
+        await this.notificationOrchestrator.buildAndSave(
+          trade.buyer.user.id,
+          'trade.completed',
+          {
+            title: 'Trade Completed!',
+            message: `You successfully purchased ${trade.units} units of "${assetTitle}".`,
+            tradeId,
+            timestamp: new Date(),
+          },
+        );
+      }
+      if (trade.seller?.user?.id) {
+        await this.notificationOrchestrator.buildAndSave(
+          trade.seller.user.id,
+          'trade.completed',
+          {
+            title: 'Units Sold Successfully',
+            message: `You successfully sold ${trade.units} units of "${assetTitle}".`,
+            tradeId,
+            timestamp: new Date(),
+          },
+        );
+      }
+    } catch (err) {
+      this.logger.error(`Failed to send trade completion notification: ${err}`);
+    }
+
+    return result;
   }
 
   // =========================================================
@@ -469,11 +538,11 @@ export class TradeService {
     buyer: InvestorProfile,
     txHash: string,
   ): Promise<Trade> {
-    return await this.tradeRepo.manager.transaction(
+    const savedTrade = await this.tradeRepo.manager.transaction(
       async (manager: EntityManager) => {
         let trade = await manager.findOne(Trade, {
           where: { listingId, status: TradeStatus.PENDING },
-          relations: ['seller', 'buyer', 'asset'],
+          relations: ['seller', 'buyer', 'asset', 'seller.user', 'buyer.user'],
           lock: { mode: 'pessimistic_write' },
         });
 
@@ -513,7 +582,7 @@ export class TradeService {
         trade.status = TradeStatus.COMPLETED;
         trade.txHash = txHash;
         trade.settlementMode = SettlementMode.ON_CHAIN;
-        const savedTrade = await manager.save(Trade, trade);
+        const saved = await manager.save(Trade, trade);
 
         await this.ownershipService.removeUnits(
           sellerProfile.id,
@@ -535,20 +604,40 @@ export class TradeService {
         await this.auditService.log(
           {
             adminId: buyer.user.id,
-            targetId: savedTrade.id,
+            targetId: saved.id,
             action: AdminAction.TRADE_COMPLETED,
             reason: `On-chain atomic trade synced successfully via indexer (TX: ${txHash})`,
           },
           manager,
         );
 
-        return savedTrade;
+        return saved;
       },
     );
+
+    // 🛡️ NOTIFICATION: Inform participants of sync completion
+    try {
+      if (buyer?.user?.id) {
+        await this.notificationOrchestrator.buildAndSave(
+          buyer.user.id,
+          'trade.completed',
+          {
+            title: 'Trade Synced & Completed',
+            message: `Your on-chain trade has been successfully synced and completed.`,
+            tradeId: savedTrade.id,
+            timestamp: new Date(),
+          },
+        );
+      }
+    } catch (err) {
+      this.logger.error(`Failed to send sync trade notification: ${err}`);
+    }
+
+    return savedTrade;
   }
 
   async settleTrade(tradeId: string, currentUserId: string): Promise<Trade> {
-    return await this.settlementMutex.runExclusive(async () => {
+    const tradeResult = await this.settlementMutex.runExclusive(async () => {
       const trade = await this.tradeRepo.findOne({
         where: { id: tradeId },
         relations: ['seller', 'seller.user', 'buyer', 'buyer.user', 'asset'],
@@ -627,6 +716,40 @@ export class TradeService {
         return txTrade;
       });
     });
+
+    // 🛡️ NOTIFICATION: Inform buyer and seller escrow settlement completed
+    try {
+      if (tradeResult.buyer?.user?.id) {
+        await this.notificationOrchestrator.buildAndSave(
+          tradeResult.buyer.user.id,
+          'trade.completed',
+          {
+            title: 'Escrow Settlement Completed',
+            message: `Your trade for "${tradeResult.asset?.title || 'Asset'}" has been settled.`,
+            tradeId,
+            timestamp: new Date(),
+          },
+        );
+      }
+      if (tradeResult.seller?.user?.id) {
+        await this.notificationOrchestrator.buildAndSave(
+          tradeResult.seller.user.id,
+          'trade.completed',
+          {
+            title: 'Escrow Released & Paid',
+            message: `Funds for your sold asset units have been released to your account.`,
+            tradeId,
+            timestamp: new Date(),
+          },
+        );
+      }
+    } catch (err) {
+      this.logger.error(
+        `Failed to send escrow settlement notification: ${err}`,
+      );
+    }
+
+    return tradeResult;
   }
 
   async getTrades() {

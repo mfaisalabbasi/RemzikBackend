@@ -3,6 +3,7 @@ import {
   UnauthorizedException,
   BadRequestException,
   InternalServerErrorException,
+  Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource, EntityManager } from 'typeorm';
@@ -20,9 +21,12 @@ import { KycStatus } from '../kyc/enums/kyc-status.enum';
 import { PartnerService } from '../partner/partner.service';
 import { InvestorService } from '../investor/investor.service';
 import { StorageService } from '../storage/storage.service';
+import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
 
 @Injectable()
 export class UserService {
+  private readonly logger = new Logger(UserService.name);
+
   constructor(
     @InjectRepository(User) private userRepo: Repository<User>,
     private jwtService: JwtService,
@@ -30,6 +34,7 @@ export class UserService {
     private partnerService: PartnerService,
     private investorService: InvestorService,
     private storageService: StorageService,
+    private notificationOrchestrator: NotificationOrchestrator,
   ) {}
 
   async registerWithKyc(
@@ -75,10 +80,11 @@ export class UserService {
     }
 
     const hashedPassword = await bcrypt.hash(dto.password, 10);
+    let savedUserId: string | null = null;
 
     // 3. DATABASE TRANSACTION
     try {
-      return await this.dataSource.transaction(
+      const result = await this.dataSource.transaction(
         async (manager: EntityManager) => {
           // Create User
           const user = manager.create(User, {
@@ -89,6 +95,7 @@ export class UserService {
             role: (dto.role as UserRole) ?? UserRole.INVESTOR,
           });
           const savedUser = await manager.save(user);
+          savedUserId = savedUser.id;
 
           // Create Role Profile
           if (savedUser.role === UserRole.PARTNER) {
@@ -101,7 +108,7 @@ export class UserService {
             await this.investorService.createProfile(savedUser.id, manager);
           }
 
-          // Create KYC Record (Direct Instantiation to solve Overload Error)
+          // Create KYC Record
           const kyc = new KycProfile();
           kyc.fullName = dto.fullName;
           kyc.dob = dto.dob;
@@ -132,6 +139,26 @@ export class UserService {
           };
         },
       );
+
+      // 🛡️ NOTIFICATION: Inform user of successful registration & KYC submission
+      if (savedUserId) {
+        try {
+          await this.notificationOrchestrator.buildAndSave(
+            savedUserId,
+            'user.registered',
+            {
+              title: 'Account Registered & KYC Submitted',
+              message:
+                'Your account has been created and your verification documents are under review.',
+              timestamp: new Date(),
+            },
+          );
+        } catch (err) {
+          this.logger.error(`Failed to send registration notification: ${err}`);
+        }
+      }
+
+      return result;
     } catch (error) {
       // 4. CRITICAL S3 CLEANUP ON DB FAILURE
       console.error('Transaction Failed, cleaning up storage...');
@@ -152,10 +179,9 @@ export class UserService {
   }
 
   async validateUser(email: string, password: string): Promise<User> {
-    // Add relations here to fetch the KYC data
     const user = await this.userRepo.findOne({
       where: { email },
-      relations: ['kyc'], // <--- CRITICAL FIX
+      relations: ['kyc'],
     });
 
     if (!user) throw new UnauthorizedException('Invalid credentials');
@@ -186,6 +212,21 @@ export class UserService {
       sameSite: 'lax',
       secure: process.env.NODE_ENV === 'production',
     });
+
+    // 🛡️ NOTIFICATION: Inform user registration completed
+    try {
+      await this.notificationOrchestrator.buildAndSave(
+        savedUser.id,
+        'user.registered',
+        {
+          title: 'Welcome to Remzik!',
+          message: 'Your account has been created successfully.',
+          timestamp: new Date(),
+        },
+      );
+    } catch (err) {
+      this.logger.error(`Failed to send registration notification: ${err}`);
+    }
 
     return {
       message: 'User created successfully',
@@ -227,6 +268,23 @@ export class UserService {
     }
 
     await this.userRepo.save(user);
+
+    // 🛡️ NOTIFICATION: Inform user wallet linked successfully
+    try {
+      await this.notificationOrchestrator.buildAndSave(
+        userId,
+        'user.wallet_linked',
+        {
+          title: 'Wallet Connected',
+          message:
+            'Your cryptographic wallet has been successfully anchored to your profile.',
+          walletAddress,
+          timestamp: new Date(),
+        },
+      );
+    } catch (err) {
+      this.logger.error(`Failed to send wallet link notification: ${err}`);
+    }
 
     return {
       message:

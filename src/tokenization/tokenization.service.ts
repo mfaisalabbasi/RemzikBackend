@@ -1,8 +1,8 @@
 import {
   Injectable,
   BadRequestException,
-  Logger,
   InternalServerErrorException,
+  Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -14,6 +14,7 @@ import { AssetStatus } from '../asset/enums/asset-status.enum';
 import { BlockchainService } from '../blockchain/blockchain.service';
 import { ConfigService } from '@nestjs/config';
 import { OracleService } from 'src/secondary-market/trade/oracle.service';
+import { NotificationOrchestrator } from 'src/notifications/notifications.orchestrator';
 
 @Injectable()
 export class TokenizationService {
@@ -32,6 +33,7 @@ export class TokenizationService {
     private readonly blockchainService: BlockchainService,
     private readonly configService: ConfigService,
     private readonly oracleService: OracleService,
+    private readonly notificationOrchestrator: NotificationOrchestrator,
   ) {}
 
   async tokenizeAsset(assetId: string, dto: CreateTokenizationDto) {
@@ -39,7 +41,7 @@ export class TokenizationService {
       // 1. Fetch and Validate
       const asset = await this.assetRepo.findOne({
         where: { id: assetId },
-        relations: ['partner'],
+        relations: ['partner', 'partner.user'],
       });
 
       if (!asset) throw new BadRequestException('Asset not found');
@@ -125,6 +127,28 @@ export class TokenizationService {
         await this.assetRepo.update(assetId, {
           status: AssetStatus.SYNC_PENDING,
         });
+      }
+
+      // 🛡️ NOTIFICATION: Inform partner asset is successfully tokenized
+      try {
+        const partnerUserId = asset.partner?.user?.id;
+        if (partnerUserId) {
+          await this.notificationOrchestrator.buildAndSave(
+            partnerUserId,
+            'asset.tokenized',
+            {
+              title: 'Asset Tokenized Successfully',
+              message: `Your asset "${asset.title}" has been successfully tokenized and deployed on-chain.`,
+              assetId: asset.id,
+              tokenAddress,
+              timestamp: new Date(),
+            },
+          );
+        }
+      } catch (err) {
+        this.logger.error(
+          `Failed to send asset tokenization notification: ${err}`,
+        );
       }
 
       return {

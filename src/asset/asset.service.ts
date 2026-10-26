@@ -690,7 +690,7 @@ export class AssetService {
       asset.legalDocuments?.forEach((url, i) =>
         allDocs.push({
           id: `${asset.id}-legal-${i}`,
-          title: `${asset.title} - Legal Doc ${i + 1}`,
+          title: `${asset.title} Legal Doc ${i + 1}`,
           type: 'Agreement',
           status: this.mapAssetStatusToDoc(asset.status),
           uploaded: new Date(asset.createdAt).toLocaleDateString('en-GB', {
@@ -705,7 +705,7 @@ export class AssetService {
       asset.financialDocuments?.forEach((url, i) =>
         allDocs.push({
           id: `${asset.id}-fin-${i}`,
-          title: `${asset.title} - Financial ${i + 1}`,
+          title: `${asset.title} Financial ${i + 1}`,
           type: 'Report',
           status: this.mapAssetStatusToDoc(asset.status),
           uploaded: new Date(asset.createdAt).toLocaleDateString('en-GB', {
@@ -720,7 +720,7 @@ export class AssetService {
       asset.otherDocuments?.forEach((url, i) =>
         allDocs.push({
           id: `${asset.id}-other-${i}`,
-          title: `${asset.title} - Certificate ${i + 1}`,
+          title: `${asset.title} Certificate ${i + 1}`,
           type: 'Certificate',
           status: this.mapAssetStatusToDoc(asset.status),
           uploaded: new Date(asset.createdAt).toLocaleDateString('en-GB', {
@@ -806,11 +806,38 @@ export class AssetService {
   }
 
   async reject(assetId: string, reason: string): Promise<Asset> {
-    const asset = await this.assetRepo.findOne({ where: { id: assetId } });
-    if (!asset) throw new NotFoundException();
+    const asset = await this.assetRepo.findOne({
+      where: { id: assetId },
+      relations: ['partner', 'partner.user'],
+    });
+    if (!asset) throw new NotFoundException('Asset not found');
+
     asset.status = AssetStatus.REJECTED;
     asset.rejectionReason = reason;
-    return this.assetRepo.save(asset);
+    const updatedAsset = await this.assetRepo.save(asset);
+
+    // 🛡️ NOTIFICATION: Inform partner that asset listing was rejected
+    if (updatedAsset.partner?.user?.id) {
+      try {
+        await this.notificationOrchestrator.buildAndSave(
+          updatedAsset.partner.user.id,
+          'asset.rejected',
+          {
+            title: 'Asset Listing Rejected',
+            message: `Your asset listing "${updatedAsset.title}" was not approved. Reason: ${reason}`,
+            asset: updatedAsset.title,
+            reason,
+            timestamp: new Date(),
+          },
+        );
+      } catch (err) {
+        this.logger.error(
+          `Failed to dispatch asset rejection notification: ${err}`,
+        );
+      }
+    }
+
+    return updatedAsset;
   }
 
   async getApprovedAssets(): Promise<Asset[]> {
