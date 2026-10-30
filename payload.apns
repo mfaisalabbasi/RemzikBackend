@@ -1,0 +1,14 @@
+cat << 'EOF' > payload.apns
+{
+  "Simulator Target Bundle": "org.reactjs.native.example.remzic",
+  "aps": {
+    "alert": {
+      "title": "Local Simulator Test",
+      "body": "Testing notification banners without APNs keys!"
+    },
+    "badge": 1,
+    "sound": "default"
+  },
+  "type": "general"
+}
+EOF

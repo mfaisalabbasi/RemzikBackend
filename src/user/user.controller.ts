@@ -1,7 +1,8 @@
-// src/user/user.controller.ts (or wherever it's located)
+// src/user/user.controller.ts
 import {
   Controller,
   Post,
+  Patch,
   Body,
   Res,
   UseInterceptors,
@@ -11,14 +12,19 @@ import {
 } from '@nestjs/common';
 import { FileFieldsInterceptor } from '@nestjs/platform-express';
 import { memoryStorage } from 'multer';
-import type { Response } from 'express';
+import type { Response, Request } from 'express';
 import { UserService } from './user.service';
 import { CreateUserDto } from './dto/create-user.dto';
 import { RegisterWithKycDto } from './dto/register-with-kyc.dto';
+import { ChangePasswordDto } from './dto/change-password.dto';
 import { JwtAuthGuard } from 'src/auth/guards/jwt.gaurd';
 import { SyncWalletDto } from './dto/sync-wallet.dto';
+import { UpdateFcmTokenDto } from './dto/update-fcm-token.dto';
+import { ForgotPasswordDto } from './dto/forgot-password.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
+import { HttpCode, HttpStatus } from '@nestjs/common';
 
-@Controller('users') // 👈 CHANGED from 'auth' to 'users' to avoid collision
+@Controller('users')
 export class UserController {
   constructor(private readonly userService: UserService) {}
 
@@ -66,6 +72,41 @@ export class UserController {
       userId,
       dto.walletAddress,
       dto.privyUserId,
+    );
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('fcm-token')
+  async updateFcmToken(
+    @Body() dto: UpdateFcmTokenDto,
+    @Req() req: Request & { user?: any },
+  ) {
+    const userId = req.user?.userId || req.user?.sub;
+    return this.userService.updateFcmToken(userId, dto.fcmToken);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Patch('change-password')
+  async changePassword(
+    @Body() dto: ChangePasswordDto,
+    @Req() req: Request & { user?: any },
+  ) {
+    const userId = req.user?.userId || req.user?.sub;
+    return this.userService.changePassword(userId, dto);
+  }
+  @Post('forgot-password')
+  @HttpCode(HttpStatus.OK)
+  async forgotPassword(@Body() dto: ForgotPasswordDto) {
+    return this.userService.forgotPassword(dto.email);
+  }
+
+  @Post('reset-password')
+  @HttpCode(HttpStatus.OK)
+  async resetPassword(@Body() dto: ResetPasswordDto) {
+    return this.userService.resetPassword(
+      dto.email,
+      dto.token,
+      dto.newPassword,
     );
   }
 }

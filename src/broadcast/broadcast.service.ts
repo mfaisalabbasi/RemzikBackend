@@ -5,6 +5,8 @@ import { Broadcast } from './broadcast.entity';
 import { CreateBroadcastDto } from './dto/create-broadcast.dto';
 import { BroadcastGateway } from './broadcast.gateway';
 import { BroadcastTarget } from './enums/broadcast-target.enum';
+import { FirebaseProvider } from '../notifications/firebase.provider'; // 👈 Import FirebaseProvider
+import { User } from 'src/user/user.entity'; // 👈 Import User entity
 
 @Injectable()
 export class BroadcastService {
@@ -12,6 +14,9 @@ export class BroadcastService {
     @InjectRepository(Broadcast)
     private readonly broadcastRepo: Repository<Broadcast>,
     private readonly gateway: BroadcastGateway,
+    private readonly firebaseProvider: FirebaseProvider, // 👈 Inject FirebaseProvider
+    @InjectRepository(User)
+    private readonly userRepo: Repository<User>, // 👈 Inject User repository for FCM token lookups
   ) {}
 
   async create(dto: CreateBroadcastDto, adminId: string): Promise<Broadcast> {
@@ -57,6 +62,7 @@ export class BroadcastService {
         broadcast,
       )) as any as Broadcast;
 
+      // 1. Existing WebSocket emission
       if (this.gateway.server) {
         this.gateway.server.to(`user-${userId}`).emit('new_notification', {
           id: `direct-${saved.id}`,
@@ -66,6 +72,41 @@ export class BroadcastService {
           isBroadcast: false,
           createdAt: saved.createdAt,
         });
+      }
+
+      // 2. NEW: Native FCM Push Notification Delivery
+      try {
+        const user = await this.userRepo.findOne({ where: { id: userId } });
+        if (user && user.fcmToken) {
+          await this.firebaseProvider.getMessaging().send({
+            token: user.fcmToken,
+            notification: {
+              title: saved.title,
+              body: saved.message,
+            },
+            data: {
+              type: type || 'info',
+              actionUrl: '/dashboard',
+              notificationId: `direct-${saved.id}`,
+            },
+            apns: {
+              payload: {
+                aps: {
+                  sound: 'default',
+                },
+              },
+            },
+          });
+          console.log(
+            `[BroadcastService] FCM push delivered to user ${userId}`,
+          );
+        }
+      } catch (fcmError) {
+        // Log FCM errors without blocking the rest of the flow
+        console.error(
+          `[BroadcastService] FCM push failed for user ${userId}:`,
+          fcmError,
+        );
       }
 
       return { success: true, id: saved.id };

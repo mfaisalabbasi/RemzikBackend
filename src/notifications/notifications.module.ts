@@ -5,23 +5,30 @@ import { NotificationsService } from './notifications.service';
 import { NotificationsController } from './notifications.controller';
 import { NotificationsGateway } from './notifications.gateway';
 import { NotificationsListener } from './notifications.listener';
-import { NotificationOrchestrator } from './notifications.orchestrator'; // <--- 1. Import it
+import { NotificationOrchestrator } from './notifications.orchestrator';
 import { BroadcastModule } from 'src/broadcast/broadcast.module';
+import { FirebaseProvider } from './firebase.provider'; // 👈 1. Import Firebase Provider
+import { User } from 'src/user/user.entity'; // 👈 2. Import User Entity (adjust path if needed)
 
 @Global()
 @Module({
-  imports: [TypeOrmModule.forFeature([Notification]), BroadcastModule],
+  imports: [
+    TypeOrmModule.forFeature([Notification, User]), // 👈 3. Added User repository here
+    BroadcastModule,
+  ],
   controllers: [NotificationsController],
   providers: [
     NotificationsService,
     NotificationsGateway,
     NotificationsListener,
-    NotificationOrchestrator, // <--- 2. ADD IT HERE
+    NotificationOrchestrator,
+    FirebaseProvider, // 👈 4. Added Firebase Provider here
   ],
   exports: [
     NotificationsService,
     NotificationsGateway,
     NotificationOrchestrator,
-  ], // <--- 3. Export it (optional, but good practice)
+    FirebaseProvider,
+  ],
 })
 export class NotificationsModule {}

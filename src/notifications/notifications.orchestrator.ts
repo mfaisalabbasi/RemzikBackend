@@ -1,13 +1,21 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { NotificationsService } from './notifications.service';
 import { NotificationsGateway } from './notifications.gateway';
 import { NotificationType } from './enums/notification-type.enum';
+import { FirebaseProvider } from './firebase.provider'; // 👈 1. Import Firebase Provider
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { User } from 'src/user/user.entity'; // 👈 2. Import User Entity (adjust path if needed)
 
 @Injectable()
 export class NotificationOrchestrator {
+  private readonly logger = new Logger(NotificationOrchestrator.name);
+
   constructor(
     private readonly service: NotificationsService,
     private readonly gateway: NotificationsGateway,
+    private readonly firebaseProvider: FirebaseProvider, // 👈 3. Inject Firebase provider
+    @InjectRepository(User) private readonly userRepo: Repository<User>, // 👈 4. Inject User repository for FCM token lookup
   ) {}
 
   async buildAndSave(userId: string, eventName: string, data: any) {
@@ -427,8 +435,43 @@ export class NotificationOrchestrator {
       };
     }
 
+    // 1. Save to database
     const notification = await this.service.create({ userId, ...config });
+
+    // 2. Emit via WebSockets (For foreground active clients)
     this.gateway.sendNotification(userId, notification);
+
+    // 3. Push via Firebase Admin SDK (For background & killed states)
+    try {
+      const user = await this.userRepo.findOne({ where: { id: userId } });
+      if (user && user.fcmToken) {
+        await this.firebaseProvider.getMessaging().send({
+          token: user.fcmToken,
+          notification: {
+            title: config.title,
+            body: config.message,
+          },
+          data: {
+            type: config.type,
+            actionUrl: config.actionUrl,
+            notificationId: notification.id.toString(),
+          },
+          apns: {
+            payload: {
+              aps: {
+                sound: 'default',
+              },
+            },
+          },
+        });
+        this.logger.debug(`FCM push sent successfully to user ${userId}`);
+      }
+    } catch (error) {
+      this.logger.error(
+        `Failed to send FCM push notification to user ${userId}: ${error}`,
+      );
+    }
+
     return notification;
   }
 }

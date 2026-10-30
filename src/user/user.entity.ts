@@ -58,6 +58,15 @@ export class User {
 
   @Column({ unique: true, nullable: true })
   walletAddress?: string;
+  // Add this inside your User entity class
+  @Column({ nullable: true })
+  fcmToken?: string;
+
+  @Column({ nullable: true })
+  resetPasswordToken?: string;
+
+  @Column({ type: 'timestamp', nullable: true })
+  resetPasswordExpires?: Date;
 
   @CreateDateColumn()
   createdAt!: Date;
